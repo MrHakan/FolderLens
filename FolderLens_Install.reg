@@ -1,0 +1,23 @@
+Windows Registry Editor Version 5.00
+
+; FolderLens - Context Menu Install
+; Double-click to add to context menu
+;
+; NOTE: Update the path below to your installation directory
+; Example: C:\Program Files\FolderLens\FolderLens.exe
+
+; Right-click inside folder (Background)
+[HKEY_CLASSES_ROOT\Directory\Background\shell\FolderLens]
+@="Analyze with FolderLens"
+"Icon"="C:\\FolderLens\\FolderLens.exe"
+
+[HKEY_CLASSES_ROOT\Directory\Background\shell\FolderLens\command]
+@="\"C:\\FolderLens\\FolderLens.exe\" \"%V\""
+
+; Right-click on folder
+[HKEY_CLASSES_ROOT\Directory\shell\FolderLens]
+@="Analyze with FolderLens"
+"Icon"="C:\\FolderLens\\FolderLens.exe"
+
+[HKEY_CLASSES_ROOT\Directory\shell\FolderLens\command]
+@="\"C:\\FolderLens\\FolderLens.exe\" \"%1\""

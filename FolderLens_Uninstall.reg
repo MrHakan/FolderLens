@@ -1,0 +1,8 @@
+Windows Registry Editor Version 5.00
+
+; FolderLens - Context Menu Uninstall
+; Double-click to remove from context menu
+
+[-HKEY_CLASSES_ROOT\Directory\Background\shell\FolderLens]
+
+[-HKEY_CLASSES_ROOT\Directory\shell\FolderLens]

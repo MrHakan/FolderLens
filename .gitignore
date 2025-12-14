@@ -1,0 +1,97 @@
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# virtualenv
+venv/
+ENV/
+env/
+.venv/
+.env
+
+# pyinstaller
+dist/
+*.spec
+*.manifest
+*.exe
+
+# installer output
+installer_output/
+*.msi
+
+# ide
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# os
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# logs
+*.log
+*.logs
+logs/
+debug/
+*.debug
+
+# temp
+*.tmp
+*.temp
+*.bak
+*.backup
+tmp/
+temp/
+
+# test
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# sensitive
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+config.local.*
+
+# assets placeholder
+assets/*
+!assets/.gitkeep
