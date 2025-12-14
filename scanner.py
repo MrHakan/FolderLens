@@ -85,7 +85,6 @@ class FolderScanner:
         on_complete: Optional[Callable[[ScanResult], None]] = None,
         on_error: Optional[Callable[[str], None]] = None
     ):
-"
         def _scan_worker():
             self._cancel_requested.clear()
             self._is_scanning.set()
@@ -202,6 +201,7 @@ class QuickScanner:
         self._executor = ThreadPoolExecutor(max_workers=4)
         
     def scan_first_level(self, folder_path: str) -> List[FileItem]:
+        items = []
         try:
             with os.scandir(folder_path) as entries:
                 for entry in entries:
