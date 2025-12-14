@@ -1,6 +1,5 @@
 @echo off
 rem FolderLens Build Script
-rem Requirements: Python 3.9+, PyInstaller, Inno Setup 6 (optional)
 
 echo ===================================
 echo FolderLens Build Script
@@ -9,23 +8,26 @@ echo.
 
 cd /d "%~dp0"
 
-echo [1/4] Cleaning old files...
+echo [1/3] Cleaning old files...
 if exist "dist" rmdir /s /q "dist"
 if exist "build" rmdir /s /q "build"
-if exist "installer_output" rmdir /s /q "installer_output"
-if exist "*.spec" del /q "*.spec" 2>nul
+if exist "FolderLens.spec" del /q "FolderLens.spec" 2>nul
 
 echo.
-echo [2/4] Building executable with PyInstaller...
+echo [2/3] Building executable with PyInstaller...
 echo.
 
 pyinstaller --onefile --windowed --name FolderLens ^
+    --add-data "version.py;." ^
     --add-data "file_utils.py;." ^
     --add-data "scanner.py;." ^
     --add-data "registry_installer.py;." ^
+    --add-data "updater.py;." ^
     --hidden-import customtkinter ^
     --hidden-import darkdetect ^
     --hidden-import PIL ^
+    --hidden-import PIL.Image ^
+    --hidden-import PIL.ImageTk ^
     --collect-all customtkinter ^
     main.py
 
@@ -37,46 +39,17 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/4] Executable created: dist\FolderLens.exe
+echo [3/3] Build complete!
 echo.
-
-if not exist "installer_output" mkdir "installer_output"
-
-echo [4/4] Building installer with Inno Setup...
-
-set ISCC=""
-if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" (
-    set ISCC="%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-) else if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" (
-    set ISCC="%ProgramFiles%\Inno Setup 6\ISCC.exe"
-)
-
-if %ISCC%=="" (
-    echo.
-    echo [WARNING] Inno Setup not found!
-    echo To create installer, install Inno Setup 6:
-    echo https://jrsoftware.org/isinfo.php
-    echo.
-    echo Executable ready at: dist\FolderLens.exe
-    echo.
-) else (
-    echo Inno Setup found: %ISCC%
-    %ISCC% "installer\FolderLens_Setup.iss"
-    
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] Inno Setup failed!
-    ) else (
-        echo.
-        echo ===================================
-        echo BUILD COMPLETE
-        echo ===================================
-        echo.
-        echo Output:
-        echo   - EXE: dist\FolderLens.exe
-        echo   - Installer: installer_output\FolderLens_Setup_1.0.0.exe
-        echo.
-    )
-)
+echo ===================================
+echo BUILD SUCCESS
+echo ===================================
+echo.
+echo Output: dist\FolderLens.exe
+echo.
+echo To install:
+echo   1. Run: python simple_installer.py
+echo   2. Or just copy dist\FolderLens.exe where you want
+echo.
 
 pause
