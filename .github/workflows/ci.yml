@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install pytest
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q main.py app.py scanner.py file_utils.py updater.py version.py registry_installer.py simple_installer.py
+
+      - name: Run tests
+        run: python -m pytest tests -v

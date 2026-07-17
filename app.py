@@ -1,7 +1,8 @@
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import tkinter as tk
-from typing import Optional, List, Callable, Set
+from typing import Optional, List, Callable, Set, Dict
+import json
 import os
 import threading
 import shutil
@@ -22,79 +23,117 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+def _settings_file() -> str:
+    base = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), '.config')
+    return os.path.join(base, 'FolderLens', 'settings.json')
+
+
 class AppSettings:
     def __init__(self):
         self.icon_size = "medium"
         self.preview_enabled = True
         self.dark_mode = True
-    
+        self.load()
+
     def get_icon_font_size(self) -> int:
         sizes = {"small": 14, "medium": 20, "large": 28}
         return sizes.get(self.icon_size, 20)
-    
+
     def get_row_height(self) -> int:
         heights = {"small": 40, "medium": 56, "large": 72}
         return heights.get(self.icon_size, 56)
+
+    def load(self):
+        try:
+            with open(_settings_file(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if data.get('icon_size') in ("small", "medium", "large"):
+                self.icon_size = data['icon_size']
+            if isinstance(data.get('preview_enabled'), bool):
+                self.preview_enabled = data['preview_enabled']
+            if isinstance(data.get('dark_mode'), bool):
+                self.dark_mode = data['dark_mode']
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        try:
+            path = _settings_file()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'icon_size': self.icon_size,
+                    'preview_enabled': self.preview_enabled,
+                    'dark_mode': self.dark_mode,
+                }, f, indent=2)
+        except OSError:
+            pass
 
 
 class SelectionManager:
     def __init__(self):
         self.selected_items: Set[str] = set()
         self.on_change_callbacks: List[Callable] = []
-    
-    def toggle(self, path: str) -> bool:
+        self._size_cache: Dict[str, int] = {}
+
+    def toggle(self, path: str, size: Optional[int] = None) -> bool:
         if path in self.selected_items:
             self.selected_items.remove(path)
+            self._size_cache.pop(path, None)
             selected = False
         else:
             self.selected_items.add(path)
+            if size is not None:
+                self._size_cache[path] = size
             selected = True
         self._notify()
         return selected
-    
-    def select(self, path: str):
+
+    def select(self, path: str, size: Optional[int] = None):
         self.selected_items.add(path)
+        if size is not None:
+            self._size_cache[path] = size
         self._notify()
-    
+
     def deselect(self, path: str):
         self.selected_items.discard(path)
+        self._size_cache.pop(path, None)
         self._notify()
-    
+
     def clear(self):
         self.selected_items.clear()
+        self._size_cache.clear()
         self._notify()
-    
+
     def is_selected(self, path: str) -> bool:
         return path in self.selected_items
-    
+
     def count(self) -> int:
         return len(self.selected_items)
-    
+
     def get_total_size(self) -> int:
+        """Total size of the selection, using sizes cached at selection time
+        so the UI thread never has to re-walk directory trees."""
         total = 0
         for path in self.selected_items:
-            try:
-                if os.path.isfile(path):
-                    total += os.path.getsize(path)
-                elif os.path.isdir(path):
-                    for root, dirs, files in os.walk(path):
-                        for f in files:
-                            try:
-                                total += os.path.getsize(os.path.join(root, f))
-                            except:
-                                pass
-            except:
-                pass
+            if path in self._size_cache:
+                total += self._size_cache[path]
+            else:
+                try:
+                    if os.path.isfile(path):
+                        total += os.path.getsize(path)
+                except OSError:
+                    pass
         return total
-    
+
     def on_change(self, callback: Callable):
         self.on_change_callbacks.append(callback)
-    
+
     def _notify(self):
         for cb in self.on_change_callbacks:
             try:
                 cb()
-            except:
+            except Exception:
                 pass
 
 
@@ -239,7 +278,7 @@ class FileListItem(ctk.CTkFrame):
             self._bind_children(child)
     
     def _toggle_selection(self):
-        self.is_selected = self.selection_manager.toggle(self.file_item.path)
+        self.is_selected = self.selection_manager.toggle(self.file_item.path, self.file_item.size)
         self.checkbox.configure(
             text=ICONS['check_filled'] if self.is_selected else ICONS['check_empty'],
             text_color="#3B82F6" if self.is_selected else "gray"
@@ -649,33 +688,39 @@ class ImagePreview(ctk.CTkToplevel):
 
 class FilterBar(ctk.CTkFrame):
     """Filter and sort buttons"""
-    
-    def __init__(self, master, on_filter: Callable, on_refresh: Callable, on_settings: Callable, **kwargs):
+
+    FILTER_OPTIONS = ["All", "Folders", "Files", "Video", "Audio", "Image", "Document", "Archive", "Code", "Other"]
+
+    def __init__(self, master, on_filter: Callable, on_refresh: Callable, on_settings: Callable,
+                 on_category_filter: Optional[Callable] = None, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
-        
+
         self.on_filter = on_filter
         self.on_refresh = on_refresh
         self.on_settings = on_settings
+        self.on_category_filter = on_category_filter
         self.active_sort = "size"
-        
+        self.sort_order = "desc"
+
         left_frame = ctk.CTkFrame(self, fg_color="transparent")
         left_frame.pack(side="left", fill="y")
-        
-        filter_btn = ctk.CTkButton(
+
+        self.filter_menu = ctk.CTkOptionMenu(
             left_frame,
-            text="Filter",
+            values=self.FILTER_OPTIONS,
             font=ctk.CTkFont(size=12),
             fg_color=("white", "gray20"),
-            hover_color=("gray90", "gray25"),
+            button_color=("gray85", "gray25"),
+            button_hover_color=("gray80", "gray30"),
             text_color=("gray20", "gray80"),
             corner_radius=20,
             height=32,
-            width=80,
-            border_width=1,
-            border_color=("gray80", "gray40")
+            width=110,
+            command=self._on_filter_select
         )
-        filter_btn.pack(side="left", padx=(0, 8))
-        
+        self.filter_menu.set("All")
+        self.filter_menu.pack(side="left", padx=(0, 8))
+
         separator = ctk.CTkFrame(left_frame, width=1, height=20, fg_color="gray")
         separator.pack(side="left", padx=8)
         
@@ -732,34 +777,39 @@ class FilterBar(ctk.CTkFrame):
         )
         settings_btn.pack(side="left", padx=2)
     
+    def _on_filter_select(self, choice: str):
+        if self.on_category_filter:
+            self.on_category_filter(choice)
+
     def _on_sort_click(self, key: str):
         if self.active_sort == key:
-            return
-        
-        old_btn = self.sort_btns[self.active_sort]
-        old_text = old_btn.cget("text")
-        clean_text = old_text.replace("● ", "").replace(" ↓", "").replace(" ↑", "")
-        old_btn.configure(
-            text=clean_text,
-            fg_color=("white", "gray20"),
-            text_color=("gray40", "gray70"),
-            font=ctk.CTkFont(size=12),
-            width=70
-        )
-        
-        new_btn = self.sort_btns[key]
-        new_text = new_btn.cget("text")
-        clean_text = new_text.replace("● ", "").replace(" ↓", "").replace(" ↑", "")
-        new_btn.configure(
-            text=f"● {clean_text} ↓",
+            self.sort_order = "asc" if self.sort_order == "desc" else "desc"
+        else:
+            old_btn = self.sort_btns[self.active_sort]
+            old_text = old_btn.cget("text")
+            clean_text = old_text.replace("● ", "").replace(" ↓", "").replace(" ↑", "")
+            old_btn.configure(
+                text=clean_text,
+                fg_color=("white", "gray20"),
+                text_color=("gray40", "gray70"),
+                font=ctk.CTkFont(size=12),
+                width=70
+            )
+            self.active_sort = key
+            self.sort_order = "desc"
+
+        arrow = "↓" if self.sort_order == "desc" else "↑"
+        btn = self.sort_btns[key]
+        clean_text = btn.cget("text").replace("● ", "").replace(" ↓", "").replace(" ↑", "")
+        btn.configure(
+            text=f"● {clean_text} {arrow}",
             fg_color="#135bec",
             text_color="white",
             font=ctk.CTkFont(size=12, weight="bold"),
             width=90
         )
-        
-        self.active_sort = key
-        self.on_filter(key, "desc")
+
+        self.on_filter(key, self.sort_order)
 
 
 class BreadcrumbBar(ctk.CTkFrame):
@@ -845,11 +895,13 @@ class StatusBar(ctk.CTkFrame):
         )
         self.right_label.pack(side="right", padx=16)
     
-    def update_status(self, item_count: int = 0, selected: int = 0, total_size: int = 0):
+    def update_status(self, item_count: int = 0, selected: int = 0, total_size: int = 0, error_count: int = 0):
         left_text = f"{item_count} items"
         if selected > 0:
             left_text += f"  |  {selected} selected"
-        
+        if error_count > 0:
+            left_text += f"  |  ⚠ {error_count} inaccessible"
+
         self.left_label.configure(text=left_text)
         self.right_label.configure(text=f"Total: {format_size(total_size)}")
 
@@ -941,17 +993,22 @@ class FolderLensApp(ctk.CTk):
         self.total_size = 0
         self.sort_key = "size"
         self.sort_order = SortState.DESCENDING
-        
+        self.category_filter = "All"
+
         self.settings = AppSettings()
+        ctk.set_appearance_mode("dark" if self.settings.dark_mode else "light")
+
         self.selection_manager = SelectionManager()
         self.selection_manager.on_change(self._on_selection_change)
-        
+
         self.analyze_visible = False
-        
+
         self._create_ui()
-        
+
         if initial_path and os.path.isdir(initial_path):
             self.after(100, lambda: self.scan_folder(initial_path))
+        else:
+            self._show_welcome()
     
     def _create_ui(self):
         self.main_container = ctk.CTkFrame(self, fg_color=("gray98", "gray10"), corner_radius=0)
@@ -970,7 +1027,8 @@ class FolderLensApp(ctk.CTk):
             self.main_content,
             on_filter=self._on_filter_change,
             on_refresh=self._on_refresh,
-            on_settings=self._show_settings
+            on_settings=self._show_settings,
+            on_category_filter=self._on_category_filter
         )
         self.filter_bar.pack(fill="x", pady=(0, 16))
         
@@ -1093,9 +1151,85 @@ class FolderLensApp(ctk.CTk):
     def _create_navigation(self):
         nav_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
         nav_frame.pack(fill="x", padx=24, pady=16)
-        
+
+        self.up_btn = ctk.CTkButton(
+            nav_frame,
+            text="⬅",
+            font=ctk.CTkFont(size=14),
+            fg_color="transparent",
+            hover_color=("gray90", "gray25"),
+            text_color=("gray40", "gray70"),
+            width=32,
+            height=28,
+            command=self._go_up
+        )
+        self.up_btn.pack(side="left", padx=(0, 4))
+
+        browse_btn = ctk.CTkButton(
+            nav_frame,
+            text=f"{ICONS['folder_open']} Browse",
+            font=ctk.CTkFont(size=12),
+            fg_color=("white", "gray20"),
+            hover_color=("gray90", "gray25"),
+            text_color=("gray20", "gray80"),
+            corner_radius=6,
+            height=28,
+            width=90,
+            border_width=1,
+            border_color=("gray80", "gray40"),
+            command=self._browse_folder
+        )
+        browse_btn.pack(side="left", padx=(0, 12))
+
         self.breadcrumb = BreadcrumbBar(nav_frame, on_navigate=self.scan_folder)
-        self.breadcrumb.pack(fill="x")
+        self.breadcrumb.pack(side="left", fill="x", expand=True)
+
+    def _browse_folder(self):
+        folder = filedialog.askdirectory(title="Select folder to analyze")
+        if folder:
+            self.scan_folder(os.path.normpath(folder))
+
+    def _go_up(self):
+        if not self.current_path:
+            return
+        parent = os.path.dirname(self.current_path.rstrip("\\/"))
+        if parent and parent != self.current_path and os.path.isdir(parent):
+            self.scan_folder(parent)
+
+    def _show_welcome(self):
+        for widget in self.file_list.winfo_children():
+            widget.destroy()
+
+        welcome = ctk.CTkFrame(self.file_list, fg_color="transparent")
+        welcome.pack(expand=True, pady=120)
+
+        ctk.CTkLabel(
+            welcome,
+            text=ICONS['folder_open'],
+            font=ctk.CTkFont(size=56)
+        ).pack()
+
+        ctk.CTkLabel(
+            welcome,
+            text="No folder selected",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(pady=(16, 4))
+
+        ctk.CTkLabel(
+            welcome,
+            text="Choose a folder to see what's taking up space.",
+            font=ctk.CTkFont(size=13),
+            text_color="gray"
+        ).pack(pady=(0, 20))
+
+        ctk.CTkButton(
+            welcome,
+            text="Select Folder",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            height=36,
+            width=160,
+            command=self._browse_folder
+        ).pack()
     
     def _start_drag(self, event):
         self._drag_start_x = event.x
@@ -1136,6 +1270,7 @@ class FolderLensApp(ctk.CTk):
         mode = "dark" if self.settings.dark_mode else "light"
         ctk.set_appearance_mode(mode)
         self.theme_btn.configure(text=ICONS['sun'] if self.settings.dark_mode else ICONS['moon'])
+        self.settings.save()
     
     def _toggle_analyze(self):
         if self.analyze_visible:
@@ -1160,6 +1295,7 @@ class FolderLensApp(ctk.CTk):
         SettingsMenu(self, self.settings, self._on_settings_apply)
     
     def _on_settings_apply(self):
+        self.settings.save()
         if self.current_path:
             self._refresh_list()
     
@@ -1208,21 +1344,46 @@ class FolderLensApp(ctk.CTk):
         
         self.current_items = result.items
         self.total_size = result.total_size
-        
+
         self._sort_items()
         self._refresh_list()
-        
+
         self.status_bar.update_status(
             item_count=result.total_items,
             selected=self.selection_manager.count(),
-            total_size=result.total_size
+            total_size=result.total_size,
+            error_count=len(result.errors)
         )
     
+    def _visible_items(self) -> List[FileItem]:
+        if self.category_filter == "All":
+            return self.current_items
+        if self.category_filter == "Folders":
+            return [i for i in self.current_items if i.is_directory]
+        if self.category_filter == "Files":
+            return [i for i in self.current_items if not i.is_directory]
+        return [
+            i for i in self.current_items
+            if not i.is_directory and get_file_category(i.path)['label'] == self.category_filter
+        ]
+
     def _refresh_list(self):
         for widget in self.file_list.winfo_children():
             widget.destroy()
-        
-        for item in self.current_items:
+
+        visible = self._visible_items()
+
+        if not visible:
+            if self.current_path:
+                ctk.CTkLabel(
+                    self.file_list,
+                    text="Nothing to show here.",
+                    font=ctk.CTkFont(size=13),
+                    text_color="gray"
+                ).pack(pady=80)
+            return
+
+        for item in visible:
             file_widget = FileListItem(
                 self.file_list,
                 item,
@@ -1256,6 +1417,10 @@ class FolderLensApp(ctk.CTk):
         self.sort_key = sort_key
         self.sort_order = sort_order
         self._sort_items()
+        self._refresh_list()
+
+    def _on_category_filter(self, category: str):
+        self.category_filter = category
         self._refresh_list()
     
     def _on_refresh(self):
