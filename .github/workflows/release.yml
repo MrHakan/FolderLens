@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release (e.g. v1.1.0); leave empty for a build-only run"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -54,8 +59,9 @@ jobs:
           path: dist/FolderLens.exe
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/FolderLens.exe
           generate_release_notes: true
