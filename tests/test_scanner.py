@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scanner import FolderScanner, QuickScanner
+from scanner import TreeScanner, FolderScanner, QuickScanner
 
 
 @pytest.fixture
@@ -25,36 +25,113 @@ def sample_tree(tmp_path):
     return tmp_path
 
 
-def run_scan(path):
-    scanner = FolderScanner()
-    result_holder = [None]
-    error_holder = [None]
+def run_tree_scan(path):
+    scanner = TreeScanner()
+    holder = {"root": None, "errors": None, "error": None}
     done = threading.Event()
 
-    def on_complete(result):
-        result_holder[0] = result
+    def on_complete(root, errors, scan_time):
+        holder["root"] = root
+        holder["errors"] = errors
         done.set()
 
     def on_error(error):
-        error_holder[0] = error
+        holder["error"] = error
         done.set()
 
     scanner.scan(str(path), on_complete=on_complete, on_error=on_error)
     assert done.wait(timeout=30), "scan did not finish in time"
-    return result_holder[0], error_holder[0]
+    return holder
 
 
-def test_scan_sizes(sample_tree):
-    result, error = run_scan(sample_tree)
+def run_flat_scan(path):
+    scanner = FolderScanner()
+    holder = {"result": None, "error": None}
+    done = threading.Event()
+
+    def on_complete(result):
+        holder["result"] = result
+        done.set()
+
+    def on_error(error):
+        holder["error"] = error
+        done.set()
+
+    scanner.scan(str(path), on_complete=on_complete, on_error=on_error)
+    assert done.wait(timeout=30), "scan did not finish in time"
+    return holder["result"], holder["error"]
+
+
+def test_tree_scan_builds_full_tree(sample_tree):
+    holder = run_tree_scan(sample_tree)
+    assert holder["error"] is None
+    root = holder["root"]
+    assert root is not None
+    assert root.is_dir
+
+    by_name = {c.name: c for c in root.children}
+    assert set(by_name) == {"file_a.txt", "file_b.bin", "subdir"}
+    assert by_name["file_a.txt"].size == 100
+    assert by_name["file_b.bin"].size == 250
+
+    subdir = by_name["subdir"]
+    assert subdir.is_dir
+    assert subdir.size == 75
+    # nested.txt + deeper dir + deep.txt
+    assert subdir.item_count == 3
+
+    sub_children = {c.name: c for c in subdir.children}
+    assert set(sub_children) == {"nested.txt", "deeper"}
+    assert sub_children["deeper"].size == 25
+    assert sub_children["deeper"].children[0].name == "deep.txt"
+    assert sub_children["deeper"].children[0].parent is sub_children["deeper"]
+
+    assert root.size == 425
+    # file_a + file_b + subdir + nested.txt + deeper + deep.txt
+    assert root.item_count == 6
+    assert holder["errors"] == []
+
+
+def test_tree_scan_sorted_children(sample_tree):
+    root = run_tree_scan(sample_tree)["root"]
+    by_size = root.sorted_children("size", reverse=True)
+    assert [c.name for c in by_size] == ["file_b.bin", "file_a.txt", "subdir"]
+
+    by_name = root.sorted_children("name", reverse=False)
+    assert [c.name for c in by_name] == ["file_a.txt", "file_b.bin", "subdir"]
+
+
+def test_tree_scan_missing_folder(tmp_path):
+    holder = run_tree_scan(tmp_path / "does_not_exist")
+    assert holder["root"] is None
+    assert "not found" in holder["error"].lower()
+
+
+def test_tree_scan_file_not_folder(tmp_path):
+    target = tmp_path / "plain.txt"
+    target.write_text("hello")
+    holder = run_tree_scan(target)
+    assert holder["root"] is None
+    assert "not a folder" in holder["error"].lower()
+
+
+def test_tree_scan_empty_folder(tmp_path):
+    holder = run_tree_scan(tmp_path)
+    root = holder["root"]
+    assert holder["error"] is None
+    assert root.children == []
+    assert root.size == 0
+    assert root.item_count == 0
+
+
+def test_flat_scan_sizes(sample_tree):
+    result, error = run_flat_scan(sample_tree)
     assert error is None
-    assert result is not None
 
     by_name = {item.name: item for item in result.items}
     assert by_name["file_a.txt"].size == 100
-    assert by_name["file_b.bin"].size == 250
     assert by_name["subdir"].size == 75
     assert by_name["subdir"].is_directory
-    # nested.txt + deep.txt + the "deeper" dir itself
     assert by_name["subdir"].item_count == 3
 
     assert result.total_size == 425
@@ -62,25 +139,10 @@ def test_scan_sizes(sample_tree):
     assert result.errors == []
 
 
-def test_scan_missing_folder(tmp_path):
-    result, error = run_scan(tmp_path / "does_not_exist")
+def test_flat_scan_missing_folder(tmp_path):
+    result, error = run_flat_scan(tmp_path / "does_not_exist")
     assert result is None
     assert "not found" in error.lower()
-
-
-def test_scan_file_not_folder(tmp_path):
-    target = tmp_path / "plain.txt"
-    target.write_text("hello")
-    result, error = run_scan(target)
-    assert result is None
-    assert "not a folder" in error.lower()
-
-
-def test_scan_empty_folder(tmp_path):
-    result, error = run_scan(tmp_path)
-    assert error is None
-    assert result.total_items == 0
-    assert result.total_size == 0
 
 
 def test_quick_scanner(sample_tree):
