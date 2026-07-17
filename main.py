@@ -78,8 +78,19 @@ Examples:
         action="store_true",
         help="Run in console mode (CLI)"
     )
-    
+
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print version and exit"
+    )
+
     args = parser.parse_args()
+
+    if args.version:
+        from version import VERSION
+        print(f"FolderLens {VERSION}")
+        return
     
     if args.install:
         from registry_installer import install_context_menu, is_admin
@@ -134,20 +145,22 @@ Examples:
         print(f"Scanning: {folder}")
         print("-" * 60)
         
+        import threading
+
         scanner = FolderScanner()
         result_holder = [None]
-        
+        done = threading.Event()
+
         def on_complete(result):
             result_holder[0] = result
-        
+            done.set()
+
         def on_error(error):
             print(f"[ERROR] {error}")
-        
+            done.set()
+
         scanner.scan(folder, on_complete=on_complete, on_error=on_error)
-        
-        import time
-        while scanner.is_scanning:
-            time.sleep(0.1)
+        done.wait()
         
         result = result_holder[0]
         if result:
