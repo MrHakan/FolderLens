@@ -11,19 +11,18 @@ Grab the latest standalone `FolderLens.exe` from the [Releases page](https://git
 
 ## Features
 
-- Recursive scanning of folders and subfolders
-- Parallel directory sizing — first-level folders are sized concurrently
-- Async scanning (UI doesn't freeze)
-- Visual usage bars showing relative size
+- **Tree view** — browse folders and the files inside them as an expandable tree, with sizes, usage bars, item counts, and dates at every level
+- **One scan, instant navigation** — the whole directory tree is scanned once (in parallel, up to 32 workers); expanding any folder afterwards is instant, no rescanning
+- Async scanning (UI doesn't freeze) with live progress
+- Visual usage bars showing each item's share of its parent folder
 - File type icons and color coding
-- Category filter (folders, files, video, image, code, ...)
-- Sortable columns with ascending/descending toggle (size, name, type, date)
-- Folder and file selection across directories
-- Analyze panel with zip and delete options
+- Sortable columns with ascending/descending toggle (name, size, items, type, date)
+- Multi-select (Ctrl/Shift) with zip, delete, and open-in-Explorer actions
+- Right-click context menu inside the tree; Delete key and F5 shortcuts
 - Image preview on double-click
 - Light/dark mode toggle (persisted between sessions)
 - Auto-update from GitHub releases
-- Right-click context menu integration
+- Windows Explorer right-click context menu integration
 - Handles "access denied" errors gracefully
 
 ## Installation
@@ -71,13 +70,15 @@ python main.py --version
 
 ## UI controls
 
+- **📂 Browse** - pick a folder to analyze
+- **⬅ Up** - go to parent folder
+- **🔄 Refresh / F5** - rescan the current folder
+- **📦 Zip / 🗑️ Delete** - act on the selected rows (Ctrl/Shift multi-select)
 - **☀️/🌙** - toggle light/dark mode
 - **⬆** - check for updates
-- **📊** - open analyze panel for selected items
-- **•••** - settings (icon size, preview toggle)
-- **○/●** - select/deselect files and folders
-- **📂 Browse** - pick a folder to analyze
-- **⬅** - go to parent folder
+- **•••** - settings (row size, preview toggle)
+- **Right-click** - open in Explorer, zip, delete
+- **Column headers** - click to sort, click again to reverse
 
 ## Requirements
 
