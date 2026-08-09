@@ -303,14 +303,20 @@ class FolderLensApp(ctk.CTk):
         self._search_after = None
 
         # tree-view state
+        self.tree: Optional[ttk.Treeview] = None
         self.iid_to_node: Dict[str, Node] = {}
         self.sort_key = "size"
         self.sort_reverse = True
+
+        # largest-files view state
+        self.largest_tree: Optional[ttk.Treeview] = None
+        self.largest_map: Dict[str, Node] = {}
 
         # treemap state
         self.treemap_stack: List[Node] = []
         self._tile_items: Dict[int, analysis.Tile] = {}
         self.tooltip: Optional[Tooltip] = None
+        self._treemap_redraw_after = None
 
         self._build_toolbar()
         self._build_body()
@@ -507,8 +513,15 @@ class FolderLensApp(ctk.CTk):
     def _clear_body(self):
         if self.tooltip:
             self.tooltip.hide()
+        if self._treemap_redraw_after:
+            self.after_cancel(self._treemap_redraw_after)
+            self._treemap_redraw_after = None
         for child in self.body.winfo_children():
             child.destroy()
+        # drop references to the widgets we just destroyed so nothing
+        # reaches for a stale one later
+        self.tree = None
+        self.largest_tree = None
 
     def _render_active_view(self):
         self._clear_body()
@@ -730,7 +743,9 @@ class FolderLensApp(ctk.CTk):
             "path": (560, 240, "w", True),
         }
         self.largest_tree = self._make_treeview(("size", "type", "path"), headings, widths)
-        self.largest_map: Dict[str, Node] = {}
+        self.largest_map = {}
+        self.largest_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.largest_tree.bind("<Delete>", lambda e: self._delete_selected())
 
         files = analysis.largest_files(self.root_node, 100)
         if self.search_query:
@@ -828,10 +843,28 @@ class FolderLensApp(ctk.CTk):
         if self.tooltip is None:
             self.tooltip = Tooltip(self)
         self.treemap_node = node
-        self.treemap_canvas.bind("<Configure>", lambda e: self._draw_treemap())
+        self.treemap_canvas.bind("<Configure>", lambda e: self._schedule_treemap_redraw())
         self.treemap_canvas.bind("<Motion>", self._treemap_hover)
         self.treemap_canvas.bind("<Leave>", lambda e: self.tooltip.hide())
         self.treemap_canvas.bind("<Button-1>", self._treemap_click)
+
+    def _schedule_treemap_redraw(self):
+        """Coalesce the burst of <Configure> events a window resize produces
+        into a single re-layout."""
+        if self._treemap_redraw_after:
+            self.after_cancel(self._treemap_redraw_after)
+        self._treemap_redraw_after = self.after(80, self._do_treemap_redraw)
+
+    def _do_treemap_redraw(self):
+        self._treemap_redraw_after = None
+        if getattr(self, "treemap_canvas", None) is None:
+            return
+        try:
+            if not self.treemap_canvas.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._draw_treemap()
 
     def _draw_treemap(self):
         canvas = self.treemap_canvas
@@ -858,8 +891,12 @@ class FolderLensApp(ctk.CTk):
             self._tile_items[item] = tile
             if tile.w > 46 and tile.h > 16:
                 text_color = "#f8fafc" if (self.settings.dark_mode or not n.is_dir) else "#1f2937"
-                canvas.create_text(tile.x + 4, tile.y + 3, anchor="nw", text=n.name[:40],
-                                   fill=text_color, font=("Segoe UI", 8))
+                label = canvas.create_text(tile.x + 4, tile.y + 3, anchor="nw", text=n.name[:40],
+                                           fill=text_color, font=("Segoe UI", 8))
+                # map the label to the same tile: hit-testing resolves to the
+                # topmost item, so without this the tooltip/click would be lost
+                # exactly where the pointer most naturally lands
+                self._tile_items[label] = tile
 
     def _treemap_hover(self, event):
         items = self.treemap_canvas.find_closest(event.x, event.y)
@@ -906,22 +943,46 @@ class FolderLensApp(ctk.CTk):
 
     # --------------------------------------------------------------- actions
 
-    def _selected_nodes(self) -> List[Node]:
-        return [self.iid_to_node[iid] for iid in self.tree.selection() if iid in self.iid_to_node]
+    def _selection_context(self):
+        """Return (tree_widget, iid->Node map) for the view that currently owns
+        a selection, or (None, {}) when the active view has none.
 
-    def _top_level_selection(self) -> List[str]:
-        selection = set(self.tree.selection())
+        Views are rebuilt on every switch, so the widget references are only
+        valid for the view that is on screen right now.
+        """
+        if self.active_view == "Tree" and self.tree is not None:
+            return self.tree, self.iid_to_node
+        if self.active_view == "Largest Files" and self.largest_tree is not None:
+            return self.largest_tree, self.largest_map
+        return None, {}
+
+    def _selected_nodes(self) -> List[Node]:
+        tree, mapping = self._selection_context()
+        if tree is None:
+            return []
+        return [mapping[iid] for iid in tree.selection() if iid in mapping]
+
+    def _top_level_selection(self) -> List[tuple]:
+        """Selected (iid, node) pairs, with anything nested under another
+        selected row removed so we never act on the same bytes twice."""
+        tree, mapping = self._selection_context()
+        if tree is None:
+            return []
+
+        selection = set(tree.selection())
         result = []
-        for iid in self.tree.selection():
-            parent = self.tree.parent(iid)
+        for iid in tree.selection():
+            if iid not in mapping:
+                continue
+            parent = tree.parent(iid)
             nested = False
             while parent:
                 if parent in selection:
                     nested = True
                     break
-                parent = self.tree.parent(parent)
+                parent = tree.parent(parent)
             if not nested:
-                result.append(iid)
+                result.append((iid, mapping[iid]))
         return result
 
     def _reveal(self, path: str):
@@ -962,15 +1023,15 @@ class FolderLensApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _zip_selected(self):
-        iids = self._top_level_selection()
-        if not iids:
-            messagebox.showwarning("No selection", "Select files or folders to zip.")
+        selection = self._top_level_selection()
+        if not selection:
+            messagebox.showwarning("No selection", self._no_selection_hint())
             return
         save_path = filedialog.asksaveasfilename(defaultextension=".zip",
                                                  filetypes=[("ZIP files", "*.zip")], title="Save ZIP as")
         if not save_path:
             return
-        paths = [self.iid_to_node[i].path for i in iids if i in self.iid_to_node]
+        paths = [node.path for _, node in selection]
         self._set_status("Creating ZIP…")
 
         def worker():
@@ -996,21 +1057,29 @@ class FolderLensApp(ctk.CTk):
                                        messagebox.showerror("Error", f"Failed to create ZIP: {msg}")))
         threading.Thread(target=worker, daemon=True).start()
 
+    def _no_selection_hint(self) -> str:
+        if self.active_view in ("Tree", "Largest Files"):
+            return "Select files or folders first."
+        return "Switch to the Tree or Largest Files view to select items."
+
     def _delete_selected(self):
-        iids = self._top_level_selection()
-        if not iids:
-            messagebox.showwarning("No selection", "Select files or folders to delete.")
+        selection = self._top_level_selection()
+        if not selection:
+            messagebox.showwarning("No selection", self._no_selection_hint())
             return
-        nodes = [self.iid_to_node[i] for i in iids if i in self.iid_to_node]
-        total = sum(n.size for n in nodes)
+        total = sum(node.size for _, node in selection)
         if not messagebox.askyesno("Confirm delete",
-                                   f"Delete {len(nodes)} item(s) ({format_size(total)})?\nThis cannot be undone."):
+                                   f"Delete {len(selection)} item(s) ({format_size(total)})?\nThis cannot be undone."):
             return
         self._set_status("Deleting…")
 
+        # remember which view started this so the async result never touches a
+        # widget the user has since navigated away from
+        tree, mapping = self._selection_context()
+
         def worker():
             deleted, errors = [], []
-            for iid, node in zip(iids, nodes):
+            for iid, node in selection:
                 try:
                     if os.path.isdir(node.path):
                         shutil.rmtree(node.path)
@@ -1019,10 +1088,17 @@ class FolderLensApp(ctk.CTk):
                     deleted.append((iid, node))
                 except Exception as e:
                     errors.append(f"{node.name}: {e}")
-            self.after(0, lambda: self._apply_deletions(deleted, errors))
+            self.after(0, lambda: self._apply_deletions(deleted, errors, tree, mapping))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_deletions(self, deleted, errors):
+    def _apply_deletions(self, deleted, errors, tree=None, mapping=None):
+        rows_alive = False
+        if tree is not None:
+            try:
+                rows_alive = bool(tree.winfo_exists())
+            except tk.TclError:
+                rows_alive = False
+
         for iid, node in deleted:
             removed_items = (1 + node.item_count) if node.is_dir else 1
             parent = node.parent
@@ -1033,9 +1109,14 @@ class FolderLensApp(ctk.CTk):
                 walk.size -= node.size
                 walk.item_count -= removed_items
                 walk = walk.parent
-            if self.tree.exists(iid):
-                self.tree.delete(iid)
-            self.iid_to_node.pop(iid, None)
+            if rows_alive:
+                try:
+                    if tree.exists(iid):
+                        tree.delete(iid)
+                except tk.TclError:
+                    rows_alive = False
+            if mapping is not None:
+                mapping.pop(iid, None)
 
         if self.root_node:
             self.status_right.configure(text=f"Total: {format_size(self.root_node.size)}")
