@@ -235,38 +235,50 @@ def test_deletion_updates_model_without_the_original_widget(gui, sample_tree):
 
 # --------------------------------------------------------------- toolbar reflow
 
-def resize(win, width, height=700):
-    """Resize for real and let the <Configure> handlers run."""
-    win.geometry(f"{width}x{height}+0+0")
-    for _ in range(40):
-        win.update()
-        if abs(win.winfo_width() - width) <= 2:
-            break
-        time.sleep(0.02)
-    win.update_idletasks()
+def packed_in(widget):
+    """Which container a widget is currently packed into, as a path string.
+
+    Layout-manager state rather than realized pixels: a headless runner may
+    have no window manager, so nothing is ever truly mapped and windows
+    cannot grow past the virtual screen.
+    """
+    try:
+        return str(widget.pack_info().get("in", ""))
+    except (tk.TclError, KeyError):
+        return ""
+
+
+def is_packed(widget) -> bool:
+    return widget.winfo_manager() == "pack"
 
 
 def test_toolbar_keeps_everything_visible_when_narrow(gui):
     """Regression: packing the whole toolbar into one fixed row silently
     clipped whatever didn't fit, so buttons disappeared on smaller windows."""
-    resize(gui, gui.NARROW_WIDTH + 260)
-    assert gui._toolbar_narrow is False
-    assert gui.search_entry.winfo_ismapped()
-    assert gui.actions.winfo_ismapped()
-    assert not gui.toolbar_row2.winfo_ismapped()
+    # drive the reflow directly: the real <Configure> handler would otherwise
+    # immediately re-apply the runner's own window size
+    gui.unbind("<Configure>")
 
-    resize(gui, gui.NARROW_WIDTH - 260)
+    gui._reflow_toolbar(gui.NARROW_WIDTH + 300)
+    gui.update_idletasks()
+    assert gui._toolbar_narrow is False
+    assert packed_in(gui.actions) == str(gui.toolbar_row1)
+    assert packed_in(gui.search_entry) == str(gui.toolbar_row1)
+    assert not is_packed(gui.toolbar_row2)
+
+    gui._reflow_toolbar(gui.NARROW_WIDTH - 300)
+    gui.update_idletasks()
     assert gui._toolbar_narrow is True
-    assert gui.toolbar_row2.winfo_ismapped(), "second row never appeared"
-    # everything is still on screen, just on another row
-    assert gui.search_entry.winfo_ismapped()
-    assert gui.actions.winfo_ismapped()
-    assert gui.actions.winfo_rooty() > gui.view_switch.winfo_rooty()
+    assert is_packed(gui.toolbar_row2), "second row never appeared"
+    # nothing was dropped: both moved to the second row
+    assert packed_in(gui.actions) == str(gui.toolbar_row2)
+    assert packed_in(gui.search_entry) == str(gui.toolbar_row2)
 
-    resize(gui, gui.NARROW_WIDTH + 260)          # and back again
+    gui._reflow_toolbar(gui.NARROW_WIDTH + 300)          # and back again
+    gui.update_idletasks()
     assert gui._toolbar_narrow is False
-    assert gui.actions.winfo_ismapped()
-    assert not gui.toolbar_row2.winfo_ismapped()
+    assert packed_in(gui.actions) == str(gui.toolbar_row1)
+    assert not is_packed(gui.toolbar_row2)
 
 
 # ------------------------------------------------------------------- treemap
@@ -340,7 +352,7 @@ def test_viewer_modes_expose_different_tools(gui, gallery):
         viewer._on_mode_change("Basic")
         viewer.update_idletasks()
         assert set(viewer.tool_buttons) == set(annotate.BASIC_TOOLS)
-        assert viewer.tools_bar.winfo_ismapped()
+        assert is_packed(viewer.tools_bar), "tool bar hidden in Basic mode"
 
         viewer._on_mode_change("Advanced")
         viewer.update_idletasks()
@@ -349,7 +361,7 @@ def test_viewer_modes_expose_different_tools(gui, gallery):
 
         viewer._on_mode_change("Off")
         viewer.update_idletasks()
-        assert not viewer.tools_bar.winfo_ismapped()
+        assert not is_packed(viewer.tools_bar), "tool bar left visible when Off"
     finally:
         viewer.destroy()
 
@@ -388,15 +400,23 @@ def test_viewer_annotation_actions_stay_visible_when_narrow(gui, gallery):
     import app as appmod
     viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
     try:
+        viewer.unbind("<Configure>")
         viewer._on_mode_change("Advanced")
-        resize(viewer, viewer.TOOLS_NARROW_WIDTH + 160, 640)
-        assert viewer._tools_narrow is False
-        assert viewer.tools_right.winfo_ismapped()
 
-        resize(viewer, viewer.TOOLS_NARROW_WIDTH - 300, 640)
+        viewer._reflow_tools(viewer.TOOLS_NARROW_WIDTH + 200)
+        viewer.update_idletasks()
+        assert viewer._tools_narrow is False
+        # both groups share the first row, actions packed first so they keep
+        # their width instead of being squeezed off the edge
+        assert packed_in(viewer.tools_right) == str(viewer.tools_row_a)
+        assert packed_in(viewer.tools_left) == str(viewer.tools_row_a)
+        assert not is_packed(viewer.tools_row_b)
+
+        viewer._reflow_tools(viewer.TOOLS_NARROW_WIDTH - 300)
+        viewer.update_idletasks()
         assert viewer._tools_narrow is True
-        assert viewer.tools_row_b.winfo_ismapped(), "actions row never appeared"
-        assert viewer.tools_right.winfo_ismapped()
-        assert viewer.tools_right.winfo_rooty() > viewer.tools_left.winfo_rooty()
+        assert is_packed(viewer.tools_row_b), "actions row never appeared"
+        assert packed_in(viewer.tools_right) == str(viewer.tools_row_b)
+        assert packed_in(viewer.tools_left) == str(viewer.tools_row_a)
     finally:
         viewer.destroy()
