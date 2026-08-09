@@ -1,5 +1,5 @@
 @echo off
-rem FolderLens Build Script
+rem FolderLens Build Script (antivirus-friendly)
 
 echo ===================================
 echo FolderLens Build Script
@@ -8,48 +8,44 @@ echo.
 
 cd /d "%~dp0"
 
-echo [1/3] Cleaning old files...
+echo [1/4] Cleaning old build output...
 if exist "dist" rmdir /s /q "dist"
+if exist "dist_onedir" rmdir /s /q "dist_onedir"
 if exist "build" rmdir /s /q "build"
-if exist "FolderLens.spec" del /q "FolderLens.spec" 2>nul
 
 echo.
-echo [2/3] Building executable with PyInstaller...
-echo.
-
-pyinstaller --onefile --windowed --name FolderLens ^
-    --add-data "version.py;." ^
-    --add-data "file_utils.py;." ^
-    --add-data "scanner.py;." ^
-    --add-data "registry_installer.py;." ^
-    --add-data "updater.py;." ^
-    --hidden-import customtkinter ^
-    --hidden-import darkdetect ^
-    --hidden-import PIL ^
-    --hidden-import PIL.Image ^
-    --hidden-import PIL.ImageTk ^
-    --collect-all customtkinter ^
-    main.py
-
-if errorlevel 1 (
-    echo.
-    echo [ERROR] PyInstaller failed!
-    pause
-    exit /b 1
-)
+echo [2/4] Generating Windows version resource...
+python make_version_info.py
+if errorlevel 1 goto :error
 
 echo.
-echo [3/3] Build complete!
+echo [3/4] Building one-file executable (no UPX, signed metadata, manifest)...
+pyinstaller --noconfirm FolderLens.spec
+if errorlevel 1 goto :error
+
+echo.
+echo [4/4] Building one-directory variant (most antivirus-friendly)...
+set FL_ONEDIR=1
+pyinstaller --noconfirm --distpath dist_onedir FolderLens.spec
+set FL_ONEDIR=
+if errorlevel 1 goto :error
+
 echo.
 echo ===================================
 echo BUILD SUCCESS
 echo ===================================
 echo.
-echo Output: dist\FolderLens.exe
+echo   dist\FolderLens.exe                 one-file executable
+echo   dist_onedir\FolderLens\FolderLens.exe   folder build (use if antivirus flags the one-file exe)
 echo.
-echo To install:
-echo   1. Run: python simple_installer.py
-echo   2. Or just copy dist\FolderLens.exe where you want
+echo If Windows Defender still flags the one-file exe, use the folder build
+echo or see docs\ANTIVIRUS.md for how to submit a false-positive report.
 echo.
-
 pause
+exit /b 0
+
+:error
+echo.
+echo [ERROR] Build failed!
+pause
+exit /b 1
