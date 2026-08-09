@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to create and release (e.g. v1.1.0); leave empty for a build-only run"
+        description: "Tag to create and release (e.g. v3.0.0); leave empty for a build-only run"
         required: false
         default: ""
 
@@ -27,23 +27,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt pytest
 
       - name: Run tests
-        run: |
-          python -m pip install pytest
-          python -m pytest tests -v
+        run: python -m pytest tests -v
 
-      - name: Build standalone executable
-        run: >
-          pyinstaller --onefile --windowed --name FolderLens
-          --hidden-import customtkinter
-          --hidden-import darkdetect
-          --hidden-import PIL
-          --hidden-import PIL.Image
-          --hidden-import PIL.ImageTk
-          --collect-all customtkinter
-          main.py
+      - name: Generate Windows version resource
+        run: python make_version_info.py
+
+      - name: Build one-file executable (no UPX, embedded metadata + manifest)
+        run: pyinstaller --noconfirm FolderLens.spec
 
       - name: Smoke test executable
         shell: pwsh
@@ -52,16 +45,37 @@ jobs:
           $p = Start-Process -FilePath dist\FolderLens.exe -ArgumentList '--version' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "Smoke test failed with exit code $($p.ExitCode)" }
 
-      - name: Upload artifact
+      - name: Build one-directory variant (antivirus-friendly)
+        shell: pwsh
+        env:
+          FL_ONEDIR: "1"
+        run: pyinstaller --noconfirm --distpath dist_onedir FolderLens.spec
+
+      - name: Package one-directory variant as zip
+        shell: pwsh
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
+          $ver = $tag -replace '^v', ''
+          if (-not $ver) { $ver = "dev" }
+          Compress-Archive -Path dist_onedir\FolderLens\* -DestinationPath "FolderLens-$ver-win64.zip" -Force
+          Get-ChildItem FolderLens-*.zip
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: FolderLens-windows
-          path: dist/FolderLens.exe
+          path: |
+            dist/FolderLens.exe
+            FolderLens-*-win64.zip
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist/FolderLens.exe
+          files: |
+            dist/FolderLens.exe
+            FolderLens-*-win64.zip
           generate_release_notes: true

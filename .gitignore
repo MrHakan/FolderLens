@@ -29,9 +29,12 @@ env/
 
 # pyinstaller
 dist/
-*.spec
-*.manifest
+dist_onedir/
+build/
 *.exe
+# version_info.txt is generated at build time by make_version_info.py
+version_info.txt
+# FolderLens.spec and app.manifest ARE tracked (build inputs)
 
 # installer output
 installer_output/
@@ -92,6 +95,9 @@ secrets/
 credentials/
 config.local.*
 
-# assets placeholder
+# assets: keep source icons + generator, ignore any other stray files
 assets/*
 !assets/.gitkeep
+!assets/icon.ico
+!assets/icon.png
+!assets/make_icon.py
