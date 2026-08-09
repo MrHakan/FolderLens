@@ -26,9 +26,22 @@ worker threads — then lets you explore it four different ways with zero
 rescanning:
 
 - 🌳 **Tree view** — expandable folder tree with a usage bar, size, item count, type, and date at every level. Expanding a folder is instant.
-- 🗺️ **Treemap** — WinDirStat-style colored map where every rectangle's area is its size. Hover for details, click a folder to zoom in, and drill back out.
-- 🏆 **Largest files** — the top 100 biggest files anywhere in the tree, with their locations. Double-click to reveal in Explorer.
+- 🗺️ **Treemap** — cushion-shaded map where every rectangle's area is its size, folders get their own header band, and **image files are painted with their own thumbnail** so you can recognise them at a glance. Hover for a **peek preview** of the picture, click a folder to zoom in, right-click to go back.
+- 🏆 **Largest files** — the top 100 biggest files anywhere in the tree, with their locations and small inline previews.
 - 🧩 **File types** — size and count broken down by category (video, image, code, …) with proportional bars.
+
+### Image viewer & annotation
+
+Double-click any image (in any view) to open it:
+
+- ◀ ▶ **step through every image in the folder**, with a position counter
+- ⬅ **Up** and a **subfolder picker** to move around without leaving the viewer
+- ✏️ **Annotate** in two modes:
+  - **Basic** — pen, marker, arrow, eraser
+  - **Advanced** — adds line, rectangle, ellipse, text, and redo
+- colour palette, brush size, undo/redo, clear, and **Save as…** to export the annotated copy at full resolution
+
+Annotations are stored relative to the image, so they stay put when you resize or zoom, and export sharp at the original resolution.
 
 Plus:
 
@@ -69,8 +82,16 @@ python main.py --version
 | `F5` | Rescan current folder |
 | `Ctrl+F` | Focus search |
 | `Esc` | Clear search |
-| `Delete` | Delete selected (tree view) |
-| Double-click | Open folder / preview image |
+| `Delete` | Delete selected (tree / largest files) |
+| Double-click | Open folder / open image viewer |
+
+In the image viewer:
+
+| Key | Action |
+| --- | --- |
+| `←` `→` | Previous / next image |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo annotation |
+| `Esc` | Close |
 
 ## Requirements
 
@@ -103,9 +124,13 @@ build.bat
 ```
 FolderLens/
 ├── main.py               # entry point, CLI
-├── app.py                # UI (customtkinter + ttk): tree, treemap, largest, types
+├── app.py                # UI (customtkinter + ttk): views, image viewer, toolbars
 ├── scanner.py            # single-pass parallel tree scanner
 ├── analysis.py           # treemap layout, largest-files, type breakdown, CSV (pure, tested)
+├── treemap_render.py     # cushion shading, thumbnails, labels, hit-testing
+├── thumbnails.py         # background thumbnail decoding + LRU cache
+├── annotate.py           # annotation model, tools, undo/redo, export (pure, tested)
+├── imagenav.py           # image/folder navigation for the viewer (pure, tested)
 ├── file_utils.py         # file type detection, formatting
 ├── updater.py            # auto-update handler
 ├── version.py            # version info
