@@ -7,6 +7,7 @@ display. They skip themselves cleanly when tkinter or a display is missing
 import os
 import sys
 import threading
+import time
 
 import pytest
 
@@ -163,22 +164,39 @@ def test_treemap_labels_are_hit_testable(gui):
         assert hit and gui._tile_items.get(hit[0]) is not None
 
 
+def test_treemap_redraw_is_wired_to_resize(gui):
+    """The canvas must actually ask for a redraw when it is resized."""
+    show(gui, "Treemap")
+    assert gui.treemap_canvas.bind("<Configure>"), "no <Configure> handler bound"
+
+
 def test_treemap_resize_is_debounced(gui):
     """A window resize fires a burst of <Configure> events; they must collapse
-    into a single re-layout instead of one per pixel."""
+    into exactly one re-layout instead of one per event.
+
+    Driven through the scheduler directly rather than by resizing a widget:
+    whether a toolkit emits <Configure> for a given geometry change differs
+    between platforms, but the debouncing itself must not.
+    """
     show(gui, "Treemap")
-    gui.treemap_canvas.configure(width=800, height=500)
-    gui.update_idletasks()
 
     calls = []
     original = gui._draw_treemap
     gui._draw_treemap = lambda: calls.append(1)
     try:
-        for width in range(700, 740):
-            gui.treemap_canvas.configure(width=width)
-            gui.update_idletasks()
-        assert len(calls) == 0, "redrew synchronously during the resize burst"
+        for _ in range(40):
+            gui._schedule_treemap_redraw()
+
+        assert calls == [], "redrew synchronously during the burst"
         assert gui._treemap_redraw_after is not None, "no redraw was scheduled"
+
+        deadline = time.time() + 5
+        while not calls and time.time() < deadline:
+            gui.update()
+            time.sleep(0.02)
+
+        assert len(calls) == 1, f"expected exactly 1 redraw for 40 events, got {len(calls)}"
+        assert gui._treemap_redraw_after is None, "pending redraw was not cleared"
     finally:
         gui._draw_treemap = original
 
