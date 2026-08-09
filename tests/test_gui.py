@@ -25,6 +25,7 @@ try:
 except Exception as exc:  # pragma: no cover - environment dependent
     pytest.skip(f"cannot open a Tk display: {exc}", allow_module_level=True)
 
+import treemap_render
 from scanner import TreeScanner
 
 
@@ -44,12 +45,25 @@ def scan_sync(path):
 
 @pytest.fixture
 def sample_tree(tmp_path):
+    from PIL import Image
     (tmp_path / "big.mp4").write_bytes(b"v" * 60000)
     (tmp_path / "notes.txt").write_bytes(b"t" * 800)
     sub = tmp_path / "sub"
     sub.mkdir()
-    (sub / "pic.png").write_bytes(b"p" * 9000)
+    Image.new("RGB", (120, 90), (200, 60, 60)).save(sub / "pic.png")
     return tmp_path
+
+
+@pytest.fixture
+def gallery(tmp_path):
+    """A folder of real images plus a subfolder, for the viewer tests."""
+    from PIL import Image
+    root = tmp_path / "gallery"
+    (root / "more").mkdir(parents=True)
+    for i, color in enumerate([(220, 80, 60), (60, 140, 220), (80, 190, 120)]):
+        Image.new("RGB", (160, 120), color).save(root / f"shot{i}.png")
+    Image.new("RGB", (80, 60), (10, 10, 10)).save(root / "more" / "deep.png")
+    return root
 
 
 @pytest.fixture
@@ -148,20 +162,20 @@ def test_top_level_selection_drops_nested_rows(gui):
 
 
 def test_treemap_labels_are_hit_testable(gui):
-    """Regression: hit-testing resolves to the topmost canvas item, so tiles
-    with a name label swallowed the tooltip/click exactly where the pointer
-    naturally lands."""
+    """Regression: hovering a tile where its name label is drawn used to lose
+    the tooltip. Hit-testing is geometric now, so the label area belongs to its
+    own tile like any other pixel."""
     show(gui, "Treemap")
     gui.treemap_canvas.configure(width=820, height=520)
     gui.update_idletasks()
     gui._draw_treemap()
 
-    labeled = [t for t in gui._tile_items.values() if t.w > 46 and t.h > 16]
+    labeled = [t for t in gui._tiles if t.w > 54 and t.h > 18]
     assert labeled, "expected at least one tile large enough to be labelled"
 
     for tile in labeled:
-        hit = gui.treemap_canvas.find_closest(int(tile.x + 8), int(tile.y + 6))
-        assert hit and gui._tile_items.get(hit[0]) is not None
+        hit = treemap_render.hit_test(gui._tiles, tile.x + 8, tile.y + 6)
+        assert hit is not None, "lost the hit over a tile label"
 
 
 def test_treemap_redraw_is_wired_to_resize(gui):
@@ -217,3 +231,172 @@ def test_deletion_updates_model_without_the_original_widget(gui, sample_tree):
 
     assert gui.root_node.size == before - node.size
     assert node not in gui.root_node.children
+
+
+# --------------------------------------------------------------- toolbar reflow
+
+def resize(win, width, height=700):
+    """Resize for real and let the <Configure> handlers run."""
+    win.geometry(f"{width}x{height}+0+0")
+    for _ in range(40):
+        win.update()
+        if abs(win.winfo_width() - width) <= 2:
+            break
+        time.sleep(0.02)
+    win.update_idletasks()
+
+
+def test_toolbar_keeps_everything_visible_when_narrow(gui):
+    """Regression: packing the whole toolbar into one fixed row silently
+    clipped whatever didn't fit, so buttons disappeared on smaller windows."""
+    resize(gui, gui.NARROW_WIDTH + 260)
+    assert gui._toolbar_narrow is False
+    assert gui.search_entry.winfo_ismapped()
+    assert gui.actions.winfo_ismapped()
+    assert not gui.toolbar_row2.winfo_ismapped()
+
+    resize(gui, gui.NARROW_WIDTH - 260)
+    assert gui._toolbar_narrow is True
+    assert gui.toolbar_row2.winfo_ismapped(), "second row never appeared"
+    # everything is still on screen, just on another row
+    assert gui.search_entry.winfo_ismapped()
+    assert gui.actions.winfo_ismapped()
+    assert gui.actions.winfo_rooty() > gui.view_switch.winfo_rooty()
+
+    resize(gui, gui.NARROW_WIDTH + 260)          # and back again
+    assert gui._toolbar_narrow is False
+    assert gui.actions.winfo_ismapped()
+    assert not gui.toolbar_row2.winfo_ismapped()
+
+
+# ------------------------------------------------------------------- treemap
+
+def test_treemap_renders_an_image_not_flat_rectangles(gui):
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+
+    assert gui._tiles, "no tiles laid out"
+    assert gui._treemap_photo is not None, "treemap image was not produced"
+
+
+def test_treemap_hit_testing_uses_geometry(gui):
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+
+    tile = gui._tiles[-1]
+    hit = treemap_render.hit_test(gui._tiles, tile.x + tile.w / 2, tile.y + tile.h / 2)
+    assert hit is tile
+    assert treemap_render.hit_test(gui._tiles, -50, -50) is None
+
+
+def test_treemap_hover_populates_the_tooltip(gui):
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+
+    tile = gui._tiles[0]
+    event = type("E", (), {"x": int(tile.x + tile.w / 2), "y": int(tile.y + tile.h / 2)})()
+    gui._treemap_hover(event)
+    assert gui.tooltip.label.cget("text"), "tooltip had no text"
+    assert gui._hover_tile is not None
+
+
+# -------------------------------------------------------------- image viewer
+
+def test_viewer_navigates_images_and_folders(gui, gallery):
+    import app as appmod
+    viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
+    try:
+        viewer.update_idletasks()
+        assert viewer.image is not None
+        assert viewer.nav.count == 3
+
+        first = viewer.nav.current
+        viewer._go_next()
+        assert viewer.nav.current != first
+        viewer._go_prev()
+        assert viewer.nav.current == first
+
+        # walk into the subfolder and back out
+        assert viewer._subfolders
+        viewer._open_subfolder(list(viewer._subfolders)[0])
+        assert viewer.nav.folder.endswith("more")
+        viewer._go_parent()
+        assert viewer.nav.folder.endswith("gallery")
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_modes_expose_different_tools(gui, gallery):
+    import app as appmod
+    import annotate
+    viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
+    try:
+        viewer._on_mode_change("Basic")
+        viewer.update_idletasks()
+        assert set(viewer.tool_buttons) == set(annotate.BASIC_TOOLS)
+        assert viewer.tools_bar.winfo_ismapped()
+
+        viewer._on_mode_change("Advanced")
+        viewer.update_idletasks()
+        assert set(viewer.tool_buttons) == set(annotate.ADVANCED_TOOLS)
+        assert "rect" in viewer.tool_buttons and "text" in viewer.tool_buttons
+
+        viewer._on_mode_change("Off")
+        viewer.update_idletasks()
+        assert not viewer.tools_bar.winfo_ismapped()
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_draws_and_undoes_a_stroke(gui, gallery):
+    import app as appmod
+    viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
+    try:
+        viewer.geometry("900x700")
+        viewer.update_idletasks()
+        viewer._on_mode_change("Basic")
+        viewer._select_tool("pen")
+        viewer.update_idletasks()
+
+        x, y, w, h = viewer._draw_geometry
+        E = lambda px, py: type("E", (), {"x": px, "y": py})()
+        viewer._on_press(E(x + 10, y + 10))
+        for i in range(5):
+            viewer._on_drag(E(x + 10 + i * 9, y + 12 + i * 7))
+        viewer._on_release(E(x + 60, y + 50))
+
+        assert len(viewer.doc.shapes) == 1
+        assert len(viewer.doc.shapes[0].points) > 1
+        # coordinates are normalized, so they stay inside 0..1
+        assert all(0.0 <= px <= 1.0 and 0.0 <= py <= 1.0
+                   for px, py in viewer.doc.shapes[0].points)
+
+        viewer._undo()
+        assert viewer.doc.is_empty
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_annotation_actions_stay_visible_when_narrow(gui, gallery):
+    """Regression: the tools filled the row first, so 'Save as…' got clipped."""
+    import app as appmod
+    viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
+    try:
+        viewer._on_mode_change("Advanced")
+        resize(viewer, viewer.TOOLS_NARROW_WIDTH + 160, 640)
+        assert viewer._tools_narrow is False
+        assert viewer.tools_right.winfo_ismapped()
+
+        resize(viewer, viewer.TOOLS_NARROW_WIDTH - 300, 640)
+        assert viewer._tools_narrow is True
+        assert viewer.tools_row_b.winfo_ismapped(), "actions row never appeared"
+        assert viewer.tools_right.winfo_ismapped()
+        assert viewer.tools_right.winfo_rooty() > viewer.tools_left.winfo_rooty()
+    finally:
+        viewer.destroy()

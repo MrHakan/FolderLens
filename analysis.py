@@ -185,12 +185,17 @@ def squarify(sizes: List[float], x: float, y: float, dx: float, dy: float) -> Li
 
 
 def build_treemap(root, x: float, y: float, width: float, height: float,
-                  min_area: float = 90.0, max_depth: int = 6, padding: float = 1.0) -> List[Tile]:
+                  min_area: float = 90.0, max_depth: int = 6, padding: float = 1.0,
+                  header: float = 0.0) -> List[Tile]:
     """Build treemap tiles for a Node.
 
     Recurses into directories only while their tile is large enough
     (area >= min_area) and depth allows, so the tile count stays bounded and
     the canvas stays responsive on huge trees.
+
+    `header` reserves a strip along the top of a directory's tile before its
+    children are laid out, giving the folder somewhere to put its own name.
+    Without it a folder's label lands on top of its first child's label.
     """
     tiles: List[Tile] = []
     if width <= 1 or height <= 1:
@@ -208,10 +213,16 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
             if rw <= 0 or rh <= 0:
                 continue
             tiles.append(Tile(node=child, x=rx, y=ry, w=rw, h=rh, depth=depth))
-            if (child.is_dir and depth + 1 < max_depth
-                    and (rw - 2 * padding) * (rh - 2 * padding) >= min_area):
-                stack.append((child, rx + padding, ry + padding,
-                              rw - 2 * padding, rh - 2 * padding, depth + 1))
+            if not (child.is_dir and depth + 1 < max_depth):
+                continue
+
+            # only spend a header on tiles with room to spare for one
+            head = header if (header and rh >= header * 3 and rw >= 80) else 0.0
+            inner_w = rw - 2 * padding
+            inner_h = rh - 2 * padding - head
+            if inner_w > 0 and inner_h > 0 and inner_w * inner_h >= min_area:
+                stack.append((child, rx + padding, ry + padding + head,
+                              inner_w, inner_h, depth + 1))
     return tiles
 
 
