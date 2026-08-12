@@ -56,6 +56,9 @@ jobs:
         run: |
           $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
           $ver = $tag -replace '^v', ''
+          # a build-only dispatch runs on a branch, whose name can contain '/'
+          # and other characters that are not legal in a file name
+          $ver = $ver -replace '[^0-9A-Za-z._-]', '-'
           if (-not $ver) { $ver = "dev" }
           Compress-Archive -Path dist_onedir\FolderLens\* -DestinationPath "FolderLens-$ver-win64.zip" -Force
           Get-ChildItem FolderLens-*.zip

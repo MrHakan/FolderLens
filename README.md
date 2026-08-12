@@ -5,7 +5,7 @@
 # FolderLens
 
 **A fast, modern folder size analyzer for Windows.**
-See what's eating your disk — as a tree, a treemap, a top-files list, or a file-type breakdown.
+See what's eating your disk — as a tree, a treemap, a top-files list, a file-type breakdown, or duplicate copies.
 
 [![CI](https://github.com/MrHakan/FolderLens/actions/workflows/ci.yml/badge.svg)](https://github.com/MrHakan/FolderLens/actions/workflows/ci.yml)
 [![Release](https://github.com/MrHakan/FolderLens/actions/workflows/release.yml/badge.svg)](https://github.com/MrHakan/FolderLens/actions/workflows/release.yml)
@@ -22,13 +22,14 @@ Grab the latest build from the [Releases page](https://github.com/MrHakan/Folder
 ## Features
 
 FolderLens scans a whole directory tree **once** — in parallel, across up to 32
-worker threads — then lets you explore it four different ways with zero
+worker threads — then lets you explore it five different ways with zero
 rescanning:
 
 - 🌳 **Tree view** — expandable folder tree with a usage bar, size, item count, type, and date at every level. Expanding a folder is instant.
 - 🗺️ **Treemap** — cushion-shaded map where every rectangle's area is its size, folders get their own header band, and **image files are painted with their own thumbnail** so you can recognise them at a glance. Hover for a **peek preview** of the picture, click a folder to zoom in, right-click to go back.
 - 🏆 **Largest files** — the top 100 biggest files anywhere in the tree, with their locations and small inline previews.
 - 🧩 **File types** — size and count broken down by category (video, image, code, …) with proportional bars.
+- 👯 **Duplicates** — finds byte-identical copies and shows exactly how much space keeping one of each would free. Narrowed by size, then a head/tail sample, then a full hash, so almost nothing is read twice.
 
 ### Image viewer & annotation
 
@@ -48,7 +49,8 @@ Plus:
 - 🔎 **Instant search** across the whole tree (Ctrl+F)
 - 🧵 **Fully responsive** — scanning, zipping, deleting, and exporting all run off the UI thread, with live progress and a **Stop** button
 - 🗑️ **Manage** — multi-select to zip, delete, or open in Explorer (right-click, toolbar, or Delete key); sizes update without rescanning
-- 📤 **Export** the full report to CSV
+- 📤 **Export** the full report to CSV, or the treemap itself as a PNG
+- ♻️ **Recycle Bin** — deletions are undoable by default (permanent delete is a setting)
 - 💽 **Disk usage** shown in the status bar (free / total)
 - 🌗 **Light / dark** theme, remembered between sessions, along with your last folder and view
 - ⬆️ **Auto-update** from GitHub releases
@@ -82,7 +84,7 @@ python main.py --version
 | `F5` | Rescan current folder |
 | `Ctrl+F` | Focus search |
 | `Esc` | Clear search |
-| `Delete` | Delete selected (tree / largest files) |
+| `Delete` | Delete selected (tree / largest files / duplicates) |
 | Double-click | Open folder / open image viewer |
 
 In the image viewer:
@@ -127,6 +129,8 @@ FolderLens/
 ├── app.py                # UI (customtkinter + ttk): views, image viewer, toolbars
 ├── scanner.py            # single-pass parallel tree scanner
 ├── analysis.py           # treemap layout, largest-files, type breakdown, CSV (pure, tested)
+├── duplicates.py         # size -> sample -> full hash duplicate detection (pure, tested)
+├── trash.py              # Recycle Bin / XDG trash, with a permanent-delete fallback
 ├── treemap_render.py     # cushion shading, thumbnails, labels, hit-testing
 ├── thumbnails.py         # background thumbnail decoding + LRU cache
 ├── annotate.py           # annotation model, tools, undo/redo, export (pure, tested)

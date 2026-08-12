@@ -20,8 +20,10 @@ from file_utils import (
 from scanner import TreeScanner, Node
 import analysis
 import annotate
+import duplicates
 import imagenav
 import treemap_render
+import trash
 from thumbnails import ThumbnailCache, fit_box
 from version import VERSION
 from updater import get_updater
@@ -61,6 +63,7 @@ class AppSettings:
         self.list_thumbnails = True
         self.peek_preview = True
         self.annotation_mode = "Basic"
+        self.use_recycle_bin = True
         self.load()
 
     def row_height(self) -> int:
@@ -81,9 +84,10 @@ class AppSettings:
                 self.dark_mode = data['dark_mode']
             if isinstance(data.get('last_folder'), str):
                 self.last_folder = data['last_folder']
-            if data.get('view') in ("Tree", "Treemap", "Largest Files", "File Types"):
+            if data.get('view') in ("Tree", "Treemap", "Largest Files", "File Types", "Duplicates"):
                 self.view = data['view']
-            for flag in ('treemap_thumbnails', 'list_thumbnails', 'peek_preview'):
+            for flag in ('treemap_thumbnails', 'list_thumbnails', 'peek_preview',
+                         'use_recycle_bin'):
                 if isinstance(data.get(flag), bool):
                     setattr(self, flag, data[flag])
             if data.get('annotation_mode') in ("Basic", "Advanced"):
@@ -106,6 +110,7 @@ class AppSettings:
                     'list_thumbnails': self.list_thumbnails,
                     'peek_preview': self.peek_preview,
                     'annotation_mode': self.annotation_mode,
+                    'use_recycle_bin': self.use_recycle_bin,
                 }, f, indent=2)
         except OSError:
             pass
@@ -691,6 +696,11 @@ class SettingsMenu(ctk.CTkToplevel):
         ctk.CTkSwitch(main, text="Show small previews in lists",
                       variable=self.list_thumbs_var).pack(anchor="w", pady=6)
 
+        ctk.CTkLabel(main, text="Deleting", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(12, 0))
+        self.recycle_var = ctk.BooleanVar(value=self.settings.use_recycle_bin)
+        ctk.CTkSwitch(main, text="Send deleted files to the Recycle Bin",
+                      variable=self.recycle_var).pack(anchor="w", pady=6)
+
         ctk.CTkLabel(main, text="Annotation", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(12, 0))
         ctk.CTkLabel(main, text="Basic: pen, marker, arrow, eraser.\nAdvanced: adds shapes, text, redo.",
                      font=ctk.CTkFont(size=11), text_color="gray",
@@ -706,6 +716,7 @@ class SettingsMenu(ctk.CTkToplevel):
         self.settings.treemap_thumbnails = self.treemap_thumbs_var.get()
         self.settings.list_thumbnails = self.list_thumbs_var.get()
         self.settings.annotation_mode = self.annotation_var.get()
+        self.settings.use_recycle_bin = self.recycle_var.get()
         self.on_apply()
         self.destroy()
 
@@ -811,7 +822,7 @@ class FolderLensApp(ctk.CTk):
     """Fast, multi-view folder size explorer."""
 
     BAR_WIDTH = 10
-    VIEWS = ["Tree", "Treemap", "Largest Files", "File Types"]
+    VIEWS = ["Tree", "Treemap", "Largest Files", "File Types", "Duplicates"]
 
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
@@ -841,11 +852,20 @@ class FolderLensApp(ctk.CTk):
         self.largest_tree: Optional[ttk.Treeview] = None
         self.largest_map: Dict[str, Node] = {}
 
+        # duplicates view state
+        self.dup_tree: Optional[ttk.Treeview] = None
+        self.dup_map: Dict[str, Node] = {}
+        self.dup_groups: List[duplicates.DuplicateGroup] = []
+        self._dup_running = False
+        self._dup_cancel = False
+
         # treemap state
         self.treemap_stack: List[Node] = []
         self._tiles: List[analysis.Tile] = []
         self._hover_tile = None
+        self._highlight_id = None
         self._treemap_photo = None
+        self._treemap_image = None
         self._peek_path: Optional[str] = None
         self._peek_args = None
         self.tooltip: Optional[Tooltip] = None
@@ -892,6 +912,13 @@ class FolderLensApp(ctk.CTk):
     # everything into one fixed row silently clipped whatever didn't fit,
     # which is why buttons went missing on smaller windows.
     NARROW_WIDTH = 1120
+
+    # Tk keeps every PhotoImage alive for as long as we reference it, so the
+    # row-preview map is capped rather than left to grow while browsing.
+    MAX_ROW_PHOTOS = 400
+
+    # duplicates below this are rarely worth the read time
+    DUPLICATE_MIN_SIZE = 4096
 
     def _build_toolbar(self):
         self.toolbar = ctk.CTkFrame(self, fg_color=("gray95", "gray14"), corner_radius=0)
@@ -945,9 +972,10 @@ class FolderLensApp(ctk.CTk):
                                        text_color=("gray30", "gray70"), hover_color=("gray85", "gray25"),
                                        command=self._toggle_theme)
         self.theme_btn.pack(side="right", padx=4)
-        ctk.CTkButton(self.actions, text="⬇ CSV", width=70, height=34, font=ctk.CTkFont(size=12),
-                      fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
-                      command=self._export_csv).pack(side="right", padx=4)
+        ctk.CTkButton(self.actions, text="⬇ Export", width=84, height=34,
+                      font=ctk.CTkFont(size=12), fg_color="transparent", border_width=1,
+                      text_color=("gray20", "gray80"),
+                      command=self._show_export_menu).pack(side="right", padx=4)
 
         self.search_var = ctk.StringVar()
         self.search_entry = ctk.CTkEntry(self.toolbar, textvariable=self.search_var,
@@ -1108,6 +1136,12 @@ class FolderLensApp(ctk.CTk):
         # reaches for a stale one later
         self.tree = None
         self.largest_tree = None
+        self.dup_tree = None
+        # every row that was pointing at a thumbnail is gone with them; the
+        # map would otherwise grow for the lifetime of the session
+        self._row_by_path.clear()
+        if len(self._row_photos) > self.MAX_ROW_PHOTOS:
+            self._row_photos.clear()
 
     def _render_active_view(self):
         self._clear_body()
@@ -1119,6 +1153,8 @@ class FolderLensApp(ctk.CTk):
             self._render_largest()
         elif self.active_view == "File Types":
             self._render_types()
+        elif self.active_view == "Duplicates":
+            self._render_duplicates()
 
     def _empty_hint(self, text: str):
         wrap = tk.Frame(self.body, bg=self._colors()['tree_bg'])
@@ -1447,6 +1483,149 @@ class FolderLensApp(ctk.CTk):
             fill = tk.Frame(track, bg=stat.color, height=14)
             fill.place(relx=0, rely=0, relwidth=max(stat.size / total, 0.004), relheight=1)
 
+    # ---- Duplicates view
+
+    def _render_duplicates(self):
+        if not self.root_node:
+            self._empty_hint("Select a folder to analyze")
+            return
+
+        colors = self._colors()
+        bar = tk.Frame(self.body, bg=colors['head_bg'], height=38)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        self.dup_status = tk.Label(bar, text="", bg=colors['head_bg'], fg=colors['head_fg'],
+                                   font=("Segoe UI", 10))
+        self.dup_status.pack(side="left", padx=12)
+
+        self.dup_button = tk.Button(bar, text="Find duplicates", bd=0, relief="flat",
+                                    cursor="hand2", bg=ACCENT, fg="white",
+                                    activebackground=ACCENT_HOVER, activeforeground="white",
+                                    font=("Segoe UI", 10, "bold"), padx=14, pady=4,
+                                    command=self._toggle_duplicate_scan)
+        self.dup_button.pack(side="right", padx=10, pady=6)
+
+        headings = {
+            "#0": ("File / group", lambda: None),
+            "size": ("Size", lambda: None),
+            "wasted": ("Reclaimable", lambda: None),
+            "path": ("Location", lambda: None),
+        }
+        widths = {
+            "#0": (360, 220, "w", False),
+            "size": (100, 80, "e", False),
+            "wasted": (110, 90, "e", False),
+            "path": (520, 240, "w", True),
+        }
+        self.dup_tree = self._make_treeview(("size", "wasted", "path"), headings, widths)
+        self.dup_map = {}
+        self.dup_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.dup_tree.bind("<Delete>", lambda e: self._delete_selected())
+        self.dup_tree.bind("<Double-Button-1>", self._on_duplicate_double)
+
+        if self.dup_groups:
+            self._fill_duplicates()
+        else:
+            self.dup_status.configure(
+                text="Find byte-identical copies and reclaim the space they waste")
+
+    def _on_duplicate_double(self, event):
+        node = self.dup_map.get(self.dup_tree.identify_row(event.y))
+        if node:
+            self._reveal(node.path)
+
+    def _toggle_duplicate_scan(self):
+        if self._dup_running:
+            self._dup_cancel = True
+            return
+        self._start_duplicate_scan()
+
+    def _start_duplicate_scan(self):
+        root = self.root_node
+        if not root:
+            return
+        self._dup_running = True
+        self._dup_cancel = False
+        self.dup_button.configure(text="Stop")
+        self.dup_status.configure(text="Scanning…")
+
+        def report(stage, done, total):
+            if total:
+                self.after(0, lambda: self._safe_dup_status(f"{stage}… {done:,}/{total:,}"))
+
+        def worker():
+            try:
+                found = duplicates.find_duplicates(
+                    root, min_size=self.DUPLICATE_MIN_SIZE,
+                    progress=report, should_cancel=lambda: self._dup_cancel)
+            except Exception as exc:
+                message = str(exc)
+                self.after(0, lambda: self._duplicate_scan_failed(message))
+                return
+            self.after(0, lambda: self._duplicate_scan_done(found))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _safe_dup_status(self, text: str):
+        if self.active_view == "Duplicates" and getattr(self, "dup_status", None) is not None:
+            try:
+                self.dup_status.configure(text=text)
+            except tk.TclError:
+                pass
+
+    def _duplicate_scan_failed(self, message: str):
+        self._dup_running = False
+        self._safe_dup_status(f"Failed: {message}")
+        if self.active_view == "Duplicates":
+            try:
+                self.dup_button.configure(text="Find duplicates")
+            except tk.TclError:
+                pass
+
+    def _duplicate_scan_done(self, groups):
+        self._dup_running = False
+        cancelled = self._dup_cancel
+        self.dup_groups = groups
+        if self.active_view != "Duplicates":
+            return
+        try:
+            self.dup_button.configure(text="Rescan")
+        except tk.TclError:
+            return
+        if cancelled:
+            self._safe_dup_status("Cancelled")
+            return
+        self._fill_duplicates()
+
+    def _fill_duplicates(self):
+        tree = self.dup_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        self.dup_map = {}
+
+        if not self.dup_groups:
+            self._safe_dup_status("No duplicate files found")
+            return
+
+        reclaimable = duplicates.total_wasted(self.dup_groups)
+        self._safe_dup_status(
+            f"{len(self.dup_groups):,} groups · {format_size(reclaimable)} reclaimable")
+
+        for group in self.dup_groups:
+            parent = tree.insert(
+                "", "end",
+                text=f"{ICONS['folder_open']} {group.count} copies · {group.nodes[0].name}",
+                values=(format_size(group.size), format_size(group.wasted), ""),
+                tags=("folder",), open=False)
+            for node in sorted(group.nodes, key=lambda n: (len(n.path), n.path)):
+                iid = tree.insert(
+                    parent, "end", text=f"{get_file_icon(node.path)} {node.name}",
+                    values=(format_size(node.size), "", os.path.dirname(node.path)))
+                self.dup_map[iid] = node
+                self._register_row_thumbnail(tree, iid, node)
+
     # ---- Treemap view
 
     def _render_treemap(self):
@@ -1487,7 +1666,7 @@ class FolderLensApp(ctk.CTk):
         self.tooltip.hide()
         if self._hover_tile is not None:
             self._hover_tile = None
-            self._schedule_treemap_redraw()
+            self._draw_highlight(None)
 
     def _schedule_treemap_redraw(self):
         """Coalesce the burst of <Configure> events a window resize produces
@@ -1529,16 +1708,33 @@ class FolderLensApp(ctk.CTk):
         opts = treemap_render.RenderOptions(
             dark_mode=self.settings.dark_mode,
             show_thumbnails=self.settings.treemap_thumbnails,
-            highlight=highlight,
         )
         image = treemap_render.render_treemap(
             self._tiles, w, h, opts,
             thumb_provider=self._treemap_thumb if self.settings.treemap_thumbnails else None)
 
         # one canvas image instead of thousands of items: far less work for Tk
+        self._treemap_image = image
         self._treemap_photo = ImageTk.PhotoImage(image)
         canvas.delete("all")
         canvas.create_image(0, 0, anchor="nw", image=self._treemap_photo)
+        self._highlight_id = None
+        if highlight is not None:
+            self._draw_highlight(highlight)
+
+    def _draw_highlight(self, tile):
+        """Outline the hovered tile as a canvas item on top of the rendered
+        image. Re-rendering the whole map just to move this outline cost a
+        full re-composite of every tile on each mouse move."""
+        canvas = self.treemap_canvas
+        if self._highlight_id is not None:
+            canvas.delete(self._highlight_id)
+            self._highlight_id = None
+        if tile is None:
+            return
+        self._highlight_id = canvas.create_rectangle(
+            tile.x, tile.y, tile.x + tile.w - 1, tile.y + tile.h - 1,
+            outline="#ffffff", width=2)
 
     def _treemap_thumb(self, path: str, size):
         return self.thumbnails.request(path, (min(size[0], 400), min(size[1], 400)))
@@ -1566,12 +1762,12 @@ class FolderLensApp(ctk.CTk):
             self.tooltip.hide()
             if self._hover_tile is not None:
                 self._hover_tile = None
-                self._schedule_treemap_redraw()
+                self._draw_highlight(None)
             return
 
         if tile is not self._hover_tile:
             self._hover_tile = tile
-            self._draw_treemap(highlight=tile)
+            self._draw_highlight(tile)
 
         n = tile.node
         kind = "Folder" if n.is_dir else get_file_category(n.path)['label']
@@ -1641,6 +1837,8 @@ class FolderLensApp(ctk.CTk):
             return self.tree, self.iid_to_node
         if self.active_view == "Largest Files" and self.largest_tree is not None:
             return self.largest_tree, self.largest_map
+        if self.active_view == "Duplicates" and self.dup_tree is not None:
+            return self.dup_tree, self.dup_map
         return None, {}
 
     def _selected_nodes(self) -> List[Node]:
@@ -1688,6 +1886,34 @@ class FolderLensApp(ctk.CTk):
         nodes = self._selected_nodes()
         if nodes:
             self._reveal(nodes[0].path)
+
+    def _show_export_menu(self):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Report as CSV…", command=self._export_csv)
+        menu.add_command(label="Treemap as PNG…", command=self._export_treemap)
+        try:
+            x = self.winfo_pointerx()
+            y = self.winfo_pointery()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _export_treemap(self):
+        image = getattr(self, "_treemap_image", None)
+        if image is None:
+            messagebox.showinfo("Nothing to export",
+                                "Open the Treemap view first.", parent=self)
+            return
+        target = filedialog.asksaveasfilename(
+            defaultextension=".png", filetypes=[("PNG image", "*.png")],
+            initialfile="folderlens-treemap.png", title="Save treemap image as")
+        if not target:
+            return
+        try:
+            image.save(target)
+            self._set_status(f"Saved {os.path.basename(target)}")
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
 
     def _export_csv(self):
         if not self.root_node:
@@ -1745,9 +1971,9 @@ class FolderLensApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _no_selection_hint(self) -> str:
-        if self.active_view in ("Tree", "Largest Files"):
+        if self.active_view in ("Tree", "Largest Files", "Duplicates"):
             return "Select files or folders first."
-        return "Switch to the Tree or Largest Files view to select items."
+        return "Switch to the Tree, Largest Files or Duplicates view to select items."
 
     def _delete_selected(self):
         selection = self._top_level_selection()
@@ -1755,10 +1981,16 @@ class FolderLensApp(ctk.CTk):
             messagebox.showwarning("No selection", self._no_selection_hint())
             return
         total = sum(node.size for _, node in selection)
-        if not messagebox.askyesno("Confirm delete",
-                                   f"Delete {len(selection)} item(s) ({format_size(total)})?\nThis cannot be undone."):
+        recycle = self.settings.use_recycle_bin and trash.is_supported()
+        if recycle:
+            prompt = (f"Move {len(selection)} item(s) ({format_size(total)}) to the "
+                      f"Recycle Bin?\nYou can restore them from there.")
+        else:
+            prompt = (f"Delete {len(selection)} item(s) ({format_size(total)})?\n"
+                      f"This cannot be undone.")
+        if not messagebox.askyesno("Confirm delete", prompt):
             return
-        self._set_status("Deleting…")
+        self._set_status("Recycling…" if recycle else "Deleting…")
 
         # remember which view started this so the async result never touches a
         # widget the user has since navigated away from
@@ -1768,7 +2000,12 @@ class FolderLensApp(ctk.CTk):
             deleted, errors = [], []
             for iid, node in selection:
                 try:
-                    if os.path.isdir(node.path):
+                    if recycle:
+                        moved, message = trash.send_to_trash(node.path)
+                        if not moved:
+                            errors.append(f"{node.name}: {message}")
+                            continue
+                    elif os.path.isdir(node.path):
                         shutil.rmtree(node.path)
                     else:
                         os.remove(node.path)

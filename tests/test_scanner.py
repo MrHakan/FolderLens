@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scanner import TreeScanner, FolderScanner, QuickScanner
+from scanner import TreeScanner, FolderScanner, QuickScanner, Node
 
 
 @pytest.fixture
@@ -153,3 +153,25 @@ def test_quick_scanner(sample_tree):
     dirs = [i for i in items if i.is_directory]
     assert len(dirs) == 1
     assert dirs[0].size == 0
+
+
+def test_node_uses_slots_to_keep_the_tree_small():
+    """One Node exists per file on disk, so the per-instance __dict__ matters."""
+    node = Node(path="/x/a.txt", name="a.txt", is_dir=False, size=1)
+    assert not hasattr(node, "__dict__"), "Node grew a __dict__ again"
+    assert hasattr(Node, "__slots__")
+
+
+def test_files_share_one_empty_children_container():
+    """Files can never have children; giving each its own list wasted memory."""
+    a = Node(path="/x/a.txt", name="a.txt", is_dir=False)
+    b = Node(path="/x/b.txt", name="b.txt", is_dir=False)
+    assert a.children is b.children
+    assert len(a.children) == 0
+
+    # directories still get their own mutable list
+    d1 = Node(path="/x/d1", name="d1", is_dir=True)
+    d2 = Node(path="/x/d2", name="d2", is_dir=True)
+    assert d1.children is not d2.children
+    d1.children.append(a)
+    assert d2.children == []

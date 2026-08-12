@@ -19,12 +19,6 @@ pytest.importorskip("customtkinter", reason="customtkinter not installed")
 if sys.platform != "win32" and not os.environ.get("DISPLAY"):
     pytest.skip("no display available", allow_module_level=True)
 
-try:
-    _probe = tk.Tk()
-    _probe.destroy()
-except Exception as exc:  # pragma: no cover - environment dependent
-    pytest.skip(f"cannot open a Tk display: {exc}", allow_module_level=True)
-
 import treemap_render
 from scanner import TreeScanner
 
@@ -66,21 +60,27 @@ def gallery(tmp_path):
     return root
 
 
-@pytest.fixture
-def gui(tmp_path, sample_tree, monkeypatch):
-    """A FolderLensApp with an already-scanned tree and isolated settings."""
-    # keep the test off the developer's real settings file
-    monkeypatch.setenv("APPDATA", str(tmp_path / "cfg"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+@pytest.fixture(scope="session")
+def app_window(tmp_path_factory):
+    """One application window for the whole session.
+
+    Every test used to build its own root window. Creating and tearing down
+    that many Tcl interpreters in a single process is flaky on CI runners —
+    it intermittently fails with "Can't find a usable init.tcl" partway
+    through the suite — so the window is made once and reset between tests.
+    """
+    cfg = tmp_path_factory.mktemp("folderlens-cfg")
+    os.environ["APPDATA"] = str(cfg)          # keep off the real settings file
+    os.environ["XDG_CONFIG_HOME"] = str(cfg)
 
     import app as appmod
 
-    root = scan_sync(sample_tree)
-    assert root is not None
+    try:
+        win = appmod.FolderLensApp(initial_path=None)   # no scan kicked off
+    except tk.TclError as exc:                # pragma: no cover - environment
+        pytest.skip(f"cannot open a Tk display: {exc}")
 
-    win = appmod.FolderLensApp(initial_path=None)   # no scan kicked off
     win.geometry("1000x700+0+0")
-    win.root_node = root
     try:
         yield win
     finally:
@@ -88,6 +88,36 @@ def gui(tmp_path, sample_tree, monkeypatch):
             win.destroy()
         except tk.TclError:
             pass
+
+
+@pytest.fixture
+def gui(app_window, sample_tree):
+    """The shared window, reset and pointed at a freshly scanned tree."""
+    win = app_window
+
+    root = scan_sync(sample_tree)
+    assert root is not None
+    win.root_node = root
+
+    # clear anything a previous test left behind
+    win.search_var.set("")
+    win.search_query = ""
+    win.treemap_stack = []
+    win.dup_groups = []
+    win._hover_tile = None
+    win._treemap_image = None
+
+    # tests may unbind the resize handler to drive the reflow directly
+    win.unbind("<Configure>")
+    win.bind("<Configure>", win._on_window_configure, add="+")
+    win._toolbar_narrow = None
+    win._reflow_toolbar(win.NARROW_WIDTH + 300)
+
+    show(win, "Tree")
+    try:
+        yield win
+    finally:
+        win._clear_body()
 
 
 def show(win, view):
@@ -420,3 +450,63 @@ def test_viewer_annotation_actions_stay_visible_when_narrow(gui, gallery):
         assert packed_in(viewer.tools_left) == str(viewer.tools_row_a)
     finally:
         viewer.destroy()
+
+
+# ------------------------------------------------------------- duplicates view
+
+def test_duplicates_view_renders_and_takes_selection(gui, tmp_path):
+    """Duplicates is a selection view, so Zip/Delete must reach it."""
+    import duplicates as dup
+
+    show(gui, "Duplicates")
+    assert gui.dup_tree is not None
+
+    # inject a finished result rather than hashing during the test
+    files = [n for n in gui.root_node.children if not n.is_dir]
+    assert len(files) >= 2
+    gui.dup_groups = [dup.DuplicateGroup(size=files[0].size, nodes=files[:2])]
+    gui._fill_duplicates()
+    gui.update_idletasks()
+
+    groups = gui.dup_tree.get_children()
+    assert len(groups) == 1
+    rows = gui.dup_tree.get_children(groups[0])
+    assert len(rows) == 2
+
+    gui.dup_tree.selection_set(rows[0])
+    selection = gui._top_level_selection()
+    assert len(selection) == 1
+    assert selection[0][1] in files
+
+
+def test_duplicates_is_offered_as_a_view(gui):
+    assert "Duplicates" in gui.VIEWS
+
+
+def test_treemap_keeps_an_exportable_image(gui):
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=520, height=380)
+    gui.update_idletasks()
+    gui._draw_treemap()
+    assert gui._treemap_image is not None
+    assert gui._treemap_image.size == (gui.treemap_canvas.winfo_width(),
+                                       gui.treemap_canvas.winfo_height())
+
+
+def test_hover_does_not_rerender_the_treemap(gui):
+    """Regression: the highlight used to be baked into the image, so every
+    mouse move across a tile boundary re-composited the whole map."""
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+
+    before = gui._treemap_photo
+    assert gui._tiles
+    for tile in gui._tiles[:10]:
+        event = type("E", (), {"x": int(tile.x + tile.w / 2),
+                               "y": int(tile.y + tile.h / 2)})()
+        gui._treemap_hover(event)
+
+    assert gui._treemap_photo is before, "the treemap image was rebuilt on hover"
+    assert gui._highlight_id is not None, "no highlight outline was drawn"
