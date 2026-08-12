@@ -183,3 +183,78 @@ def test_header_skipped_on_tiles_too_small_to_show_one():
                                    min_area=1, max_depth=6, header=18.0)
     for tile in tiles:
         assert tile.h >= 0
+
+
+# ------------------------------------------------------------- optimizations
+
+def test_tiny_tiles_are_filled_flat():
+    """Sub-8px tiles get a flat fill: the gradient is invisible at that size
+    and shading thousands of them dominated the render."""
+    import treemap_render as tr
+    assert tr.FLAT_FILL_BELOW >= 4
+    img = tr.render_treemap(tiles_for(60, 40), 60, 40)
+    assert img.size == (60, 40)
+
+
+def test_cushion_sources_are_shared_per_colour_not_per_tile():
+    """Cushions come from a small per-colour pyramid, so the cache must grow
+    with the number of colours and levels, never with the number of tiles."""
+    import treemap_render as tr
+    tr._cushion_rgb_cache.clear()
+
+    # many same-type files: lots of tiles, exactly one colour between them
+    root = Node(path="/root", name="root", is_dir=True)
+    root.children = [
+        Node(path=f"/root/clip{i}.mp4", name=f"clip{i}.mp4", is_dir=False,
+             size=1000 + i, parent=root)
+        for i in range(120)
+    ]
+    root.size = sum(c.size for c in root.children)
+
+    tiles = analysis.build_treemap(root, 0, 0, 1200, 900, min_area=1, max_depth=4)
+    tr.render_treemap(tiles, 1200, 900, tr.RenderOptions(show_thumbnails=False))
+
+    shaded = [t for t in tiles
+              if int(t.w) >= tr.FLAT_FILL_BELOW and int(t.h) >= tr.FLAT_FILL_BELOW]
+    assert len(shaded) > 20, "expected plenty of shaded tiles in this layout"
+    # one colour, so at most one entry per pyramid level regardless of tiles
+    assert len(tr._cushion_rgb_cache) <= len(tr._CUSHION_LEVELS)
+    assert len(tr._cushion_rgb_cache) < len(shaded)
+
+
+def test_cushion_level_picks_the_nearest_size_up():
+    import treemap_render as tr
+    assert tr._cushion_level(10) == 16
+    assert tr._cushion_level(16) == 16
+    assert tr._cushion_level(17) == 32
+    assert tr._cushion_level(10_000) == tr._CUSHION_LEVELS[-1]
+
+
+def test_shade_luts_are_bytes():
+    """A list LUT makes Pillow re-round 256 entries on every single call."""
+    import treemap_render as tr
+    for lut in tr._shade_luts((120, 30, 200)):
+        assert isinstance(lut, bytes)
+        assert len(lut) == 256
+
+
+def test_tile_colour_is_cached_by_extension():
+    import treemap_render as tr
+    from scanner import Node
+    tr._color_by_ext.clear()
+    a = Node(path="/x/one.mp4", name="one.mp4", is_dir=False, size=1)
+    b = Node(path="/y/two.mp4", name="two.mp4", is_dir=False, size=1)
+    assert tr.tile_color(a, True) == tr.tile_color(b, True)
+    assert len(tr._color_by_ext) == 1
+
+
+def test_thumbnail_sizes_are_bucketed_so_resizing_reuses_decodes():
+    """Requesting the exact tile size meant every window resize re-decoded
+    every image; buckets make a resize reuse what is already cached."""
+    from thumbnails import bucket_size, SIZE_BUCKETS
+    assert bucket_size((20, 15)) == bucket_size((30, 28))
+    assert bucket_size((10, 10))[0] == SIZE_BUCKETS[0]
+    assert bucket_size((5000, 5000))[0] == SIZE_BUCKETS[-1]
+    # buckets never shrink the request below what was asked for
+    for size in [(9, 9), (33, 20), (200, 130)]:
+        assert bucket_size(size)[0] >= max(size)

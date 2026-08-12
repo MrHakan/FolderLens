@@ -420,3 +420,63 @@ def test_viewer_annotation_actions_stay_visible_when_narrow(gui, gallery):
         assert packed_in(viewer.tools_left) == str(viewer.tools_row_a)
     finally:
         viewer.destroy()
+
+
+# ------------------------------------------------------------- duplicates view
+
+def test_duplicates_view_renders_and_takes_selection(gui, tmp_path):
+    """Duplicates is a selection view, so Zip/Delete must reach it."""
+    import duplicates as dup
+
+    show(gui, "Duplicates")
+    assert gui.dup_tree is not None
+
+    # inject a finished result rather than hashing during the test
+    files = [n for n in gui.root_node.children if not n.is_dir]
+    assert len(files) >= 2
+    gui.dup_groups = [dup.DuplicateGroup(size=files[0].size, nodes=files[:2])]
+    gui._fill_duplicates()
+    gui.update_idletasks()
+
+    groups = gui.dup_tree.get_children()
+    assert len(groups) == 1
+    rows = gui.dup_tree.get_children(groups[0])
+    assert len(rows) == 2
+
+    gui.dup_tree.selection_set(rows[0])
+    selection = gui._top_level_selection()
+    assert len(selection) == 1
+    assert selection[0][1] in files
+
+
+def test_duplicates_is_offered_as_a_view(gui):
+    assert "Duplicates" in gui.VIEWS
+
+
+def test_treemap_keeps_an_exportable_image(gui):
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=520, height=380)
+    gui.update_idletasks()
+    gui._draw_treemap()
+    assert gui._treemap_image is not None
+    assert gui._treemap_image.size == (gui.treemap_canvas.winfo_width(),
+                                       gui.treemap_canvas.winfo_height())
+
+
+def test_hover_does_not_rerender_the_treemap(gui):
+    """Regression: the highlight used to be baked into the image, so every
+    mouse move across a tile boundary re-composited the whole map."""
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+
+    before = gui._treemap_photo
+    assert gui._tiles
+    for tile in gui._tiles[:10]:
+        event = type("E", (), {"x": int(tile.x + tile.w / 2),
+                               "y": int(tile.y + tile.h / 2)})()
+        gui._treemap_hover(event)
+
+    assert gui._treemap_photo is before, "the treemap image was rebuilt on hover"
+    assert gui._highlight_id is not None, "no highlight outline was drawn"

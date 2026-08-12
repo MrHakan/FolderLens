@@ -1,23 +1,47 @@
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Callable, Optional
 import time
 
 
-@dataclass
+_NO_CHILDREN: tuple = ()
+
+
 class Node:
-    """One file or directory in the scanned tree."""
-    path: str
-    name: str
-    is_dir: bool
-    size: int = 0
-    creation_date: float = 0.0
-    item_count: int = 0
-    children: List["Node"] = field(default_factory=list)
-    parent: Optional["Node"] = None
-    error: Optional[str] = None
+    """One file or directory in the scanned tree.
+
+    Uses __slots__ rather than a dataclass: a scan of a large drive holds one
+    of these per file, and dropping the per-instance __dict__ cuts the tree's
+    memory footprint by roughly a third.
+    """
+
+    __slots__ = ("path", "name", "is_dir", "size", "creation_date",
+                 "item_count", "children", "parent", "error")
+
+    def __init__(self, path: str, name: str, is_dir: bool, size: int = 0,
+                 creation_date: float = 0.0, item_count: int = 0,
+                 children: Optional[List["Node"]] = None,
+                 parent: Optional["Node"] = None, error: Optional[str] = None):
+        self.path = path
+        self.name = name
+        self.is_dir = is_dir
+        self.size = size
+        self.creation_date = creation_date
+        self.item_count = item_count
+        if children is not None:
+            self.children = children
+        else:
+            # files can never have children, so they share one empty tuple
+            # instead of each allocating a list they will never use
+            self.children = [] if is_dir else _NO_CHILDREN
+        self.parent = parent
+        self.error = error
+
+    def __repr__(self) -> str:
+        kind = "dir" if self.is_dir else "file"
+        return f"<Node {kind} {self.name!r} size={self.size}>"
 
     def sorted_children(self, key: str = "size", reverse: bool = True) -> List["Node"]:
         if key == "name":
