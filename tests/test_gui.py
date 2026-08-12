@@ -19,12 +19,6 @@ pytest.importorskip("customtkinter", reason="customtkinter not installed")
 if sys.platform != "win32" and not os.environ.get("DISPLAY"):
     pytest.skip("no display available", allow_module_level=True)
 
-try:
-    _probe = tk.Tk()
-    _probe.destroy()
-except Exception as exc:  # pragma: no cover - environment dependent
-    pytest.skip(f"cannot open a Tk display: {exc}", allow_module_level=True)
-
 import treemap_render
 from scanner import TreeScanner
 
@@ -66,21 +60,27 @@ def gallery(tmp_path):
     return root
 
 
-@pytest.fixture
-def gui(tmp_path, sample_tree, monkeypatch):
-    """A FolderLensApp with an already-scanned tree and isolated settings."""
-    # keep the test off the developer's real settings file
-    monkeypatch.setenv("APPDATA", str(tmp_path / "cfg"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+@pytest.fixture(scope="session")
+def app_window(tmp_path_factory):
+    """One application window for the whole session.
+
+    Every test used to build its own root window. Creating and tearing down
+    that many Tcl interpreters in a single process is flaky on CI runners —
+    it intermittently fails with "Can't find a usable init.tcl" partway
+    through the suite — so the window is made once and reset between tests.
+    """
+    cfg = tmp_path_factory.mktemp("folderlens-cfg")
+    os.environ["APPDATA"] = str(cfg)          # keep off the real settings file
+    os.environ["XDG_CONFIG_HOME"] = str(cfg)
 
     import app as appmod
 
-    root = scan_sync(sample_tree)
-    assert root is not None
+    try:
+        win = appmod.FolderLensApp(initial_path=None)   # no scan kicked off
+    except tk.TclError as exc:                # pragma: no cover - environment
+        pytest.skip(f"cannot open a Tk display: {exc}")
 
-    win = appmod.FolderLensApp(initial_path=None)   # no scan kicked off
     win.geometry("1000x700+0+0")
-    win.root_node = root
     try:
         yield win
     finally:
@@ -88,6 +88,36 @@ def gui(tmp_path, sample_tree, monkeypatch):
             win.destroy()
         except tk.TclError:
             pass
+
+
+@pytest.fixture
+def gui(app_window, sample_tree):
+    """The shared window, reset and pointed at a freshly scanned tree."""
+    win = app_window
+
+    root = scan_sync(sample_tree)
+    assert root is not None
+    win.root_node = root
+
+    # clear anything a previous test left behind
+    win.search_var.set("")
+    win.search_query = ""
+    win.treemap_stack = []
+    win.dup_groups = []
+    win._hover_tile = None
+    win._treemap_image = None
+
+    # tests may unbind the resize handler to drive the reflow directly
+    win.unbind("<Configure>")
+    win.bind("<Configure>", win._on_window_configure, add="+")
+    win._toolbar_narrow = None
+    win._reflow_toolbar(win.NARROW_WIDTH + 300)
+
+    show(win, "Tree")
+    try:
+        yield win
+    finally:
+        win._clear_body()
 
 
 def show(win, view):
