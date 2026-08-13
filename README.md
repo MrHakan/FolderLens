@@ -21,6 +21,10 @@ Grab the latest build from the [Releases page](https://github.com/MrHakan/Folder
 
 ## Features
 
+Opens on a **start screen** offering Home, Desktop, Downloads, Documents,
+Pictures, Videos, Music and your drives — pick one and it scans, no file
+dialog required.
+
 FolderLens scans a whole directory tree **once** — in parallel, across up to 32
 worker threads — then lets you explore it five different ways with zero
 rescanning:
@@ -46,6 +50,9 @@ Annotations are stored relative to the image, so they stay put when you resize o
 
 Plus:
 
+- 🧭 **Clickable breadcrumbs** — jump straight to any folder in the path
+- 🎨 **Colour legend** under the treemap, so the colours actually mean something
+- ⌨️ **Shortcut help** built in (F1), and hover hints on every icon button
 - 🔎 **Instant search** across the whole tree (Ctrl+F)
 - 🧵 **Fully responsive** — scanning, zipping, deleting, and exporting all run off the UI thread, with live progress and a **Stop** button
 - 🗑️ **Manage** — multi-select to zip, delete, or open in Explorer (right-click, toolbar, or Delete key); sizes update without rescanning
@@ -85,6 +92,9 @@ python main.py --version
 | `Ctrl+F` | Focus search |
 | `Esc` | Clear search |
 | `Delete` | Delete selected (tree / largest files / duplicates) |
+| `F1` | Keyboard shortcut help |
+| `Ctrl+O` | Browse for a folder |
+| `Backspace` | Go to the parent folder |
 | Double-click | Open folder / open image viewer |
 
 In the image viewer:
@@ -130,6 +140,7 @@ FolderLens/
 ├── scanner.py            # single-pass parallel tree scanner
 ├── analysis.py           # treemap layout, largest-files, type breakdown, CSV (pure, tested)
 ├── duplicates.py         # size -> sample -> full hash duplicate detection (pure, tested)
+├── locations.py          # start-screen places and path breadcrumbs (pure, tested)
 ├── trash.py              # Recycle Bin / XDG trash, with a permanent-delete fallback
 ├── treemap_render.py     # cushion shading, thumbnails, labels, hit-testing
 ├── thumbnails.py         # background thumbnail decoding + LRU cache

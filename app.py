@@ -22,6 +22,7 @@ import analysis
 import annotate
 import duplicates
 import imagenav
+import locations
 import treemap_render
 import trash
 from thumbnails import ThumbnailCache, fit_box
@@ -130,6 +131,73 @@ LIGHT = {
     'folder_fg': '#1d4ed8', 'error_fg': '#dc2626', 'muted_fg': '#9ca3af',
     'canvas_bg': '#eef0f3', 'tile_border': '#ffffff', 'tip_bg': '#1f2937', 'tip_fg': '#ffffff',
 }
+
+
+class HoverTip:
+    """Plain hover help for a widget.
+
+    The toolbar is mostly icons; without this, "⬆" and "•••" are guesses.
+    """
+
+    _shared = None
+
+    def __init__(self, widget, text: str, delay: int = 450):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after = None
+        self._window = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except (tk.TclError, ValueError):
+                pass
+            self._after = None
+
+    def _show(self):
+        if self._window is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except tk.TclError:
+            return
+        self._window = tk.Toplevel(self.widget)
+        self._window.withdraw()
+        self._window.overrideredirect(True)
+        self._window.attributes("-topmost", True)
+        label = tk.Label(self._window, text=self.text, justify="left",
+                         bg="#111827", fg="#f9fafb", padx=8, pady=4,
+                         font=("Segoe UI", 9), bd=0)
+        label.pack()
+        self._window.update_idletasks()
+        width = self._window.winfo_reqwidth()
+        x = max(0, min(x - width // 2, self._window.winfo_screenwidth() - width))
+        self._window.geometry(f"+{x}+{y}")
+        self._window.deiconify()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except tk.TclError:
+                pass
+            self._window = None
+
+
+def add_hint(widget, text: str):
+    HoverTip(widget, text)
+    return widget
 
 
 class Tooltip:
@@ -882,6 +950,9 @@ class FolderLensApp(ctk.CTk):
         self._build_status_bar()
 
         self.bind("<F5>", lambda e: self._refresh())
+        self.bind("<F1>", lambda e: self._show_shortcuts())
+        self.bind("<Control-o>", lambda e: self._browse_folder())
+        self.bind("<BackSpace>", self._on_backspace)
         self.bind("<Control-f>", lambda e: self.search_entry.focus_set())
         self.bind("<Escape>", lambda e: self._clear_search())
 
@@ -936,12 +1007,17 @@ class FolderLensApp(ctk.CTk):
         ctk.CTkButton(r1, text=f"{ICONS['folder_open']}  Browse", width=104, height=34,
                       font=ctk.CTkFont(size=12, weight="bold"), fg_color=ACCENT, hover_color=ACCENT_HOVER,
                       command=self._browse_folder).pack(side="left", padx=(12, 6), pady=9)
-        ctk.CTkButton(r1, text="⬅", width=38, height=34, font=ctk.CTkFont(size=14),
-                      fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
-                      command=self._go_up).pack(side="left", padx=3, pady=9)
-        ctk.CTkButton(r1, text=ICONS['refresh'], width=38, height=34, font=ctk.CTkFont(size=14),
-                      fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
-                      command=self._refresh).pack(side="left", padx=3, pady=9)
+        up = ctk.CTkButton(r1, text="⬅", width=38, height=34, font=ctk.CTkFont(size=14),
+                           fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
+                           command=self._go_up)
+        up.pack(side="left", padx=3, pady=9)
+        add_hint(up, "Go to the parent folder")
+
+        refresh = ctk.CTkButton(r1, text=ICONS['refresh'], width=38, height=34,
+                                font=ctk.CTkFont(size=14), fg_color="transparent", border_width=1,
+                                text_color=("gray20", "gray80"), command=self._refresh)
+        refresh.pack(side="left", padx=3, pady=9)
+        add_hint(refresh, "Rescan this folder  (F5)")
         self.cancel_btn = ctk.CTkButton(r1, text="✕ Stop", width=68, height=34, font=ctk.CTkFont(size=12),
                                         fg_color="#b91c1c", hover_color="#991b1b", command=self._cancel_scan)
 
@@ -959,19 +1035,35 @@ class FolderLensApp(ctk.CTk):
         # row-parented widget could never move to the sibling row.
         self.actions = ctk.CTkFrame(self.toolbar, fg_color="transparent")
 
-        ctk.CTkButton(self.actions, text="•••", width=40, height=34, font=ctk.CTkFont(size=14),
-                      fg_color="transparent", text_color=("gray30", "gray70"),
-                      hover_color=("gray85", "gray25"),
-                      command=self._show_settings).pack(side="right", padx=(4, 4))
-        ctk.CTkButton(self.actions, text="⬆", width=40, height=34, font=ctk.CTkFont(size=14),
-                      fg_color="transparent", text_color=("gray30", "gray70"),
-                      hover_color=("gray85", "gray25"),
-                      command=lambda: UpdateDialog(self)).pack(side="right", padx=4)
+        settings_btn = ctk.CTkButton(self.actions, text="•••", width=40, height=34,
+                                     font=ctk.CTkFont(size=14), fg_color="transparent",
+                                     text_color=("gray30", "gray70"),
+                                     hover_color=("gray85", "gray25"),
+                                     command=self._show_settings)
+        settings_btn.pack(side="right", padx=(4, 4))
+        add_hint(settings_btn, "Settings")
+
+        help_btn = ctk.CTkButton(self.actions, text="?", width=34, height=34,
+                                 font=ctk.CTkFont(size=14, weight="bold"),
+                                 fg_color="transparent", text_color=("gray30", "gray70"),
+                                 hover_color=("gray85", "gray25"),
+                                 command=self._show_shortcuts)
+        help_btn.pack(side="right", padx=4)
+        add_hint(help_btn, "Keyboard shortcuts  (F1)")
+
+        update_btn = ctk.CTkButton(self.actions, text="⬆", width=40, height=34,
+                                   font=ctk.CTkFont(size=14), fg_color="transparent",
+                                   text_color=("gray30", "gray70"),
+                                   hover_color=("gray85", "gray25"),
+                                   command=lambda: UpdateDialog(self))
+        update_btn.pack(side="right", padx=4)
+        add_hint(update_btn, "Check for updates")
         self.theme_btn = ctk.CTkButton(self.actions, text=ICONS['sun'] if self.settings.dark_mode else ICONS['moon'],
                                        width=40, height=34, font=ctk.CTkFont(size=14), fg_color="transparent",
                                        text_color=("gray30", "gray70"), hover_color=("gray85", "gray25"),
                                        command=self._toggle_theme)
         self.theme_btn.pack(side="right", padx=4)
+        add_hint(self.theme_btn, "Switch between light and dark")
         ctk.CTkButton(self.actions, text="⬇ Export", width=84, height=34,
                       font=ctk.CTkFont(size=12), fg_color="transparent", border_width=1,
                       text_color=("gray20", "gray80"),
@@ -981,11 +1073,23 @@ class FolderLensApp(ctk.CTk):
         self.search_entry = ctk.CTkEntry(self.toolbar, textvariable=self.search_var,
                                          width=210, height=34,
                                          placeholder_text="Search files & folders…")
+        add_hint(self.search_entry, "Search everything in this scan  (Ctrl+F)")
         self.search_var.trace_add("write", lambda *a: self._on_search_change())
 
         self._toolbar_narrow = None
         self.bind("<Configure>", self._on_window_configure, add="+")
         self.after(80, lambda: self._reflow_toolbar(self.winfo_width()))
+
+    def _on_backspace(self, event):
+        """Up one folder, unless the user is typing in a field."""
+        if isinstance(event.widget, (tk.Entry, ctk.CTkEntry)):
+            return
+        try:
+            if str(event.widget).startswith(str(self.search_entry)):
+                return
+        except tk.TclError:
+            pass
+        self._go_up()
 
     def _on_window_configure(self, event):
         if event.widget is self:
@@ -1012,12 +1116,12 @@ class FolderLensApp(ctk.CTk):
             self.search_entry.pack(in_=self.toolbar_row1, side="right", padx=6, pady=9)
 
     def _build_body(self):
-        self.pathbar = ctk.CTkFrame(self, fg_color=("gray92", "gray16"), corner_radius=0, height=30)
+        self.pathbar = ctk.CTkFrame(self, fg_color=("gray92", "gray16"), corner_radius=0, height=32)
         self.pathbar.pack(fill="x")
         self.pathbar.pack_propagate(False)
-        self.path_label = ctk.CTkLabel(self.pathbar, text="", font=ctk.CTkFont(size=12),
-                                       text_color=("gray30", "gray70"), anchor="w")
-        self.path_label.pack(side="left", padx=14)
+        self.crumb_bar = tk.Frame(self.pathbar, bg=self._pathbar_bg())
+        self.crumb_bar.pack(side="left", fill="both", expand=True, padx=10)
+        self._set_breadcrumbs("")
 
         self.body = tk.Frame(self, highlightthickness=0, bd=0)
         self.body.pack(fill="both", expand=True)
@@ -1026,6 +1130,50 @@ class FolderLensApp(ctk.CTk):
         self.progress.set(0)
 
         self._render_active_view()
+
+    def _pathbar_bg(self) -> str:
+        return "#28282b" if self.settings.dark_mode else "#e9ebef"
+
+    def _set_breadcrumbs(self, path: str):
+        """Render the current path as clickable crumbs.
+
+        A flat label told you where you were but made you walk up one level at
+        a time; every crumb here jumps straight to that folder.
+        """
+        bar = getattr(self, "crumb_bar", None)
+        if bar is None:
+            return
+        bg = self._pathbar_bg()
+        bar.configure(bg=bg)
+        for child in bar.winfo_children():
+            child.destroy()
+
+        if not path:
+            tk.Label(bar, text="No folder scanned yet", bg=bg,
+                     fg=self._colors()['muted_fg'], font=("Segoe UI", 10)).pack(side="left")
+            return
+
+        crumbs = locations.shorten_middle(locations.breadcrumbs(path), keep=4)
+        last = len(crumbs) - 1
+        for index, crumb in enumerate(crumbs):
+            if crumb is None:
+                tk.Label(bar, text="…", bg=bg, fg=self._colors()['muted_fg'],
+                         font=("Segoe UI", 10)).pack(side="left", padx=3)
+                continue
+
+            label, target = crumb
+            is_last = index == last
+            item = tk.Label(bar, text=label, bg=bg,
+                            fg=self._colors()['tree_fg'] if is_last else self._colors()['muted_fg'],
+                            font=("Segoe UI", 10, "bold" if is_last else "normal"),
+                            cursor="arrow" if is_last else "hand2")
+            item.pack(side="left")
+            if not is_last:
+                item.bind("<Button-1>", lambda e, p=target: self.scan_folder(p))
+                item.bind("<Enter>", lambda e, w=item: w.configure(fg=ACCENT))
+                item.bind("<Leave>", lambda e, w=item: w.configure(fg=self._colors()['muted_fg']))
+                tk.Label(bar, text="›", bg=bg, fg=self._colors()['muted_fg'],
+                         font=("Segoe UI", 10)).pack(side="left", padx=5)
 
     def _build_status_bar(self):
         bar = ctk.CTkFrame(self, fg_color=("gray95", "gray14"), corner_radius=0, height=28)
@@ -1044,7 +1192,7 @@ class FolderLensApp(ctk.CTk):
         self.settings.last_folder = path
         self.settings.save()
         self.treemap_stack = []
-        self.path_label.configure(text=path)
+        self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
         self._show_progress(True)
         self.cancel_btn.pack(side="left", padx=3, pady=9)
@@ -1157,10 +1305,90 @@ class FolderLensApp(ctk.CTk):
             self._render_duplicates()
 
     def _empty_hint(self, text: str):
-        wrap = tk.Frame(self.body, bg=self._colors()['tree_bg'])
+        """Shown when a view has nothing to display.
+
+        With no folder scanned yet this is the first thing anyone sees, so it
+        offers the places people actually want to look at rather than just
+        telling them to go and find one.
+        """
+        colors = self._colors()
+        wrap = tk.Frame(self.body, bg=colors['tree_bg'])
         wrap.pack(fill="both", expand=True)
-        tk.Label(wrap, text=text, fg=self._colors()['muted_fg'], bg=self._colors()['tree_bg'],
-                 font=("Segoe UI", 13)).place(relx=0.5, rely=0.45, anchor="center")
+
+        if self.root_node is not None:
+            tk.Label(wrap, text=text, fg=colors['muted_fg'], bg=colors['tree_bg'],
+                     font=("Segoe UI", 13)).place(relx=0.5, rely=0.45, anchor="center")
+            return
+
+        centre = tk.Frame(wrap, bg=colors['tree_bg'])
+        centre.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(centre, text="Where should we look?", bg=colors['tree_bg'],
+                 fg=colors['tree_fg'], font=("Segoe UI", 20, "bold")).pack()
+        tk.Label(centre, text="Pick a place to scan, or browse for any folder.",
+                 bg=colors['tree_bg'], fg=colors['muted_fg'],
+                 font=("Segoe UI", 11)).pack(pady=(6, 22))
+
+        grid = tk.Frame(centre, bg=colors['tree_bg'])
+        grid.pack()
+        for index, place in enumerate(locations.start_places()[:12]):
+            self._place_card(grid, place, colors).grid(
+                row=index // 4, column=index % 4, padx=7, pady=7)
+
+        browse = tk.Label(centre, text="⌕  Browse for another folder…",
+                          bg=colors['tree_bg'], fg=ACCENT, cursor="hand2",
+                          font=("Segoe UI", 11, "underline"))
+        browse.pack(pady=(20, 0))
+        browse.bind("<Button-1>", lambda e: self._browse_folder())
+
+    def _place_card(self, parent, place, colors):
+        """One clickable tile on the start screen, with its free space."""
+        card = tk.Frame(parent, bg=colors['head_bg'], width=176, height=92,
+                        highlightthickness=1, highlightbackground=colors['head_bg'],
+                        cursor="hand2")
+        card.pack_propagate(False)
+
+        top = tk.Frame(card, bg=colors['head_bg'])
+        top.pack(fill="x", padx=12, pady=(12, 2))
+        tk.Label(top, text=place.icon, bg=colors['head_bg'], fg=colors['tree_fg'],
+                 font=("Segoe UI", 16)).pack(side="left")
+        tk.Label(top, text=place.label, bg=colors['head_bg'], fg=colors['tree_fg'],
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=(8, 0))
+
+        # Only drives get the capacity bar. Every user folder lives on the
+        # same disk, so repeating one figure across all of them was noise
+        # that said nothing about the folder you were choosing.
+        if place.is_drive and place.total:
+            track = tk.Frame(card, bg=colors['tree_bg'], height=5)
+            track.pack(fill="x", padx=12, pady=(8, 4))
+            track.pack_propagate(False)
+            fill = tk.Frame(track, bg=ACCENT if place.used_fraction < 0.9 else "#dc2626")
+            fill.place(relx=0, rely=0, relwidth=max(place.used_fraction, 0.02), relheight=1)
+            tk.Label(card, text=f"{format_size(place.free)} free",
+                     bg=colors['head_bg'], fg=colors['muted_fg'],
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=12)
+        else:
+            home = os.path.expanduser("~")
+            shown = place.path
+            if shown.startswith(home):
+                shown = "~" + shown[len(home):] or "~"
+            tk.Label(card, text=shown, bg=colors['head_bg'], fg=colors['muted_fg'],
+                     font=("Segoe UI", 9), anchor="w").pack(anchor="w", padx=12, pady=(12, 0))
+
+        def enter(_e):
+            card.configure(highlightbackground=ACCENT)
+
+        def leave(_e):
+            card.configure(highlightbackground=colors['head_bg'])
+
+        def open_place(_e):
+            self.scan_folder(place.path)
+
+        for widget in (card, top, *top.winfo_children(), *card.winfo_children()):
+            widget.bind("<Button-1>", open_place)
+            widget.bind("<Enter>", enter)
+            widget.bind("<Leave>", leave)
+        return card
 
     # ---- shared treeview styling
 
@@ -1203,13 +1431,16 @@ class FolderLensApp(ctk.CTk):
             self._empty_hint("Select a folder to analyze")
             return
 
+        arrow = " ↓" if self.sort_reverse else " ↑"
+        marks = {key: (arrow if key == self.sort_key else "")
+                 for key in ("name", "size", "type", "date")}
         headings = {
-            "#0": ("Name", lambda: self._sort_tree("name")),
-            "usage": ("Usage", lambda: self._sort_tree("size")),
-            "size": ("Size", lambda: self._sort_tree("size")),
+            "#0": ("Name" + marks["name"], lambda: self._sort_tree("name")),
+            "usage": ("Usage" + marks["size"], lambda: self._sort_tree("size")),
+            "size": ("Size" + marks["size"], lambda: self._sort_tree("size")),
             "items": ("Items", lambda: self._sort_tree("size")),
-            "type": ("Type", lambda: self._sort_tree("type")),
-            "modified": ("Created", lambda: self._sort_tree("date")),
+            "type": ("Type" + marks["type"], lambda: self._sort_tree("type")),
+            "modified": ("Created" + marks["date"], lambda: self._sort_tree("date")),
         }
         widths = {
             "#0": (440, 220, "w", True),
@@ -1230,7 +1461,8 @@ class FolderLensApp(ctk.CTk):
 
         self.tree_menu = tk.Menu(self, tearoff=0)
         self.tree_menu.add_command(label="Open in Explorer", command=self._open_in_explorer)
-        self.tree_menu.add_command(label="Zip selected", command=self._zip_selected)
+        self.tree_menu.add_command(label="Copy path", command=self._copy_path)
+        self.tree_menu.add_command(label="Zip selected…", command=self._zip_selected)
         self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Delete selected", command=self._delete_selected)
 
@@ -1337,6 +1569,7 @@ class FolderLensApp(ctk.CTk):
             self.sort_reverse = key != "name"
         if self.search_query:
             return
+        self._render_active_view()      # repaint headers so the arrow follows
         expanded = set()
 
         def collect(iid):
@@ -1638,19 +1871,23 @@ class FolderLensApp(ctk.CTk):
         wrap = tk.Frame(self.body, bg=colors['canvas_bg'])
         wrap.pack(fill="both", expand=True)
 
-        crumb = tk.Frame(wrap, bg=colors['head_bg'], height=28)
-        crumb.pack(fill="x")
-        crumb.pack_propagate(False)
-        label = "  ›  ".join([self.root_node.name] + [n.name for n in self.treemap_stack]) or node.name
-        tk.Label(crumb, text=f"🗺  {label}", bg=colors['head_bg'], fg=colors['head_fg'],
-                 font=("Segoe UI", 10)).pack(side="left", padx=12)
+        # Only shown once you have zoomed into something: at the top level it
+        # would just repeat the path bar above it.
         if self.treemap_stack:
-            tk.Button(crumb, text="⬅ Back", bd=0, relief="flat", cursor="hand2",
-                      bg=colors['head_bg'], fg=colors['head_fg'], font=("Segoe UI", 9),
-                      command=self._treemap_back).pack(side="right", padx=8)
+            crumb = tk.Frame(wrap, bg=colors['head_bg'], height=28)
+            crumb.pack(fill="x")
+            crumb.pack_propagate(False)
+            label = "  ›  ".join([self.root_node.name] + [n.name for n in self.treemap_stack])
+            tk.Label(crumb, text=f"🔍  zoomed into  {label}", bg=colors['head_bg'],
+                     fg=colors['head_fg'], font=("Segoe UI", 10)).pack(side="left", padx=12)
+            back = tk.Label(crumb, text="⬅ Back", bg=colors['head_bg'], fg=ACCENT,
+                            cursor="hand2", font=("Segoe UI", 10, "bold"))
+            back.pack(side="right", padx=12)
+            back.bind("<Button-1>", lambda e: self._treemap_back())
 
         self.treemap_canvas = tk.Canvas(wrap, bg=colors['canvas_bg'], highlightthickness=0)
         self.treemap_canvas.pack(fill="both", expand=True)
+        self._build_treemap_legend(wrap, colors)
         if self.tooltip is None:
             self.tooltip = Tooltip(self)
         self.treemap_node = node
@@ -1661,6 +1898,38 @@ class FolderLensApp(ctk.CTk):
         self.treemap_canvas.bind("<Button-1>", self._treemap_click)
         self.treemap_canvas.bind("<Double-Button-1>", self._treemap_double_click)
         self.treemap_canvas.bind("<Button-3>", lambda e: self._treemap_back())
+
+    def _build_treemap_legend(self, parent, colors):
+        """Colour key along the bottom of the map.
+
+        Without it the colours are just decoration: you can see one big blue
+        block without knowing blue means documents.
+        """
+        from file_utils import FILE_CATEGORIES
+
+        legend = tk.Frame(parent, bg=colors['head_bg'], height=26)
+        legend.pack(fill="x")
+        legend.pack_propagate(False)
+
+        inner = tk.Frame(legend, bg=colors['head_bg'])
+        inner.pack(side="left", padx=10)
+
+        shown = ("folder", "video", "image", "audio", "document", "archive", "code", "other")
+        for key in shown:
+            category = FILE_CATEGORIES.get(key)
+            if not category:
+                continue
+            chip = tk.Frame(inner, bg=colors['head_bg'])
+            chip.pack(side="left", padx=(0, 12))
+            swatch = tk.Frame(chip, bg=category['color'], width=10, height=10)
+            swatch.pack(side="left", pady=7)
+            swatch.pack_propagate(False)
+            tk.Label(chip, text=category['label'], bg=colors['head_bg'],
+                     fg=colors['muted_fg'], font=("Segoe UI", 9)).pack(side="left", padx=(5, 0))
+
+        tk.Label(legend, text="click a folder to zoom in · right-click to go back",
+                 bg=colors['head_bg'], fg=colors['muted_fg'],
+                 font=("Segoe UI", 9)).pack(side="right", padx=12)
 
     def _treemap_leave(self, event):
         self.tooltip.hide()
@@ -1882,6 +2151,14 @@ class FolderLensApp(ctk.CTk):
         except OSError as e:
             messagebox.showerror("Error", f"Could not open: {e}")
 
+    def _copy_path(self):
+        nodes = self._selected_nodes()
+        if not nodes:
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(n.path for n in nodes))
+        self._set_status(f"Copied {len(nodes)} path(s) to the clipboard")
+
     def _open_in_explorer(self):
         nodes = self._selected_nodes()
         if nodes:
@@ -2059,6 +2336,58 @@ class FolderLensApp(ctk.CTk):
         self.theme_btn.configure(text=ICONS['sun'] if self.settings.dark_mode else ICONS['moon'])
         self.settings.save()
         self._render_active_view()
+
+    SHORTCUTS = (
+        ("Getting around", (
+            ("F5", "Rescan the current folder"),
+            ("Backspace", "Go to the parent folder"),
+            ("Ctrl+O", "Browse for a folder"),
+            ("Double-click", "Open a folder, or an image in the viewer"),
+        )),
+        ("Finding things", (
+            ("Ctrl+F", "Jump to search"),
+            ("Esc", "Clear the search"),
+            ("Click a column", "Sort by it; click again to reverse"),
+        )),
+        ("Acting on files", (
+            ("Ctrl/Shift+click", "Select several items"),
+            ("Delete", "Send the selection to the Recycle Bin"),
+            ("Right-click", "Open in Explorer, copy path, zip, delete"),
+        )),
+        ("Treemap", (
+            ("Hover", "Peek at a file, with a preview for images"),
+            ("Click", "Zoom into a folder"),
+            ("Right-click", "Zoom back out"),
+        )),
+    )
+
+    def _show_shortcuts(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Keyboard shortcuts")
+        window.geometry("460x520")
+        window.transient(self)
+        window.grab_set()
+        self.update_idletasks()
+        window.geometry(f"+{self.winfo_x() + 160}+{max(self.winfo_y() + 60, 0)}")
+
+        ctk.CTkButton(window, text="Got it", height=34,
+                      command=window.destroy).pack(side="bottom", pady=(0, 14))
+
+        body = ctk.CTkScrollableFrame(window, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=16)
+
+        for section, rows in self.SHORTCUTS:
+            ctk.CTkLabel(body, text=section, font=ctk.CTkFont(size=13, weight="bold"),
+                         anchor="w").pack(fill="x", pady=(10, 4))
+            for keys, description in rows:
+                row = ctk.CTkFrame(body, fg_color="transparent")
+                row.pack(fill="x", pady=1)
+                ctk.CTkLabel(row, text=keys, width=118, anchor="w",
+                             font=ctk.CTkFont(size=11, weight="bold"),
+                             text_color=ACCENT).pack(side="left")
+                ctk.CTkLabel(row, text=description, anchor="w",
+                             font=ctk.CTkFont(size=11),
+                             text_color=("gray25", "gray75")).pack(side="left", fill="x", expand=True)
 
     def _show_settings(self):
         SettingsMenu(self, self.settings, self._on_settings_apply)

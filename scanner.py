@@ -17,14 +17,18 @@ class Node:
     memory footprint by roughly a third.
     """
 
-    __slots__ = ("path", "name", "is_dir", "size", "creation_date",
+    __slots__ = ("_path", "name", "is_dir", "size", "creation_date",
                  "item_count", "children", "parent", "error")
 
-    def __init__(self, path: str, name: str, is_dir: bool, size: int = 0,
+    def __init__(self, path: Optional[str], name: str, is_dir: bool, size: int = 0,
                  creation_date: float = 0.0, item_count: int = 0,
                  children: Optional[List["Node"]] = None,
                  parent: Optional["Node"] = None, error: Optional[str] = None):
-        self.path = path
+        # Files far outnumber directories, and a file's path is just its
+        # parent's path plus its name. Storing it per file was about a third
+        # of the tree's memory, so it is derived on demand instead; only
+        # directories (and any node without a parent) keep their own copy.
+        self._path = path if (is_dir or parent is None) else None
         self.name = name
         self.is_dir = is_dir
         self.size = size
@@ -38,6 +42,29 @@ class Node:
             self.children = [] if is_dir else _NO_CHILDREN
         self.parent = parent
         self.error = error
+
+    @property
+    def path(self) -> str:
+        if self._path is not None:
+            return self._path
+        parent = self.parent
+        if parent is None:                    # defensive: detached node
+            return self.name
+        base = parent.path
+        if base.endswith(("\\", "/")):        # drive roots like "C:\"
+            return base + self.name
+        return base + os.sep + self.name
+
+    @path.setter
+    def path(self, value: str):
+        self._path = value
+
+    @property
+    def ext(self) -> str:
+        """Lower-case extension, taken from the name so the full path never
+        has to be materialised just to ask what kind of file this is."""
+        dot = self.name.rfind(".")
+        return self.name[dot:].lower() if dot > 0 else ""
 
     def __repr__(self) -> str:
         kind = "dir" if self.is_dir else "file"

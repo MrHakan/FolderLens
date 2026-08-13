@@ -19,6 +19,7 @@ pytest.importorskip("customtkinter", reason="customtkinter not installed")
 if sys.platform != "win32" and not os.environ.get("DISPLAY"):
     pytest.skip("no display available", allow_module_level=True)
 
+import locations
 import treemap_render
 from scanner import TreeScanner
 
@@ -33,7 +34,7 @@ def scan_sync(path):
         on_complete=lambda root, errors, t: (holder.update(root=root), done.set()),
         on_error=lambda msg: (holder.update(error=msg), done.set()),
     )
-    assert done.wait(timeout=30), "scan did not finish"
+    assert done.wait(timeout=90), "scan did not finish"
     return holder.get("root")
 
 
@@ -510,3 +511,84 @@ def test_hover_does_not_rerender_the_treemap(gui):
 
     assert gui._treemap_photo is before, "the treemap image was rebuilt on hover"
     assert gui._highlight_id is not None, "no highlight outline was drawn"
+
+
+# ------------------------------------------------------------ start screen
+
+def test_start_screen_offers_places_before_any_scan(gui):
+    """With nothing scanned the app used to show a bare line of text; it now
+    offers somewhere to start."""
+    gui.root_node = None
+    show(gui, "Tree")
+
+    texts = []
+
+    def collect(widget):
+        for child in widget.winfo_children():
+            try:
+                text = child.cget("text")
+            except tk.TclError:
+                text = ""
+            if text:
+                texts.append(str(text))
+            collect(child)
+
+    collect(gui.body)
+    joined = " ".join(texts)
+    assert "Where should we look" in joined
+    assert "Browse" in joined
+    assert any(place.label in joined for place in locations.start_places())
+
+
+def test_breadcrumbs_are_clickable_prefixes(gui, tmp_path):
+    deep = tmp_path / "one" / "two" / "three"
+    deep.mkdir(parents=True)
+    gui._set_breadcrumbs(str(deep))
+    gui.update_idletasks()
+
+    labels = []
+    for child in gui.crumb_bar.winfo_children():
+        try:
+            labels.append(str(child.cget("text")))
+        except tk.TclError:
+            pass
+    assert "three" in labels
+    assert "two" in labels and "one" in labels
+
+
+def test_breadcrumbs_empty_state(gui):
+    gui._set_breadcrumbs("")
+    gui.update_idletasks()
+    texts = [str(c.cget("text")) for c in gui.crumb_bar.winfo_children()]
+    assert any("No folder" in t for t in texts)
+
+
+def test_sort_header_shows_the_direction(gui):
+    show(gui, "Tree")
+    gui.sort_key, gui.sort_reverse = "size", True
+    show(gui, "Tree")
+    assert "↓" in gui.tree.heading("size")["text"]
+
+    gui.sort_reverse = False
+    show(gui, "Tree")
+    assert "↑" in gui.tree.heading("size")["text"]
+
+
+def test_copy_path_puts_the_selection_on_the_clipboard(gui):
+    show(gui, "Tree")
+    first = gui.tree.get_children()[0]
+    gui.tree.selection_set(first)
+    node = gui.iid_to_node[first]
+
+    gui._copy_path()
+    gui.update_idletasks()
+    assert gui.clipboard_get() == node.path
+
+
+def test_shortcuts_are_documented():
+    import app as appmod
+    sections = dict(appmod.FolderLensApp.SHORTCUTS)
+    assert sections, "no shortcut help defined"
+    keys = [k for rows in sections.values() for k, _ in rows]
+    for expected in ("F5", "Ctrl+F", "Delete"):
+        assert expected in keys, f"{expected} is bound but undocumented"

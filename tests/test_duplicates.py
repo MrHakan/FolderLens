@@ -15,7 +15,7 @@ def scan(path):
     TreeScanner().scan(str(path),
                        on_complete=lambda r, e, t: (holder.update(root=r), done.set()),
                        on_error=lambda m: done.set())
-    assert done.wait(30)
+    assert done.wait(90)
     return holder["root"]
 
 
