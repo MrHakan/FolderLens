@@ -14,7 +14,6 @@ actually was. This renders the whole map into a single image instead:
 Compositing into one image is also far cheaper than thousands of live canvas
 items, which is what made the old view stutter on big trees.
 """
-import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple
@@ -172,11 +171,12 @@ def tile_color(node, dark_mode: bool) -> Tuple[int, int, int]:
     if node.is_dir:
         return (63, 63, 70) if dark_mode else (203, 213, 225)
     # a tile's colour depends only on its extension, and a big tree asks the
-    # same question thousands of times
-    ext = os.path.splitext(node.path)[1].lower()
+    # same question thousands of times. Using node.ext keeps the full path
+    # from being built just to look at the suffix.
+    ext = node.ext
     color = _color_by_ext.get(ext)
     if color is None:
-        color = _rgb(get_file_category(node.path)['color'])
+        color = _rgb(get_file_category("x" + ext)['color'])
         if len(_color_by_ext) > 4000:
             _color_by_ext.clear()
         _color_by_ext[ext] = color
@@ -221,7 +221,7 @@ def render_treemap(tiles: Sequence, width: int, height: int,
 
         patch = None
         if (opts.show_thumbnails and thumb_provider is not None
-                and not node.is_dir and is_image_file(node.path)
+                and not node.is_dir and is_image_file(node.name)
                 and tw >= opts.min_thumb and th >= opts.min_thumb):
             thumb = thumb_provider(node.path, (tw, th))
             if thumb is not None:

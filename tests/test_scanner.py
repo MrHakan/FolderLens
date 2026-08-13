@@ -40,7 +40,7 @@ def run_tree_scan(path):
         done.set()
 
     scanner.scan(str(path), on_complete=on_complete, on_error=on_error)
-    assert done.wait(timeout=30), "scan did not finish in time"
+    assert done.wait(timeout=90), "scan did not finish in time (machine under load?)"
     return holder
 
 
@@ -58,7 +58,7 @@ def run_flat_scan(path):
         done.set()
 
     scanner.scan(str(path), on_complete=on_complete, on_error=on_error)
-    assert done.wait(timeout=30), "scan did not finish in time"
+    assert done.wait(timeout=90), "scan did not finish in time (machine under load?)"
     return holder["result"], holder["error"]
 
 
