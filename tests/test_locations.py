@@ -74,18 +74,28 @@ def test_place_usage_handles_unknown_capacity():
 # -------------------------------------------------------------- breadcrumbs
 
 def test_breadcrumbs_are_navigable_prefixes():
-    crumbs = locations.breadcrumbs("/home/user/Pictures/Trip")
-    assert [label for label, _ in crumbs][-3:] == ["user", "Pictures", "Trip"]
+    # built from os.sep: on Windows a leading "/" lands on the current drive,
+    # so a hardcoded posix path would not survive the round trip
+    folder = os.path.join(os.sep, "home", "user", "Pictures", "Trip")
+    full = os.path.abspath(folder)
+    crumbs = locations.breadcrumbs(folder)
 
-    # every crumb must be a real prefix you can jump to
+    assert [label for label, _ in crumbs][-3:] == ["user", "Pictures", "Trip"]
+    assert crumbs[-1][1] == full, "last crumb is not the folder itself"
+
+    # every crumb is an ancestor you can jump straight to, and they only
+    # ever get deeper
     for _, target in crumbs:
-        assert "/home/user/Pictures/Trip".startswith(target.rstrip("/")) or target == "/"
-    assert crumbs[-1][1].endswith("Trip")
+        assert full == target or full.startswith(target.rstrip("\\/") + os.sep)
+    depths = [len(target) for _, target in crumbs]
+    assert depths == sorted(depths)
+    assert len(set(depths)) == len(depths), "two crumbs point at the same place"
 
 
 def test_breadcrumbs_start_at_the_root():
-    crumbs = locations.breadcrumbs("/var/log")
-    assert crumbs[0][1] in ("/", os.sep)
+    crumbs = locations.breadcrumbs(os.path.join(os.sep, "var", "log"))
+    root = crumbs[0][1]
+    assert os.path.dirname(root) == root, f"{root!r} is not a filesystem root"
 
 
 def test_breadcrumbs_of_empty_path():
