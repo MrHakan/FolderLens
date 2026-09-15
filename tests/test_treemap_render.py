@@ -108,6 +108,26 @@ def test_thumbnails_skipped_when_disabled():
     assert calls == []
 
 
+def test_thumbnail_provider_receives_scanned_modification_stamp():
+    root = make_tree()
+    photo = next(child for child in root.children if child.name == "pic.png")
+    photo.modified_date = 123456789
+    seen = []
+
+    def provider(path, size, mtime):
+        seen.append((path, mtime))
+        return None
+
+    tiles = analysis.build_treemap(root, 0, 0, 400, 300,
+                                   min_area=1, max_depth=6)
+    treemap_render.render_treemap(
+        tiles, 400, 300,
+        treemap_render.RenderOptions(thumbnail_mtime=lambda node: node.modified_date),
+        thumb_provider=provider)
+    assert any(path.endswith("pic.png") and mtime == 123456789
+               for path, mtime in seen)
+
+
 def test_unreadable_thumbnail_falls_back_to_a_colour_tile():
     img = treemap_render.render_treemap(
         tiles_for(), 200, 150,

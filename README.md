@@ -25,14 +25,17 @@ Opens on a **start screen** offering Home, Desktop, Downloads, Documents,
 Pictures, Videos, Music and your drives — pick one and it scans, no file
 dialog required.
 
-FolderLens scans a whole directory tree **once** — in parallel, across up to 32
-worker threads — then lets you explore it five different ways with zero
-rescanning:
+FolderLens scans a whole directory tree **once** — with a shared work queue and
+a bounded worker pool that keeps one large folder parallel, avoids creating
+one task per subtree, and automatically uses gentler metadata concurrency for
+UNC and mapped network drives. The complete in-memory tree can then be
+explored five different ways with zero rescanning:
 
 - 🌳 **Tree view** — expandable folder tree with a usage bar, size, item count, type, and date at every level. Expanding a folder is instant.
-- 🗺️ **Treemap** — cushion-shaded map where every rectangle's area is its size, folders get their own header band, and **image files are painted with their own thumbnail** so you can recognise them at a glance. Hover for a **peek preview** of the picture, click a folder to zoom in, right-click to go back.
+- 🗺️ **Treemap** — a hierarchy-first cushion-shaded map where every rectangle's area is its size, folders get a reserved header band, labels are capped to the useful large tiles, and dense tails are grouped into a single “smaller items” tile. **Image files are painted with their own thumbnail** so you can recognise them at a glance. Hover for a **peek preview** of the picture, click a folder to zoom in, right-click to go back.
 - 🏆 **Largest files** — the top 100 biggest files anywhere in the tree, with their locations and small inline previews.
 - 🧩 **File types** — size and count broken down by category (video, image, code, …) with proportional bars.
+- 🎛️ **Type filter** — switch every view to Images, Videos, Audio, Documents, Archives, Code, Executables, Fonts, Databases, or Other. Matching folders remain as context, while all displayed sizes, counts, rankings, treemap areas, search results, and duplicate checks use only the selected file type.
 - 👯 **Duplicates** — finds byte-identical copies and shows exactly how much space keeping one of each would free. Narrowed by size, then a head/tail sample, then a full hash, so almost nothing is read twice.
 
 ### Image viewer & annotation

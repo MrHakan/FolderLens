@@ -19,7 +19,7 @@ from file_utils import is_image_file
 # generous but finite ceiling so a malformed file can't exhaust memory.
 Image.MAX_IMAGE_PIXELS = 200_000_000
 
-CacheKey = Tuple[str, int, int, float]
+CacheKey = Tuple[str, int, int, object]
 
 
 def bucket_size(size: Tuple[int, int]) -> Tuple[int, int]:
@@ -61,7 +61,7 @@ class ThumbnailCache:
         self._on_ready = callback
 
     @staticmethod
-    def _key(path: str, size: Tuple[int, int], mtime: float) -> CacheKey:
+    def _key(path: str, size: Tuple[int, int], mtime: object) -> CacheKey:
         return (path, size[0], size[1], mtime)
 
     @staticmethod
@@ -71,27 +71,34 @@ class ThumbnailCache:
         except OSError:
             return 0.0
 
-    def get(self, path: str, size: Tuple[int, int]) -> Optional[Image.Image]:
+    def get(self, path: str, size: Tuple[int, int], mtime: object = None) -> Optional[Image.Image]:
         """Return a cached thumbnail, or None. Never blocks, never decodes."""
-        key = self._key(path, bucket_size(size), self._mtime(path))
+        stamp = self._mtime(path) if mtime is None else mtime
+        key = self._key(path, bucket_size(size), stamp)
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 return self._cache[key]
         return None
 
-    def request(self, path: str, size: Tuple[int, int]) -> Optional[Image.Image]:
+    def request(self, path: str, size: Tuple[int, int], mtime: object = None) -> Optional[Image.Image]:
         """Return the thumbnail if ready, otherwise schedule a load and return
-        None. Safe to call repeatedly: duplicate work is suppressed."""
+        None. Safe to call repeatedly: duplicate work is suppressed.
+
+        Scanned callers should pass the modification stamp captured by the
+        scanner.  Omitting it preserves the standalone API, but requires one
+        filesystem stat to validate the cache entry.
+        """
         if self._closed or not is_image_file(path):
             return None
 
         bucket = bucket_size(size)
-        cached = self.get(path, bucket)
+        stamp = self._mtime(path) if mtime is None else mtime
+        cached = self.get(path, bucket, stamp)
         if cached is not None:
             return cached
 
-        key = self._key(path, bucket, self._mtime(path))
+        key = self._key(path, bucket, stamp)
         with self._lock:
             if key in self._cache or key in self._pending:
                 return None

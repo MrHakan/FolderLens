@@ -79,7 +79,8 @@ def _group_by(items, key_func, should_cancel) -> List[List]:
 
 def find_duplicates(root, min_size: int = 1,
                     progress: Optional[Callable[[str, int, int], None]] = None,
-                    should_cancel: Optional[Callable[[], bool]] = None
+                    should_cancel: Optional[Callable[[], bool]] = None,
+                    filter_key: str = "all", filter_index=None
                     ) -> List[DuplicateGroup]:
     """Find groups of byte-identical files, biggest waste first.
 
@@ -88,7 +89,13 @@ def find_duplicates(root, min_size: int = 1,
     """
     from analysis import iter_file_nodes
 
-    files = [n for n in iter_file_nodes(root) if n.size >= min_size]
+    if filter_key != "all":
+        from file_utils import file_type_matches
+        predicate = filter_index.matches if filter_index is not None else \
+            (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
+    else:
+        predicate = None
+    files = [n for n in iter_file_nodes(root, predicate) if n.size >= min_size]
     if progress:
         progress("Grouping by size", 0, len(files))
 

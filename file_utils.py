@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Tuple
+from typing import Optional, Tuple
 
 ICONS = {
     'folder': '📁',
@@ -61,13 +61,21 @@ FILE_CATEGORIES = {
         'label': 'Audio'
     },
     'image': {
-        'extensions': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico', '.tiff', '.psd', '.raw', '.heic'],
+        'extensions': [
+            '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.apng', '.gif', '.bmp',
+            '.svg', '.webp', '.ico', '.tif', '.tiff', '.psd', '.raw', '.heic',
+            '.heif', '.avif', '.jxl',
+        ],
         'color': '#F97316',
         'icon': ICONS['image'],
         'label': 'Image'
     },
     'document': {
-        'extensions': ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.rtf', '.odt', '.ods', '.odp'],
+        'extensions': [
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt',
+            '.rtf', '.odt', '.ods', '.odp', '.csv', '.tsv', '.md', '.markdown',
+            '.log', '.tex', '.pages', '.numbers', '.key',
+        ],
         'color': '#3B82F6',
         'icon': ICONS['document'],
         'label': 'Document'
@@ -110,6 +118,16 @@ FILE_CATEGORIES = {
     }
 }
 
+# Classification is on the hot path for every file in the tree and in each
+# filtered view.  Keep the public category descriptions readable, but resolve
+# extensions in O(1) instead of walking every category for every node.
+_CATEGORY_BY_EXTENSION = {
+    extension: category_name
+    for category_name, category_info in FILE_CATEGORIES.items()
+    if category_name not in ('folder', 'other')
+    for extension in category_info['extensions']
+}
+
 SPECIAL_ICONS = {
     '.py': ICONS['python'],
     '.js': ICONS['javascript'],
@@ -141,11 +159,65 @@ SPECIAL_ICONS = {
     '.toml': ICONS['config'],
 }
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.ico'}
+IMAGE_EXTENSIONS = frozenset(FILE_CATEGORIES['image']['extensions'])
+
+# The first value is stable storage/API identity; the second is the label shown
+# in the type picker.  Directories are deliberately not a filter option: they
+# remain visible as containers whenever they contain a matching file.
+FILE_TYPE_FILTERS = (
+    ('all', 'All file types'),
+    ('image', 'Images'),
+    ('video', 'Videos'),
+    ('audio', 'Audio'),
+    ('document', 'Documents'),
+    ('archive', 'Archives'),
+    ('code', 'Code'),
+    ('executable', 'Executables'),
+    ('font', 'Fonts'),
+    ('database', 'Databases'),
+    ('other', 'Other'),
+)
+FILE_TYPE_FILTER_LABELS = dict(FILE_TYPE_FILTERS)
 
 
-def get_file_icon(path: str) -> str:
-    if os.path.isdir(path):
+def get_file_category_key(path: str, is_dir: Optional[bool] = None) -> str:
+    """Return the stable category key for *path*.
+
+    ``is_dir`` is optional for backwards compatibility.  Callers that already
+    have directory metadata (the scanner and UI do) should pass it explicitly;
+    otherwise this helper has to ask the filesystem, which is particularly
+    expensive on a network share.
+    """
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
+    if is_dir:
+        return 'folder'
+
+    name = os.path.basename(path).lower()
+    _, ext = os.path.splitext(name)
+    return _CATEGORY_BY_EXTENSION.get(ext, 'other')
+
+
+def file_type_matches(path: str, filter_key: str, is_dir: Optional[bool] = None) -> bool:
+    """Return whether a file belongs to a type-filter key.
+
+    Folders are containers rather than file types, so they never match a
+    category directly; filtered tree projections add them back when they
+    contain a matching descendant.
+    """
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
+    if filter_key == 'all':
+        return not is_dir
+    if is_dir:
+        return False
+    return get_file_category_key(path, is_dir=False) == filter_key
+
+
+def get_file_icon(path: str, is_dir: Optional[bool] = None) -> str:
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
+    if is_dir:
         return ICONS['folder']
     
     name = os.path.basename(path).lower()
@@ -156,22 +228,12 @@ def get_file_icon(path: str) -> str:
     if ext in SPECIAL_ICONS:
         return SPECIAL_ICONS[ext]
     
-    category = get_file_category(path)
+    category = get_file_category(path, is_dir=False)
     return category['icon']
 
 
-def get_file_category(path: str) -> dict:
-    if os.path.isdir(path):
-        return FILE_CATEGORIES['folder']
-    
-    _, ext = os.path.splitext(path)
-    ext = ext.lower()
-    
-    for category_name, category_info in FILE_CATEGORIES.items():
-        if ext in category_info['extensions']:
-            return category_info
-    
-    return FILE_CATEGORIES['other']
+def get_file_category(path: str, is_dir: Optional[bool] = None) -> dict:
+    return FILE_CATEGORIES[get_file_category_key(path, is_dir=is_dir)]
 
 
 def is_image_file(path: str) -> bool:
@@ -206,8 +268,10 @@ def format_date(timestamp: float) -> str:
         return "-"
 
 
-def get_file_extension(path: str) -> str:
-    if os.path.isdir(path):
+def get_file_extension(path: str, is_dir: Optional[bool] = None) -> str:
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
+    if is_dir:
         return "Folder"
     
     _, ext = os.path.splitext(path)
@@ -226,13 +290,13 @@ def get_file_info(path: str) -> Tuple[str, int, str, str, str]:
         else:
             size = os.path.getsize(path)
         
-        category = get_file_category(path)
+        category = get_file_category(path, is_dir=is_dir)
         type_label = category['label']
         
         stat = os.stat(path)
         date = format_date(stat.st_ctime)
         
-        extension = get_file_extension(path)
+        extension = get_file_extension(path, is_dir=is_dir)
         
         return (name, size, type_label, date, extension)
     except (OSError, PermissionError) as e:
