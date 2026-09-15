@@ -16,8 +16,9 @@ from PIL import Image, ImageOps, ImageTk
 from file_utils import (
     get_file_category, format_size, format_date,
     calculate_percentage, get_file_icon, is_image_file, ICONS,
+    FILE_CATEGORIES, FILE_TYPE_FILTERS, FILE_TYPE_FILTER_LABELS,
 )
-from scanner import TreeScanner, Node
+from scanner import TreeScanner, Node, is_network_path
 import analysis
 import annotate
 import duplicates
@@ -60,6 +61,7 @@ class AppSettings:
         self.dark_mode = True
         self.last_folder = ""
         self.view = "Tree"
+        self.file_filter = "all"
         self.treemap_thumbnails = True
         self.list_thumbnails = True
         self.peek_preview = True
@@ -87,6 +89,9 @@ class AppSettings:
                 self.last_folder = data['last_folder']
             if data.get('view') in ("Tree", "Treemap", "Largest Files", "File Types", "Duplicates"):
                 self.view = data['view']
+            if (isinstance(data.get('file_filter'), str)
+                    and data['file_filter'] in FILE_TYPE_FILTER_LABELS):
+                self.file_filter = data['file_filter']
             for flag in ('treemap_thumbnails', 'list_thumbnails', 'peek_preview',
                          'use_recycle_bin'):
                 if isinstance(data.get(flag), bool):
@@ -107,6 +112,7 @@ class AppSettings:
                     'dark_mode': self.dark_mode,
                     'last_folder': self.last_folder,
                     'view': self.view,
+                    'file_filter': self.file_filter,
                     'treemap_thumbnails': self.treemap_thumbnails,
                     'list_thumbnails': self.list_thumbnails,
                     'peek_preview': self.peek_preview,
@@ -909,6 +915,12 @@ class FolderLensApp(ctk.CTk):
         self.active_view = self.settings.view
         self.search_query = ""
         self._search_after = None
+        self.file_filter = self.settings.file_filter
+        self._filter_index: Optional[analysis.FilterIndex] = None
+        self._filter_index_key: Optional[str] = None
+        self._filter_generation = 0
+        self._filter_building = False
+        self._is_network_root = False
 
         # tree-view state
         self.tree: Optional[ttk.Treeview] = None
@@ -936,6 +948,7 @@ class FolderLensApp(ctk.CTk):
         self._treemap_image = None
         self._peek_path: Optional[str] = None
         self._peek_args = None
+        self._peek_mtime = None
         self.tooltip: Optional[Tooltip] = None
         self._treemap_redraw_after = None
 
@@ -955,6 +968,7 @@ class FolderLensApp(ctk.CTk):
         self.bind("<BackSpace>", self._on_backspace)
         self.bind("<Control-f>", lambda e: self.search_entry.focus_set())
         self.bind("<Escape>", lambda e: self._clear_search())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         start = initial_path or (self.settings.last_folder if os.path.isdir(self.settings.last_folder or "") else None)
         if start and os.path.isdir(start):
@@ -1076,6 +1090,23 @@ class FolderLensApp(ctk.CTk):
         add_hint(self.search_entry, "Search everything in this scan  (Ctrl+F)")
         self.search_var.trace_add("write", lambda *a: self._on_search_change())
 
+        filter_labels = [label for _, label in FILE_TYPE_FILTERS]
+        self.filter_var = ctk.StringVar(value=FILE_TYPE_FILTER_LABELS.get(self.file_filter, filter_labels[0]))
+        self.filter_menu = ctk.CTkOptionMenu(
+            self.toolbar,
+            values=filter_labels,
+            width=150,
+            height=34,
+            variable=self.filter_var,
+            command=self._on_filter_change,
+            fg_color=("gray85", "gray20"),
+            button_color=("gray75", "gray28"),
+            button_hover_color=("gray65", "gray35"),
+            text_color=("gray20", "gray90"),
+            font=ctk.CTkFont(size=11),
+        )
+        add_hint(self.filter_menu, "Limit every view to one file category; folders with matches stay visible")
+
         self._toolbar_narrow = None
         self.bind("<Configure>", self._on_window_configure, add="+")
         self.after(80, lambda: self._reflow_toolbar(self.winfo_width()))
@@ -1104,15 +1135,18 @@ class FolderLensApp(ctk.CTk):
         self._toolbar_narrow = narrow
 
         self.search_entry.pack_forget()
+        self.filter_menu.pack_forget()
         self.actions.pack_forget()
 
         if narrow:
             self.toolbar_row2.pack(fill="x")
             self.search_entry.pack(in_=self.toolbar_row2, side="left", padx=(12, 6), pady=7)
+            self.filter_menu.pack(in_=self.toolbar_row2, side="left", padx=6, pady=7)
             self.actions.pack(in_=self.toolbar_row2, side="right", padx=(4, 8), pady=4)
         else:
             self.toolbar_row2.pack_forget()
             self.actions.pack(in_=self.toolbar_row1, side="right", padx=(4, 8), pady=6)
+            self.filter_menu.pack(in_=self.toolbar_row1, side="right", padx=6, pady=9)
             self.search_entry.pack(in_=self.toolbar_row1, side="right", padx=6, pady=9)
 
     def _build_body(self):
@@ -1188,9 +1222,123 @@ class FolderLensApp(ctk.CTk):
 
     # --------------------------------------------------------------- scan
 
+    def _filter_label(self, key: Optional[str] = None) -> str:
+        return FILE_TYPE_FILTER_LABELS.get(key or self.file_filter, "All file types")
+
+    def _invalidate_filter_index(self):
+        """Drop a projection whose underlying scanned tree has changed."""
+        self._filter_generation += 1
+        self._filter_index = None
+        self._filter_index_key = None
+        self._filter_building = False
+
+    def _filter_ready_for_view(self) -> bool:
+        if self.file_filter == "all":
+            return True
+        if (self._filter_index is not None
+                and self._filter_index_key == self.file_filter
+                and self._filter_index.root is self.root_node):
+            return True
+        self._empty_hint(f"Applying {self._filter_label()} filter…")
+        return False
+
+    def _start_filter_build(self):
+        root = self.root_node
+        key = self.file_filter
+        if root is None or key == "all":
+            self._filter_building = False
+            return
+
+        generation = self._filter_generation
+        self._filter_building = True
+        self._set_status(f"Preparing {self._filter_label(key)} view…")
+        self._render_active_view()
+
+        def worker():
+            try:
+                index = analysis.build_filter_index(
+                    root, key,
+                    should_cancel=lambda: (
+                        generation != self._filter_generation
+                        or root is not self.root_node
+                        or key != self.file_filter
+                    ))
+            except Exception as exc:
+                message = str(exc)
+                self.after(0, lambda: self._filter_build_failed(root, key, generation, message))
+                return
+            if index is None:
+                return
+            self.after(0, lambda: self._filter_build_done(root, key, generation, index))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _filter_build_failed(self, root, key: str, generation: int, message: str):
+        if (root is not self.root_node or key != self.file_filter
+                or generation != self._filter_generation):
+            return
+        self._filter_building = False
+        self._set_status(f"Could not apply {self._filter_label(key)} filter: {message}")
+        self._render_active_view()
+
+    def _filter_build_done(self, root, key: str, generation: int,
+                           index: analysis.FilterIndex):
+        if (root is not self.root_node or key != self.file_filter
+                or generation != self._filter_generation):
+            return
+        self._filter_index = index
+        self._filter_index_key = key
+        self._filter_building = False
+        if self.treemap_stack and index.count(self.treemap_stack[-1]) == 0:
+            self.treemap_stack = []
+        self._set_view_total()
+        self._render_active_view()
+
+    def _set_view_total(self):
+        if not self.root_node:
+            return
+        if self.file_filter == "all" or self._filter_index is None:
+            self.status_right.configure(text=f"Total: {format_size(self.root_node.size)}")
+            return
+        visible_size = self._filter_index.size(self.root_node)
+        visible_count = self._filter_index.count(self.root_node)
+        self.status_right.configure(
+            text=f"{self._filter_label()} · {visible_count:,} files · {format_size(visible_size)}")
+
+    def _node_size(self, node: Node) -> int:
+        if self.file_filter != "all" and self._filter_index is not None:
+            return self._filter_index.size(node)
+        return node.size
+
+    def _node_count(self, node: Node) -> int:
+        if self.file_filter != "all" and self._filter_index is not None:
+            return self._filter_index.count(node)
+        return node.item_count if node.is_dir else 1
+
+    def _count_label(self) -> str:
+        """Use precise wording for full-tree item counts vs filtered files."""
+        return "files" if self.file_filter != "all" else "items"
+
+    def _visible_children(self, node: Node) -> List[Node]:
+        if self.file_filter != "all" and self._filter_index is not None:
+            return self._filter_index.children(node)
+        return node.children
+
+    def _sorted_children(self, node: Node) -> List[Node]:
+        if self.file_filter != "all" and self._filter_index is not None:
+            return self._filter_index.sorted_children(node, self.sort_key, self.sort_reverse)
+        return node.sorted_children(self.sort_key, self.sort_reverse)
+
+    @staticmethod
+    def _node_mtime(node: Node):
+        value = getattr(node, "modified_date", 0)
+        return value if value else None
+
     def scan_folder(self, path: str):
         self.settings.last_folder = path
         self.settings.save()
+        self._is_network_root = is_network_path(path)
+        self._invalidate_filter_index()
         self.treemap_stack = []
         self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
@@ -1206,6 +1354,7 @@ class FolderLensApp(ctk.CTk):
 
     def _scan_done(self, root: Node, errors: List[str], scan_time: float):
         self.root_node = root
+        self._is_network_root = is_network_path(root.path)
         self.scan_errors = errors
         self.scan_time = scan_time
         self._show_progress(False)
@@ -1215,9 +1364,12 @@ class FolderLensApp(ctk.CTk):
         if errors:
             status += f"  ·  ⚠ {len(errors)} inaccessible"
         self._set_status(status)
-        self.status_right.configure(text=f"Total: {format_size(root.size)}")
+        self._set_view_total()
         self._update_disk(root.path)
-        self._render_active_view()
+        if self.file_filter == "all":
+            self._render_active_view()
+        else:
+            self._start_filter_build()
 
     def _scan_failed(self, message: str):
         self._show_progress(False)
@@ -1271,6 +1423,30 @@ class FolderLensApp(ctk.CTk):
         self.settings.view = value
         self.settings.save()
         self._render_active_view()
+
+    def _on_filter_change(self, label: str):
+        """Build a background projection for the selected file category."""
+        reverse = {display: key for key, display in FILE_TYPE_FILTERS}
+        key = reverse.get(label, "all")
+        if key == self.file_filter and (
+                key == "all" or self._filter_index_key == key):
+            return
+
+        self.file_filter = key
+        self.settings.file_filter = key
+        self.settings.save()
+        self.treemap_stack = []
+        # Duplicate results are specific to the active type projection.
+        self._dup_cancel = True
+        self.dup_groups = []
+        self._invalidate_filter_index()
+
+        if key == "all" or self.root_node is None:
+            self._set_view_total()
+            self._render_active_view()
+            return
+
+        self._start_filter_build()
 
     def _clear_body(self):
         if self.tooltip:
@@ -1430,6 +1606,8 @@ class FolderLensApp(ctk.CTk):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
             return
+        if not self._filter_ready_for_view():
+            return
 
         arrow = " ↓" if self.sort_reverse else " ↑"
         marks = {key: (arrow if key == self.sort_key else "")
@@ -1472,24 +1650,27 @@ class FolderLensApp(ctk.CTk):
             self._insert_tree_children("", self.root_node)
 
     def _tree_values(self, node: Node, parent: Node):
-        pct = calculate_percentage(node.size, parent.size) if parent and parent.size else 0.0
+        node_size = self._node_size(node)
+        parent_size = self._node_size(parent) if parent else 0
+        pct = calculate_percentage(node_size, parent_size) if parent_size else 0.0
         filled = round(pct / 100 * self.BAR_WIDTH)
         bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
         usage = f"{bar} {pct:4.1f}%"
         if node.is_dir:
-            return (usage, format_size(node.size), f"{node.item_count:,}", "Folder", format_date(node.creation_date))
-        return (usage, format_size(node.size), "", get_file_category(node.path)['label'], format_date(node.creation_date))
+            return (usage, format_size(node_size), f"{self._node_count(node):,}", "Folder", format_date(node.creation_date))
+        return (usage, format_size(node_size), "", get_file_category(node.name, is_dir=False)['label'], format_date(node.creation_date))
 
     def _thumb_size(self) -> int:
         return max(16, self.settings.row_height() - 6)
 
     def _register_row_thumbnail(self, tree, iid: str, node: Node):
         """Ask for a small preview for an image row; it is applied when ready."""
-        if node.is_dir or not self.settings.list_thumbnails or not is_image_file(node.path):
+        if node.is_dir or not self.settings.list_thumbnails or not is_image_file(node.name):
             return
         size = self._thumb_size()
-        self._row_by_path.setdefault(node.path, []).append((tree, iid))
-        image = self.thumbnails.request(node.path, (size, size))
+        mtime = self._node_mtime(node)
+        self._row_by_path.setdefault(node.path, []).append((tree, iid, mtime))
+        image = self.thumbnails.request(node.path, (size, size), mtime=mtime)
         if image is not None:
             self._set_row_image(tree, iid, node.path, image)
 
@@ -1508,22 +1689,24 @@ class FolderLensApp(ctk.CTk):
         if not rows:
             return
         size = self._thumb_size()
-        image = self.thumbnails.get(path, (size, size))
+        mtime = rows[0][2] if len(rows[0]) > 2 else None
+        image = self.thumbnails.get(path, (size, size), mtime=mtime)
         if image is None:
             return
         alive = []
-        for tree, iid in rows:
+        for row in rows:
+            tree, iid = row[:2]
             try:
                 if tree.winfo_exists() and tree.exists(iid):
                     self._set_row_image(tree, iid, path, image)
-                    alive.append((tree, iid))
+                    alive.append(row)
             except tk.TclError:
                 continue
         self._row_by_path[path] = alive
 
     def _insert_tree_children(self, parent_iid: str, parent_node: Node):
-        for child in parent_node.sorted_children(self.sort_key, self.sort_reverse):
-            icon = ICONS['folder'] if child.is_dir else get_file_icon(child.path)
+        for child in self._sorted_children(parent_node):
+            icon = ICONS['folder'] if child.is_dir else get_file_icon(child.name, is_dir=False)
             tags = []
             if child.is_dir:
                 tags.append("folder")
@@ -1533,15 +1716,17 @@ class FolderLensApp(ctk.CTk):
                                    values=self._tree_values(child, parent_node), tags=tuple(tags))
             self.iid_to_node[iid] = child
             self._register_row_thumbnail(self.tree, iid, child)
-            if child.is_dir and child.children:
+            if child.is_dir and self._node_count(child) > 0:
                 self.tree.insert(iid, "end", text="…", tags=("dummy",))
 
     def _fill_tree_search(self):
-        matches = analysis.find_matches(self.root_node, self.search_query, limit=1000)
+        matches = analysis.find_matches(
+            self.root_node, self.search_query, limit=1000,
+            filter_key=self.file_filter, filter_index=self._filter_index)
         if not matches:
             return
         for node in matches:
-            icon = ICONS['folder'] if node.is_dir else get_file_icon(node.path)
+            icon = ICONS['folder'] if node.is_dir else get_file_icon(node.name, is_dir=False)
             tags = ["folder"] if node.is_dir else []
             iid = self.tree.insert("", "end", text=f"{icon} {node.name}",
                                    values=self._tree_values(node, self.root_node), tags=tuple(tags))
@@ -1599,9 +1784,9 @@ class FolderLensApp(ctk.CTk):
         nodes = self._selected_nodes()
         if not nodes:
             if self.root_node:
-                self._set_status(f"{self.root_node.item_count:,} items")
+                self._set_status(f"{self._node_count(self.root_node):,} {self._count_label()}")
             return
-        total = sum(n.size for n in nodes)
+        total = sum(self._node_size(n) for n in nodes)
         self._set_status(f"{len(nodes)} selected · {format_size(total)}")
 
     def _on_tree_double(self, event):
@@ -1611,7 +1796,7 @@ class FolderLensApp(ctk.CTk):
             return
         if node.is_dir:
             self.scan_folder(node.path)
-        elif self.settings.preview_enabled and is_image_file(node.path):
+        elif self.settings.preview_enabled and is_image_file(node.name):
             self._open_image(node.path)
 
     def _open_image(self, path: str):
@@ -1630,6 +1815,8 @@ class FolderLensApp(ctk.CTk):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
             return
+        if not self._filter_ready_for_view():
+            return
         headings = {
             "#0": ("File", lambda: None),
             "size": ("Size", lambda: None),
@@ -1647,22 +1834,24 @@ class FolderLensApp(ctk.CTk):
         self.largest_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.largest_tree.bind("<Delete>", lambda e: self._delete_selected())
 
-        files = analysis.largest_files(self.root_node, 100)
+        files = analysis.largest_files(
+            self.root_node, 100, filter_key=self.file_filter,
+            filter_index=self._filter_index)
         if self.search_query:
             files = [n for n in files if analysis.match_query(n.name, self.search_query)]
         if not files:
             return
         for node in files:
             iid = self.largest_tree.insert(
-                "", "end", text=f"{get_file_icon(node.path)} {node.name}",
-                values=(format_size(node.size), get_file_category(node.path)['label'],
+                "", "end", text=f"{get_file_icon(node.name, is_dir=False)} {node.name}",
+                values=(format_size(self._node_size(node)), get_file_category(node.name, is_dir=False)['label'],
                         os.path.dirname(node.path)))
             self.largest_map[iid] = node
             self._register_row_thumbnail(self.largest_tree, iid, node)
 
         def on_double(event):
             node = self.largest_map.get(self.largest_tree.identify_row(event.y))
-            if node and self.settings.preview_enabled and is_image_file(node.path):
+            if node and self.settings.preview_enabled and is_image_file(node.name):
                 self._open_image(node.path)
             elif node:
                 self._reveal(node.path)
@@ -1673,6 +1862,8 @@ class FolderLensApp(ctk.CTk):
     def _render_types(self):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
+            return
+        if not self._filter_ready_for_view():
             return
         colors = self._colors()
         outer = tk.Frame(self.body, bg=colors['tree_bg'])
@@ -1688,8 +1879,10 @@ class FolderLensApp(ctk.CTk):
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        stats = analysis.category_breakdown(self.root_node)
-        total = self.root_node.size or 1
+        stats = analysis.category_breakdown(
+            self.root_node, filter_key=self.file_filter,
+            filter_index=self._filter_index)
+        total = self._node_size(self.root_node) or 1
 
         tk.Label(inner, text="File type breakdown", bg=colors['tree_bg'], fg=colors['tree_fg'],
                  font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=24, pady=(20, 12))
@@ -1721,6 +1914,8 @@ class FolderLensApp(ctk.CTk):
     def _render_duplicates(self):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
+            return
+        if not self._filter_ready_for_view():
             return
 
         colors = self._colors()
@@ -1778,6 +1973,8 @@ class FolderLensApp(ctk.CTk):
         root = self.root_node
         if not root:
             return
+        filter_index = self._filter_index
+        filter_key = self.file_filter
         self._dup_running = True
         self._dup_cancel = False
         self.dup_button.configure(text="Stop")
@@ -1791,7 +1988,8 @@ class FolderLensApp(ctk.CTk):
             try:
                 found = duplicates.find_duplicates(
                     root, min_size=self.DUPLICATE_MIN_SIZE,
-                    progress=report, should_cancel=lambda: self._dup_cancel)
+                    progress=report, should_cancel=lambda: self._dup_cancel,
+                    filter_key=filter_key, filter_index=filter_index)
             except Exception as exc:
                 message = str(exc)
                 self.after(0, lambda: self._duplicate_scan_failed(message))
@@ -1854,7 +2052,7 @@ class FolderLensApp(ctk.CTk):
                 tags=("folder",), open=False)
             for node in sorted(group.nodes, key=lambda n: (len(n.path), n.path)):
                 iid = tree.insert(
-                    parent, "end", text=f"{get_file_icon(node.path)} {node.name}",
+                    parent, "end", text=f"{get_file_icon(node.name, is_dir=False)} {node.name}",
                     values=(format_size(node.size), "", os.path.dirname(node.path)))
                 self.dup_map[iid] = node
                 self._register_row_thumbnail(tree, iid, node)
@@ -1865,24 +2063,32 @@ class FolderLensApp(ctk.CTk):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
             return
+        if not self._filter_ready_for_view():
+            return
         colors = self._colors()
         node = self.treemap_stack[-1] if self.treemap_stack else self.root_node
 
         wrap = tk.Frame(self.body, bg=colors['canvas_bg'])
         wrap.pack(fill="both", expand=True)
 
-        # Only shown once you have zoomed into something: at the top level it
-        # would just repeat the path bar above it.
+        # A compact context bar makes the map self-explanatory after a drill
+        # down and keeps the path/size/type summary in one stable place.
+        summary = tk.Frame(wrap, bg=colors['head_bg'], height=42)
+        summary.pack(fill="x")
+        summary.pack_propagate(False)
+        title = "Treemap  ·  " + node.name
+        if self.file_filter != "all":
+            title += f"  ·  {self._filter_label()} only"
+        tk.Label(summary, text=title, bg=colors['head_bg'], fg=colors['tree_fg'],
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=(14, 4), pady=11)
+        tk.Label(summary,
+                 text=f"{self._node_count(node):,} {self._count_label()} · {format_size(self._node_size(node))}",
+                 bg=colors['head_bg'], fg=colors['muted_fg'],
+                 font=("Segoe UI", 10)).pack(side="left", pady=11)
         if self.treemap_stack:
-            crumb = tk.Frame(wrap, bg=colors['head_bg'], height=28)
-            crumb.pack(fill="x")
-            crumb.pack_propagate(False)
-            label = "  ›  ".join([self.root_node.name] + [n.name for n in self.treemap_stack])
-            tk.Label(crumb, text=f"🔍  zoomed into  {label}", bg=colors['head_bg'],
-                     fg=colors['head_fg'], font=("Segoe UI", 10)).pack(side="left", padx=12)
-            back = tk.Label(crumb, text="⬅ Back", bg=colors['head_bg'], fg=ACCENT,
+            back = tk.Label(summary, text="⬅ Back", bg=colors['head_bg'], fg=ACCENT,
                             cursor="hand2", font=("Segoe UI", 10, "bold"))
-            back.pack(side="right", padx=12)
+            back.pack(side="right", padx=14, pady=11)
             back.bind("<Button-1>", lambda e: self._treemap_back())
 
         self.treemap_canvas = tk.Canvas(wrap, bg=colors['canvas_bg'], highlightthickness=0)
@@ -1900,12 +2106,7 @@ class FolderLensApp(ctk.CTk):
         self.treemap_canvas.bind("<Button-3>", lambda e: self._treemap_back())
 
     def _build_treemap_legend(self, parent, colors):
-        """Colour key along the bottom of the map.
-
-        Without it the colours are just decoration: you can see one big blue
-        block without knowing blue means documents.
-        """
-        from file_utils import FILE_CATEGORIES
+        """Render a compact colour key for the current map projection."""
 
         legend = tk.Frame(parent, bg=colors['head_bg'], height=26)
         legend.pack(fill="x")
@@ -1914,7 +2115,10 @@ class FolderLensApp(ctk.CTk):
         inner = tk.Frame(legend, bg=colors['head_bg'])
         inner.pack(side="left", padx=10)
 
-        shown = ("folder", "video", "image", "audio", "document", "archive", "code", "other")
+        if self.file_filter == "all":
+            shown = tuple(FILE_CATEGORIES)
+        else:
+            shown = ("folder", self.file_filter)
         for key in shown:
             category = FILE_CATEGORIES.get(key)
             if not category:
@@ -1927,12 +2131,15 @@ class FolderLensApp(ctk.CTk):
             tk.Label(chip, text=category['label'], bg=colors['head_bg'],
                      fg=colors['muted_fg'], font=("Segoe UI", 9)).pack(side="left", padx=(5, 0))
 
-        tk.Label(legend, text="click a folder to zoom in · right-click to go back",
+        tk.Label(legend, text="click a folder to drill in · right-click or Back button to go up",
                  bg=colors['head_bg'], fg=colors['muted_fg'],
                  font=("Segoe UI", 9)).pack(side="right", padx=12)
 
     def _treemap_leave(self, event):
         self.tooltip.hide()
+        self._peek_path = None
+        self._peek_args = None
+        self._peek_mtime = None
         if self._hover_tile is not None:
             self._hover_tile = None
             self._draw_highlight(None)
@@ -1963,7 +2170,7 @@ class FolderLensApp(ctk.CTk):
             return
 
         node = self.treemap_node
-        if not node.children or node.size <= 0:
+        if not self._visible_children(node) or self._node_size(node) <= 0:
             canvas.delete("all")
             self._tiles = []
             canvas.create_text(w // 2, h // 2, text="Nothing to display",
@@ -1972,11 +2179,22 @@ class FolderLensApp(ctk.CTk):
 
         self._tiles = analysis.build_treemap(
             node, 2, 2, w - 4, h - 4,
-            min_area=110, max_depth=6, header=treemap_render.RenderOptions.header)
+            min_area=110, max_depth=7, padding=3,
+            header=treemap_render.RenderOptions.header,
+            size_getter=self._node_size,
+            children_getter=self._visible_children,
+            count_getter=self._node_count,
+            max_children=1200,
+            aggregate_category=self.file_filter)
 
         opts = treemap_render.RenderOptions(
             dark_mode=self.settings.dark_mode,
             show_thumbnails=self.settings.treemap_thumbnails,
+            # Remote image reads are the most visible source of latency after
+            # the metadata scan. Keep the map useful, but deliberately small,
+            # on network workfolders.
+            max_thumbnails=48 if self._is_network_root else 120,
+            thumbnail_mtime=self._node_mtime,
         )
         image = treemap_render.render_treemap(
             self._tiles, w, h, opts,
@@ -2005,8 +2223,9 @@ class FolderLensApp(ctk.CTk):
             tile.x, tile.y, tile.x + tile.w - 1, tile.y + tile.h - 1,
             outline="#ffffff", width=2)
 
-    def _treemap_thumb(self, path: str, size):
-        return self.thumbnails.request(path, (min(size[0], 400), min(size[1], 400)))
+    def _treemap_thumb(self, path: str, size, mtime=None):
+        return self.thumbnails.request(
+            path, (min(size[0], 400), min(size[1], 400)), mtime=mtime)
 
     def _on_thumbnail_ready(self, path: str):
         """A worker decoded a thumbnail; fold it into the views that show one."""
@@ -2019,7 +2238,7 @@ class FolderLensApp(ctk.CTk):
             # now rather than waiting for the next mouse move
             if self._peek_path == path and self._peek_args is not None:
                 text, x, y = self._peek_args
-                image = self.thumbnails.get(path, PEEK_SIZE)
+                image = self.thumbnails.get(path, PEEK_SIZE, mtime=self._peek_mtime)
                 if image is not None:
                     self.tooltip.show(text, x, y, self._colors(), image=image)
         elif self.settings.list_thumbnails:
@@ -2029,6 +2248,9 @@ class FolderLensApp(ctk.CTk):
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
         if tile is None:
             self.tooltip.hide()
+            self._peek_path = None
+            self._peek_args = None
+            self._peek_mtime = None
             if self._hover_tile is not None:
                 self._hover_tile = None
                 self._draw_highlight(None)
@@ -2039,11 +2261,18 @@ class FolderLensApp(ctk.CTk):
             self._draw_highlight(tile)
 
         n = tile.node
-        kind = "Folder" if n.is_dir else get_file_category(n.path)['label']
-        share = calculate_percentage(n.size, self.treemap_node.size)
-        lines = [n.name, f"{format_size(n.size)} · {kind} · {share:.1f}%"]
+        if getattr(n, "is_aggregate", False):
+            kind = f"Grouped {self._filter_label().lower()}"
+        else:
+            kind = "Folder" if n.is_dir else get_file_category(n.name, is_dir=False)['label']
+        node_size = self._node_size(n)
+        parent_size = self._node_size(self.treemap_node)
+        share = calculate_percentage(node_size, parent_size)
+        lines = [n.name, f"{format_size(node_size)} · {kind} · {share:.1f}%"]
         if n.is_dir:
-            lines.append(f"{n.item_count:,} items · click to zoom in")
+            lines.append(f"{self._node_count(n):,} {self._count_label()} · click to zoom in")
+        elif getattr(n, "is_aggregate", False):
+            lines.append(f"{n.item_count:,} items represented here")
         else:
             lines.append(os.path.dirname(n.path))
 
@@ -2051,10 +2280,14 @@ class FolderLensApp(ctk.CTk):
         peek = None
         self._peek_path = None
         self._peek_args = None
-        if self.settings.peek_preview and not n.is_dir and is_image_file(n.path):
-            peek = self.thumbnails.request(n.path, PEEK_SIZE)
+        self._peek_mtime = None
+        if (self.settings.peek_preview and not n.is_dir
+                and not getattr(n, "is_aggregate", False)
+                and is_image_file(n.name)):
+            peek = self.thumbnails.request(n.path, PEEK_SIZE, mtime=self._node_mtime(n))
             lines.append("double-click to open")
             self._peek_path = n.path
+            self._peek_mtime = self._node_mtime(n)
 
         text = "\n".join(lines)
         px, py = self.winfo_pointerx(), self.winfo_pointery()
@@ -2063,14 +2296,16 @@ class FolderLensApp(ctk.CTk):
 
     def _treemap_click(self, event):
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
-        if tile and tile.node.is_dir and tile.node.children:
+        if tile and tile.node.is_dir and self._node_count(tile.node) > 0:
             self.treemap_stack.append(tile.node)
             self._hover_tile = None
             self._render_active_view()
 
     def _treemap_double_click(self, event):
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
-        if tile and not tile.node.is_dir and is_image_file(tile.node.path):
+        if (tile and not tile.node.is_dir
+                and not getattr(tile.node, "is_aggregate", False)
+                and is_image_file(tile.node.name)):
             self._open_image(tile.node.path)
 
     def _treemap_back(self):
@@ -2257,7 +2492,7 @@ class FolderLensApp(ctk.CTk):
         if not selection:
             messagebox.showwarning("No selection", self._no_selection_hint())
             return
-        total = sum(node.size for _, node in selection)
+        total = sum(self._node_size(node) for _, node in selection)
         recycle = self.settings.use_recycle_bin and trash.is_supported()
         if recycle:
             prompt = (f"Move {len(selection)} item(s) ({format_size(total)}) to the "
@@ -2320,13 +2555,24 @@ class FolderLensApp(ctk.CTk):
                 mapping.pop(iid, None)
 
         if self.root_node:
-            self.status_right.configure(text=f"Total: {format_size(self.root_node.size)}")
-            status = f"{self.root_node.item_count:,} items"
+            if deleted:
+                self._invalidate_filter_index()
+            self._set_view_total()
+            status = f"{self._node_count(self.root_node):,} {self._count_label()}"
             if deleted:
                 status = f"Deleted {len(deleted)} item(s) · " + status
             self._set_status(status)
+            if deleted and self.file_filter != "all":
+                self._start_filter_build()
         if errors:
             messagebox.showerror("Errors", "\n".join(errors[:5]))
+
+    def _on_close(self):
+        """Stop background work and release thumbnail workers on exit."""
+        self.scanner.cancel()
+        self._dup_cancel = True
+        self.thumbnails.close()
+        self.destroy()
 
     # --------------------------------------------------------------- misc
 

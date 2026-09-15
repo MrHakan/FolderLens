@@ -5,7 +5,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from file_utils import (
     format_size, calculate_percentage, natural_sort_key,
-    get_file_extension, get_file_category, is_image_file, FILE_CATEGORIES
+    get_file_extension, get_file_category, get_file_category_key,
+    file_type_matches, get_file_icon, is_image_file, FILE_CATEGORIES,
+    FILE_TYPE_FILTER_LABELS,
 )
 
 
@@ -61,3 +63,25 @@ def test_is_image_file():
     assert is_image_file("pic.png")
     assert is_image_file("pic.JPEG")
     assert not is_image_file("doc.pdf")
+
+
+def test_type_filters_cover_common_extensions():
+    assert get_file_category_key("photo.avif", is_dir=False) == "image"
+    assert get_file_category_key("notes.md", is_dir=False) == "document"
+    assert file_type_matches("photo.avif", "image", is_dir=False)
+    assert not file_type_matches("photo.avif", "video", is_dir=False)
+    assert not file_type_matches("folder", "image", is_dir=True)
+    assert set(FILE_TYPE_FILTER_LABELS) >= {"all", "image", "other"}
+
+
+def test_file_metadata_helpers_can_skip_network_filesystem_calls(monkeypatch):
+    """Scanned callers already know the entry type; classification must honor it."""
+    import file_utils
+
+    def fail(_path):
+        raise AssertionError("unexpected filesystem type check")
+
+    monkeypatch.setattr(file_utils.os.path, "isdir", fail)
+    assert get_file_category("photo.png", is_dir=False) is FILE_CATEGORIES["image"]
+    assert get_file_icon("photo.png", is_dir=False) == FILE_CATEGORIES["image"]["icon"]
+    assert get_file_extension("photo.png", is_dir=False) == "PNG"

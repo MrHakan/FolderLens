@@ -150,3 +150,51 @@ def test_find_matches():
     # sorted largest first
     assert names[0] == "a.txt"
     assert analysis.find_matches(root, "") == []
+
+
+def test_filter_index_projects_sizes_and_children_without_touching_disk():
+    root = make_tree()
+    index = analysis.build_filter_index(root, "image")
+    sub = next(child for child in root.children if child.name == "sub")
+    image = next(child for child in sub.children if child.name == "c.png")
+
+    assert index.size(root) == 300
+    assert index.count(root) == 1
+    assert index.children(root) == [sub]
+    assert index.size(sub) == 300
+    assert index.children(sub) == [image]
+    assert analysis.largest_files(root, filter_key="image", filter_index=index) == [image]
+    assert [stat.label for stat in analysis.category_breakdown(
+        root, filter_key="image", filter_index=index)] == ["Image"]
+    assert analysis.find_matches(root, "c", filter_key="image", filter_index=index) == [image]
+
+    tiles = analysis.build_treemap(
+        root, 0, 0, 400, 300, min_area=1, max_depth=6,
+        size_getter=index.size, children_getter=index.children,
+        count_getter=index.count)
+    assert {tile.node.name for tile in tiles if not tile.node.is_dir} == {"c.png"}
+    assert any(tile.node is sub for tile in tiles)
+
+
+def test_treemap_collapses_large_sibling_tail_into_an_aggregate():
+    root = Node(path="/root", name="root", is_dir=True)
+    root.children = [
+        Node(path=f"/root/file{i}.bin", name=f"file{i}.bin", is_dir=False,
+             size=i + 1, parent=root)
+        for i in range(20)
+    ]
+    root.size = sum(child.size for child in root.children)
+    root.item_count = len(root.children)
+
+    tiles = analysis.build_treemap(
+        root, 0, 0, 400, 300, min_area=1, max_depth=1, max_children=6)
+    top = [tile for tile in tiles if tile.depth == 0]
+    aggregate = next(tile.node for tile in top if getattr(tile.node, "is_aggregate", False))
+    assert len(top) == 6
+    assert aggregate.item_count == 15
+    assert aggregate.size == sum(range(1, 16))
+
+    only_aggregate = analysis.build_treemap(
+        root, 0, 0, 100, 100, min_area=1, max_depth=1, max_children=1)
+    assert len(only_aggregate) == 1
+    assert getattr(only_aggregate[0].node, "is_aggregate", False)

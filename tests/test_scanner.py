@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scanner import TreeScanner, FolderScanner, QuickScanner, Node
+from scanner import TreeScanner, FolderScanner, QuickScanner, Node, is_network_path
 
 
 @pytest.fixture
@@ -90,6 +90,7 @@ def test_tree_scan_builds_full_tree(sample_tree):
     # file_a + file_b + subdir + nested.txt + deeper + deep.txt
     assert root.item_count == 6
     assert holder["errors"] == []
+    assert by_name["file_a.txt"].modified_date > 0
 
 
 def test_tree_scan_sorted_children(sample_tree):
@@ -175,3 +176,11 @@ def test_files_share_one_empty_children_container():
     assert d1.children is not d2.children
     d1.children.append(a)
     assert d2.children == []
+
+
+def test_network_paths_use_a_smaller_worker_pool(tmp_path):
+    assert is_network_path(r"\\server\share\work")
+    assert not is_network_path(str(tmp_path))
+    assert TreeScanner.worker_limit(r"\\server\share\work") == min(
+        TreeScanner.MAX_WORKERS, TreeScanner.NETWORK_WORKERS)
+    assert TreeScanner.worker_limit(str(tmp_path)) == TreeScanner.MAX_WORKERS

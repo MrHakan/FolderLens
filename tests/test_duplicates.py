@@ -93,6 +93,14 @@ def test_empty_tree(tmp_path):
     assert duplicates.find_duplicates(scan(tmp_path), min_size=1) == []
 
 
+def test_file_type_filter_limits_duplicate_candidates(tree):
+    root = scan(tree)
+    assert duplicates.find_duplicates(root, min_size=1, filter_key="image") == []
+    groups = duplicates.find_duplicates(root, min_size=1, filter_key="executable")
+    assert len(groups) == 1
+    assert groups[0].count == 3
+
+
 def test_keep_first_delete_rest_keeps_the_shortest_path(tree):
     group = duplicates.find_duplicates(scan(tree), min_size=1)[0]
     doomed = duplicates.keep_first_delete_rest(group)

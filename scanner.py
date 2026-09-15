@@ -1,6 +1,7 @@
 import os
+import queue
+import stat as stat_module
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Callable, Optional
 import time
@@ -18,12 +19,13 @@ class Node:
     """
 
     __slots__ = ("_path", "name", "is_dir", "size", "creation_date",
-                 "item_count", "children", "parent", "error")
+                 "modified_date", "item_count", "children", "parent", "error")
 
     def __init__(self, path: Optional[str], name: str, is_dir: bool, size: int = 0,
                  creation_date: float = 0.0, item_count: int = 0,
                  children: Optional[List["Node"]] = None,
-                 parent: Optional["Node"] = None, error: Optional[str] = None):
+                 parent: Optional["Node"] = None, error: Optional[str] = None,
+                 modified_date: int = 0):
         # Files far outnumber directories, and a file's path is just its
         # parent's path plus its name. Storing it per file was about a third
         # of the tree's memory, so it is derived on demand instead; only
@@ -33,6 +35,10 @@ class Node:
         self.is_dir = is_dir
         self.size = size
         self.creation_date = creation_date
+        # Captured during the same stat call used for size.  Thumbnail and
+        # other metadata consumers can use this without stat'ing a network
+        # path again.
+        self.modified_date = modified_date
         self.item_count = item_count
         if children is not None:
             self.children = children
@@ -80,7 +86,7 @@ class Node:
             from file_utils import get_file_category
             return sorted(
                 self.children,
-                key=lambda n: (not n.is_dir, "" if n.is_dir else get_file_category(n.path)['label'], n.name.lower()),
+                key=lambda n: (not n.is_dir, "" if n.is_dir else get_file_category(n.name, is_dir=False)['label'], n.name.lower()),
                 reverse=reverse
             )
         return sorted(self.children, key=lambda n: n.size, reverse=reverse)
@@ -106,16 +112,44 @@ class ScanResult:
     scan_time: float
 
 
+def is_network_path(path: str) -> bool:
+    """Return whether *path* is likely backed by a network share.
+
+    UNC paths are portable to detect.  On Windows, mapped network drives are
+    identified with ``GetDriveTypeW`` as well; this matters because a mapped
+    drive does not retain the ``\\server\\share`` spelling in the UI.
+    """
+    if path.startswith(("\\\\", "//")):
+        return True
+    if os.name != "nt":
+        return False
+
+    drive, _ = os.path.splitdrive(os.path.abspath(path))
+    if not drive:
+        return False
+    try:
+        import ctypes
+        # DRIVE_REMOTE == 4.  ctypes is imported only on Windows so the
+        # scanner remains easy to use in headless tests and on other hosts.
+        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4
+    except (AttributeError, OSError, TypeError):
+        return False
+
+
 class TreeScanner:
     """Scans a whole directory tree once, in parallel, into a Node tree.
 
-    Top-level directories are walked concurrently; each subtree is walked
-    iteratively (no recursion limit) and sizes are aggregated bottom-up in a
-    single post-order pass. The resulting tree lets a UI expand any folder
-    instantly without touching the disk again.
+    Directory work is fed through a shared queue and bounded worker pool
+    instead of assigning one whole subtree to one future.  That keeps a single
+    large top-level folder parallel and prevents thousands of futures from
+    being created.  Network shares use a smaller pool: remote metadata calls
+    are latency-bound and an oversized local-style pool tends to make SMB
+    workfolders slower, not faster.  Sizes are aggregated bottom-up once the
+    walk is complete.
     """
 
     MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
+    NETWORK_WORKERS = 6
     PROGRESS_EVERY = 500
 
     def __init__(self):
@@ -132,6 +166,13 @@ class TreeScanner:
     def cancel(self):
         self._cancel_requested.set()
 
+    @classmethod
+    def worker_limit(cls, folder_path: str) -> int:
+        """Choose a sensible metadata-concurrency limit for a folder."""
+        if is_network_path(folder_path):
+            return min(cls.MAX_WORKERS, cls.NETWORK_WORKERS)
+        return cls.MAX_WORKERS
+
     def _tick_progress(self, on_progress: Optional[Callable[[int], None]], n: int = 1):
         if on_progress is None:
             return
@@ -142,48 +183,119 @@ class TreeScanner:
         if before // self.PROGRESS_EVERY != after // self.PROGRESS_EVERY:
             on_progress(after)
 
+    @staticmethod
+    def _entry_modified_time(entry_stat) -> int:
+        value = getattr(entry_stat, "st_mtime_ns", None)
+        if value is not None:
+            return int(value)
+        return int(getattr(entry_stat, "st_mtime", 0.0) * 1_000_000_000)
+
+    def _read_directory(self, node: Node, errors: List[str],
+                        on_progress: Optional[Callable[[int], None]] = None,
+                        work_queue: Optional[queue.Queue] = None) -> Optional[str]:
+        """Read one directory and enqueue child directories.
+
+        The entry type and metadata come from one ``DirEntry.stat`` call.  In
+        particular, this avoids the old ``stat`` + ``is_dir`` pair of remote
+        metadata requests on filesystems where neither result is cached.
+        Returns a user-facing error for a directory-open failure, otherwise
+        ``None``.  Entry-level failures remain non-fatal and are collected.
+        """
+        try:
+            with os.scandir(node.path) as entries:
+                batch = 0
+                for entry in entries:
+                    if self._cancel_requested.is_set():
+                        break
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                        is_dir = stat_module.S_ISDIR(entry_stat.st_mode)
+                        child = Node(
+                            path=entry.path,
+                            name=entry.name,
+                            is_dir=is_dir,
+                            size=0 if is_dir else entry_stat.st_size,
+                            creation_date=entry_stat.st_ctime,
+                            parent=node,
+                            modified_date=self._entry_modified_time(entry_stat),
+                        )
+                        node.children.append(child)
+                        if is_dir and work_queue is not None:
+                            work_queue.put(child)
+                        batch += 1
+                        if batch >= self.PROGRESS_EVERY:
+                            self._tick_progress(on_progress, batch)
+                            batch = 0
+                    except PermissionError:
+                        errors.append(f"Access denied: {entry.path}")
+                    except OSError as e:
+                        errors.append(f"Error: {entry.path} - {str(e)}")
+                if batch:
+                    self._tick_progress(on_progress, batch)
+            return None
+        except PermissionError:
+            node.error = "Access denied"
+            message = f"Access denied: {node.path}"
+            errors.append(message)
+            return message
+        except FileNotFoundError:
+            node.error = "Folder not found"
+            message = f"Folder not found: {node.path}"
+            errors.append(message)
+            return message
+        except NotADirectoryError:
+            node.error = "Not a folder"
+            message = f"Not a folder: {node.path}"
+            errors.append(message)
+            return message
+        except OSError as e:
+            node.error = str(e)
+            message = f"Cannot read folder: {str(e)}"
+            errors.append(message)
+            return message
+
+    def _run_directory_workers(self, work_queue: queue.Queue, workers: int,
+                               error_lists: List[List[str]],
+                               on_progress: Optional[Callable[[int], None]] = None):
+        """Drain a directory queue with a fixed, bounded worker pool."""
+        def worker(errors: List[str]):
+            while True:
+                try:
+                    node = work_queue.get(timeout=0.05)
+                except queue.Empty:
+                    # A worker may be reading a directory and enqueueing more
+                    # work.  Keep waiting while any queued task is unfinished;
+                    # exit only once the queue is genuinely drained.
+                    if work_queue.unfinished_tasks == 0:
+                        return
+                    continue
+                try:
+                    if not self._cancel_requested.is_set():
+                        self._read_directory(node, errors, on_progress, work_queue)
+                except Exception as e:  # defensive: one bad share must not kill the pool
+                    errors.append(f"Error: {node.path} - {str(e)}")
+                finally:
+                    work_queue.task_done()
+
+        threads = [
+            threading.Thread(target=worker, args=(error_lists[i],), daemon=True)
+            for i in range(workers)
+        ]
+        for thread in threads:
+            thread.start()
+
+        # Queue.join also drains cleanly after cancellation: workers still
+        # call task_done for queued directories but skip their filesystem I/O.
+        work_queue.join()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
     def _build_subtree(self, root: Node, errors: List[str],
                        on_progress: Optional[Callable[[int], None]] = None):
-        """Fill in root's descendants iteratively, then aggregate sizes bottom-up."""
-        stack = [root]
-        while stack:
-            if self._cancel_requested.is_set():
-                return
-            node = stack.pop()
-            try:
-                with os.scandir(node.path) as entries:
-                    batch = 0
-                    for entry in entries:
-                        if self._cancel_requested.is_set():
-                            break
-                        try:
-                            stat = entry.stat(follow_symlinks=False)
-                            if entry.is_dir(follow_symlinks=False):
-                                child = Node(
-                                    path=entry.path, name=entry.name, is_dir=True,
-                                    creation_date=stat.st_ctime, parent=node
-                                )
-                                stack.append(child)
-                            else:
-                                child = Node(
-                                    path=entry.path, name=entry.name, is_dir=False,
-                                    size=stat.st_size, creation_date=stat.st_ctime, parent=node
-                                )
-                            node.children.append(child)
-                            batch += 1
-                        except PermissionError:
-                            errors.append(f"Access denied: {entry.path}")
-                        except OSError as e:
-                            errors.append(f"Error: {entry.path} - {str(e)}")
-                    if batch:
-                        self._tick_progress(on_progress, batch)
-            except PermissionError:
-                node.error = "Access denied"
-                errors.append(f"Access denied: {node.path}")
-            except OSError as e:
-                node.error = str(e)
-                errors.append(f"Error: {node.path} - {str(e)}")
-
+        """Compatibility helper that walks one subtree with the shared queue."""
+        work_queue: queue.Queue = queue.Queue()
+        work_queue.put(root)
+        self._run_directory_workers(work_queue, 1, [errors], on_progress)
         self._aggregate_sizes(root)
 
     @staticmethod
@@ -221,77 +333,33 @@ class TreeScanner:
             errors: List[str] = []
 
             try:
-                if not os.path.exists(folder_path):
-                    if on_error:
-                        on_error(f"Folder not found: {folder_path}")
-                    return
-                if not os.path.isdir(folder_path):
-                    if on_error:
-                        on_error(f"Not a folder: {folder_path}")
-                    return
-
+                root_path = os.path.abspath(folder_path)
                 try:
-                    root_stat = os.stat(folder_path)
+                    root_stat = os.stat(root_path)
                 except OSError:
+                    # Let the single scandir below provide the authoritative
+                    # missing/not-a-folder/access-denied result.
                     root_stat = None
 
                 root = Node(
-                    path=os.path.abspath(folder_path),
-                    name=os.path.basename(folder_path.rstrip("\\/")) or folder_path,
+                    path=root_path,
+                    name=os.path.basename(root_path.rstrip("\\/")) or root_path,
                     is_dir=True,
-                    creation_date=root_stat.st_ctime if root_stat else 0.0
+                    creation_date=root_stat.st_ctime if root_stat else 0.0,
+                    modified_date=self._entry_modified_time(root_stat) if root_stat else 0,
                 )
 
-                try:
-                    entries = list(os.scandir(root.path))
-                except PermissionError:
+                work_queue: queue.Queue = queue.Queue()
+                root_error = self._read_directory(root, errors, on_progress, work_queue)
+                if root_error:
                     if on_error:
-                        on_error(f"Access denied: {folder_path}")
-                    return
-                except OSError as e:
-                    if on_error:
-                        on_error(f"Cannot read folder: {str(e)}")
+                        on_error(root_error)
                     return
 
-                dir_children = []
-                for entry in entries:
-                    if self._cancel_requested.is_set():
-                        break
-                    try:
-                        stat = entry.stat(follow_symlinks=False)
-                        if entry.is_dir(follow_symlinks=False):
-                            child = Node(
-                                path=entry.path, name=entry.name, is_dir=True,
-                                creation_date=stat.st_ctime, parent=root
-                            )
-                            dir_children.append(child)
-                        else:
-                            child = Node(
-                                path=entry.path, name=entry.name, is_dir=False,
-                                size=stat.st_size, creation_date=stat.st_ctime, parent=root
-                            )
-                        root.children.append(child)
-                    except PermissionError:
-                        errors.append(f"Access denied: {entry.path}")
-                    except OSError as e:
-                        errors.append(f"Error: {entry.path} - {str(e)}")
-
-                self._tick_progress(on_progress, len(root.children))
-
-                if dir_children and not self._cancel_requested.is_set():
-                    # each worker collects errors into its own list to avoid locking
-                    error_lists = [[] for _ in dir_children]
-                    workers = min(self.MAX_WORKERS, len(dir_children))
-                    with ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = {
-                            executor.submit(self._build_subtree, child, error_lists[i], on_progress): i
-                            for i, child in enumerate(dir_children)
-                        }
-                        for future in as_completed(futures):
-                            try:
-                                future.result()
-                            except Exception as e:
-                                errors.append(f"Error: {dir_children[futures[future]].path} - {str(e)}")
+                if work_queue.qsize() and not self._cancel_requested.is_set():
+                    workers = self.worker_limit(root.path)
+                    error_lists = [[] for _ in range(workers)]
+                    self._run_directory_workers(work_queue, workers, error_lists, on_progress)
                     for lst in error_lists:
                         errors.extend(lst)
 
@@ -387,15 +455,15 @@ class QuickScanner:
             with os.scandir(folder_path) as entries:
                 for entry in entries:
                     try:
-                        stat = entry.stat(follow_symlinks=False)
-                        is_dir = entry.is_dir(follow_symlinks=False)
+                        entry_stat = entry.stat(follow_symlinks=False)
+                        is_dir = stat_module.S_ISDIR(entry_stat.st_mode)
 
                         items.append(FileItem(
                             path=entry.path,
                             name=entry.name,
-                            size=0 if is_dir else stat.st_size,
+                            size=0 if is_dir else entry_stat.st_size,
                             is_directory=is_dir,
-                            creation_date=stat.st_ctime
+                            creation_date=entry_stat.st_ctime
                         ))
                     except (PermissionError, OSError):
                         pass

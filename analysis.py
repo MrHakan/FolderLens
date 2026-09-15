@@ -7,21 +7,31 @@ file-type / extension breakdown.
 """
 import csv
 from dataclasses import dataclass
-from typing import Iterator, List, Dict, Tuple, Optional
+from typing import Callable, Iterator, List, Dict, Tuple, Optional
 
-from file_utils import get_file_category, get_file_extension, format_size
+from file_utils import (
+    FILE_TYPE_FILTER_LABELS,
+    file_type_matches,
+    get_file_category,
+    get_file_extension,
+    format_size,
+)
 
 
 # --------------------------------------------------------------------- walking
 
-def iter_file_nodes(root) -> Iterator:
-    """Yield every non-directory Node in the subtree (iterative)."""
+def iter_file_nodes(root, predicate: Optional[Callable] = None) -> Iterator:
+    """Yield non-directory Nodes in the subtree (iterative).
+
+    ``predicate`` is deliberately applied to the in-memory node, so filtered
+    views never need to touch the filesystem again.
+    """
     stack = [root]
     while stack:
         node = stack.pop()
         if node.is_dir:
             stack.extend(node.children)
-        else:
+        elif predicate is None or predicate(node):
             yield node
 
 
@@ -37,11 +47,20 @@ def iter_all_nodes(root) -> Iterator:
 
 # ------------------------------------------------------------- largest files
 
-def largest_files(root, limit: int = 100) -> List:
-    """Return the `limit` largest files anywhere in the tree, biggest first."""
-    files = list(iter_file_nodes(root))
-    files.sort(key=lambda n: n.size, reverse=True)
-    return files[:limit]
+def largest_files(root, limit: int = 100, filter_key: str = "all",
+                  filter_index=None) -> List:
+    """Return the `limit` largest matching files, biggest first."""
+    if limit <= 0:
+        return []
+    predicate = None
+    if filter_key != "all":
+        predicate = filter_index.matches if filter_index is not None else \
+            (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
+
+    # A bounded heap avoids retaining every file in memory just to find the
+    # top 100 on a large drive.  nlargest still returns largest-first.
+    from heapq import nlargest
+    return nlargest(limit, iter_file_nodes(root, predicate), key=lambda n: n.size)
 
 
 # --------------------------------------------------------- type breakdown
@@ -55,11 +74,15 @@ class CategoryStat:
     percent: float = 0.0
 
 
-def category_breakdown(root) -> List[CategoryStat]:
+def category_breakdown(root, filter_key: str = "all", filter_index=None) -> List[CategoryStat]:
     """Aggregate total size and file count per file category, largest first."""
     totals: Dict[str, List[int]] = {}
-    for node in iter_file_nodes(root):
-        cat = get_file_category(node.path)
+    predicate = None
+    if filter_key != "all":
+        predicate = filter_index.matches if filter_index is not None else \
+            (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
+    for node in iter_file_nodes(root, predicate):
+        cat = get_file_category(node.name, is_dir=False)
         label = cat['label']
         entry = totals.setdefault(label, [0, 0, cat['color']])
         entry[0] += node.size
@@ -75,11 +98,16 @@ def category_breakdown(root) -> List[CategoryStat]:
     return stats
 
 
-def extension_breakdown(root, limit: int = 15) -> List[Tuple[str, int, int]]:
+def extension_breakdown(root, limit: int = 15, filter_key: str = "all",
+                        filter_index=None) -> List[Tuple[str, int, int]]:
     """Return (extension, total_size, count) tuples, largest first."""
     totals: Dict[str, List[int]] = {}
-    for node in iter_file_nodes(root):
-        ext = get_file_extension(node.path)
+    predicate = None
+    if filter_key != "all":
+        predicate = filter_index.matches if filter_index is not None else \
+            (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
+    for node in iter_file_nodes(root, predicate):
+        ext = get_file_extension(node.name, is_dir=False)
         entry = totals.setdefault(ext, [0, 0])
         entry[0] += node.size
         entry[1] += 1
@@ -98,6 +126,137 @@ class Tile:
     w: float
     h: float
     depth: int
+
+
+@dataclass
+class TreemapAggregate:
+    """A lightweight tile representing children too small to show separately."""
+
+    name: str
+    size: int
+    item_count: int
+    parent: object
+    is_dir: bool = False
+    creation_date: float = 0.0
+    modified_date: int = 0
+    error: Optional[str] = None
+    is_aggregate: bool = True
+    category_key: str = "other"
+
+    @property
+    def path(self) -> str:
+        # There is no single real path for an aggregate.  The parent path is
+        # still useful in the tooltip and avoids manufacturing a path that
+        # could accidentally be opened or deleted.
+        return self.parent.path if self.parent is not None else self.name
+
+    @property
+    def ext(self) -> str:
+        return ""
+
+
+class FilterIndex:
+    """In-memory projection of a scanned tree for one file category.
+
+    Only directories need stored aggregates; matching files continue to use
+    their existing size.  This keeps the filter cheap in memory while making
+    folder rows and treemap areas reflect the selected type exactly.
+    """
+
+    __slots__ = ("root", "filter_key", "size_by_node", "count_by_node")
+
+    def __init__(self, root, filter_key: str, size_by_node: Dict[object, int],
+                 count_by_node: Dict[object, int]):
+        self.root = root
+        self.filter_key = filter_key
+        self.size_by_node = size_by_node
+        self.count_by_node = count_by_node
+
+    def matches(self, node) -> bool:
+        return (not node.is_dir and
+                file_type_matches(node.name, self.filter_key, is_dir=False))
+
+    def size(self, node) -> int:
+        if getattr(node, "is_aggregate", False):
+            return node.size
+        if node.is_dir:
+            return self.size_by_node.get(node, 0)
+        return node.size if self.matches(node) else 0
+
+    def count(self, node) -> int:
+        if getattr(node, "is_aggregate", False):
+            return node.item_count
+        if node.is_dir:
+            return self.count_by_node.get(node, 0)
+        return 1 if self.matches(node) else 0
+
+    def children(self, node) -> List:
+        if not node.is_dir:
+            return []
+        return [child for child in node.children if self.count(child) > 0]
+
+    def sorted_children(self, node, key: str = "size", reverse: bool = True) -> List:
+        children = self.children(node)
+        if key == "name":
+            from file_utils import natural_sort_key
+            return sorted(children, key=lambda n: natural_sort_key(n.name), reverse=reverse)
+        if key == "date":
+            return sorted(children, key=lambda n: n.creation_date, reverse=reverse)
+        if key == "type":
+            return sorted(
+                children,
+                key=lambda n: (
+                    not n.is_dir,
+                    "" if n.is_dir else get_file_category(n.name, is_dir=False)['label'],
+                    n.name.lower(),
+                ),
+                reverse=reverse,
+            )
+        return sorted(children, key=self.size, reverse=reverse)
+
+
+def build_filter_index(root, filter_key: str, should_cancel: Optional[Callable[[], bool]] = None) -> Optional[FilterIndex]:
+    """Build directory totals for a category without any filesystem I/O.
+
+    ``should_cancel`` lets the UI abandon a stale projection when the user
+    changes filters again while a very large in-memory tree is being reduced.
+    """
+    if filter_key not in FILE_TYPE_FILTER_LABELS or filter_key == "all":
+        raise ValueError(f"Unsupported file filter: {filter_key}")
+
+    sizes: Dict[object, int] = {}
+    counts: Dict[object, int] = {}
+    stack = [(root, False)]
+    while stack:
+        if should_cancel and should_cancel():
+            return None
+        node, processed = stack.pop()
+        if not node.is_dir:
+            continue
+        if not processed:
+            stack.append((node, True))
+            for child in node.children:
+                if child.is_dir:
+                    stack.append((child, False))
+            continue
+
+        total_size = 0
+        total_count = 0
+        for index, child in enumerate(node.children):
+            if should_cancel and index % 256 == 0 and should_cancel():
+                return None
+            if child.is_dir:
+                child_count = counts.get(child, 0)
+                if child_count:
+                    total_size += sizes.get(child, 0)
+                    total_count += child_count
+            elif file_type_matches(child.name, filter_key, is_dir=False):
+                total_size += child.size
+                total_count += 1
+        sizes[node] = total_size
+        counts[node] = total_count
+
+    return FilterIndex(root, filter_key, sizes, counts)
 
 
 def _normalize(sizes: List[float], area: float) -> List[float]:
@@ -128,14 +287,26 @@ def _layout_row(sizes, x, y, dx, dy, horizontal):
     return rects
 
 
-def _worst(sizes, x, y, dx, dy, horizontal):
-    rects = _layout_row(sizes, x, y, dx, dy, horizontal)
-    worst = 0.0
-    for (_, _, w, h) in rects:
-        if w <= 0 or h <= 0:
-            return float('inf')
-        worst = max(worst, w / h, h / w)
-    return worst
+def _worst(sizes, side: float) -> float:
+    """Aspect-ratio score for a row, computed without constructing rectangles."""
+    if not sizes or side <= 0:
+        return float('inf')
+    total = sum(sizes)
+    smallest = min(sizes)
+    largest = max(sizes)
+    return _worst_metrics(total, smallest, largest, side)
+
+
+def _worst_metrics(total: float, smallest: float, largest: float, side: float) -> float:
+    """Aspect-ratio score from maintained row metrics (constant time)."""
+    if total <= 0 or smallest <= 0:
+        return float('inf')
+    side_squared = side * side
+    total_squared = total * total
+    return max(
+        side_squared * largest / total_squared,
+        total_squared / (side_squared * smallest),
+    )
 
 
 def squarify(sizes: List[float], x: float, y: float, dx: float, dy: float) -> List[Tuple[float, float, float, float]]:
@@ -144,49 +315,79 @@ def squarify(sizes: List[float], x: float, y: float, dx: float, dy: float) -> Li
     `sizes` are raw weights; they are normalized to the given rectangle's area.
     Returns rectangles (x, y, w, h) in the same order as `sizes`.
     """
-    sizes = _normalize([float(s) for s in sizes], dx * dy)
-    result: List[Optional[Tuple[float, float, float, float]]] = [None] * len(sizes)
+    raw_sizes = [max(0.0, float(s)) for s in sizes]
+    result: List[Optional[Tuple[float, float, float, float]]] = [None] * len(raw_sizes)
+    if not raw_sizes or dx <= 0 or dy <= 0:
+        return [(x, y, 0.0, 0.0) for _ in raw_sizes]
 
-    order = list(range(len(sizes)))
-    order.sort(key=lambda i: sizes[i], reverse=True)
+    normalized = _normalize(raw_sizes, dx * dy)
+    order = [i for i, value in enumerate(normalized) if value > 0]
+    order.sort(key=lambda i: normalized[i], reverse=True)
+    if not order:
+        return [(x, y, 0.0, 0.0) for _ in raw_sizes]
 
-    def place(indices, x, y, dx, dy):
-        if not indices:
-            return
-        if len(indices) == 1:
-            i = indices[0]
-            result[i] = (x, y, dx, dy)
-            return
+    position = 0
+    cursor_x, cursor_y = x, y
+    remaining_dx, remaining_dy = dx, dy
+    while position < len(order) and remaining_dx > 0 and remaining_dy > 0:
+        horizontal = remaining_dx >= remaining_dy
+        side = remaining_dy if horizontal else remaining_dx
+        first = order[position]
+        position += 1
+        row = [first]
+        first_size = normalized[first]
+        row_sizes = [first_size]
+        row_total = first_size
+        row_smallest = first_size
+        row_largest = first_size
+        row_worst = _worst_metrics(row_total, row_smallest, row_largest, side)
 
-        horizontal = dx >= dy
-        vals = [sizes[i] for i in indices]
+        while position < len(order):
+            candidate_index = order[position]
+            candidate_size = normalized[candidate_index]
+            candidate_worst = _worst_metrics(
+                row_total + candidate_size,
+                min(row_smallest, candidate_size),
+                max(row_largest, candidate_size),
+                side,
+            )
+            if candidate_worst <= row_worst:
+                position += 1
+                row.append(candidate_index)
+                row_sizes.append(candidate_size)
+                row_total += candidate_size
+                row_smallest = min(row_smallest, candidate_size)
+                row_largest = max(row_largest, candidate_size)
+                row_worst = candidate_worst
+            else:
+                break
 
-        split = 1
-        while split < len(vals) and _worst(vals[:split], x, y, dx, dy, horizontal) >= \
-                _worst(vals[:split + 1], x, y, dx, dy, horizontal):
-            split += 1
+        rects = _layout_row(row_sizes, cursor_x, cursor_y,
+                            remaining_dx, remaining_dy, horizontal)
+        for index, rect in zip(row, rects):
+            result[index] = rect
 
-        current = indices[:split]
-        rest = indices[split:]
-        rects = _layout_row([sizes[i] for i in current], x, y, dx, dy, horizontal)
-        for idx, rect in zip(current, rects):
-            result[idx] = rect
-
-        covered = sum(sizes[i] for i in current)
+        covered = sum(row_sizes)
         if horizontal:
-            width = covered / dy if dy else 0
-            place(rest, x + width, y, dx - width, dy)
+            strip_width = covered / remaining_dy if remaining_dy else 0.0
+            cursor_x += strip_width
+            remaining_dx = max(0.0, remaining_dx - strip_width)
         else:
-            height = covered / dx if dx else 0
-            place(rest, x, y + height, dx, dy - height)
+            strip_height = covered / remaining_dx if remaining_dx else 0.0
+            cursor_y += strip_height
+            remaining_dy = max(0.0, remaining_dy - strip_height)
 
-    place(order, x, y, dx, dy)
     return [r if r is not None else (x, y, 0.0, 0.0) for r in result]
 
 
 def build_treemap(root, x: float, y: float, width: float, height: float,
                   min_area: float = 90.0, max_depth: int = 6, padding: float = 1.0,
-                  header: float = 0.0) -> List[Tile]:
+                  header: float = 0.0,
+                  size_getter: Optional[Callable] = None,
+                  children_getter: Optional[Callable] = None,
+                  count_getter: Optional[Callable] = None,
+                  max_children: int = 1200,
+                  aggregate_category: Optional[str] = None) -> List[Tile]:
     """Build treemap tiles for a Node.
 
     Recurses into directories only while their tile is large enough
@@ -197,6 +398,13 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
     children are laid out, giving the folder somewhere to put its own name.
     Without it a folder's label lands on top of its first child's label.
     """
+    get_size = size_getter or (lambda node: node.size)
+    get_children = children_getter or (lambda node: node.children)
+    get_count = count_getter or (
+        lambda node: node.item_count
+        if (node.is_dir or getattr(node, "is_aggregate", False)) else 1
+    )
+
     tiles: List[Tile] = []
     if width <= 1 or height <= 1:
         return tiles
@@ -204,11 +412,32 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
     stack = [(root, x, y, width, height, 0)]
     while stack:
         node, nx, ny, nw, nh, depth = stack.pop()
-        children = [c for c in node.children if c.size > 0]
+        children = [c for c in get_children(node) if get_size(c) > 0]
         if not children:
             continue
 
-        rects = squarify([c.size for c in children], nx, ny, nw, nh)
+        # A directory with tens of thousands of siblings cannot produce a
+        # useful one-pixel tile for each item. Keep the largest entries and
+        # preserve the remaining area as one explicit aggregate tile. This
+        # bounds layout, rendering, and mouse-hit work without changing the
+        # complete tree shown in the Tree view.
+        if max_children and len(children) > max_children:
+            keep_count = max(0, max_children - 1)
+            ranked = sorted(children, key=get_size, reverse=True)
+            kept = ranked[:keep_count]
+            omitted = ranked[keep_count:]
+            omitted_size = sum(get_size(child) for child in omitted)
+            omitted_count = sum(get_count(child) for child in omitted)
+            aggregate = TreemapAggregate(
+                name=f"{omitted_count:,} smaller items",
+                size=omitted_size,
+                item_count=omitted_count,
+                parent=node,
+                category_key=aggregate_category or "other",
+            )
+            children = kept + ([aggregate] if omitted_size > 0 else [])
+
+        rects = squarify([get_size(c) for c in children], nx, ny, nw, nh)
         for child, (rx, ry, rw, rh) in zip(children, rects):
             if rw <= 0 or rh <= 0:
                 continue
@@ -235,7 +464,7 @@ def export_tree_csv(root, path: str) -> int:
         writer = csv.writer(f)
         writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items"])
         for node in iter_all_nodes(root):
-            kind = "Folder" if node.is_dir else get_file_category(node.path)['label']
+            kind = "Folder" if node.is_dir else get_file_category(node.name, is_dir=False)['label']
             writer.writerow([
                 node.path, node.name, kind, node.size,
                 format_size(node.size),
@@ -254,10 +483,23 @@ def match_query(name: str, query: str) -> bool:
     return query.lower() in name.lower()
 
 
-def find_matches(root, query: str, limit: int = 500) -> List:
-    """Return nodes whose name matches `query`, largest first (bounded)."""
+def find_matches(root, query: str, limit: int = 500, filter_key: str = "all",
+                 filter_index=None) -> List:
+    """Return matching nodes, respecting an optional type projection."""
     if not query:
         return []
-    matches = [n for n in iter_all_nodes(root) if match_query(n.name, query)]
-    matches.sort(key=lambda n: n.size, reverse=True)
+    matches = []
+    for node in iter_all_nodes(root):
+        if not match_query(node.name, query):
+            continue
+        if filter_key != "all":
+            visible = (filter_index.count(node) if filter_index is not None
+                       else (1 if file_type_matches(node.name, filter_key, is_dir=node.is_dir) else 0))
+            if not visible:
+                continue
+        matches.append(node)
+    if filter_index is None:
+        matches.sort(key=lambda n: n.size, reverse=True)
+    else:
+        matches.sort(key=filter_index.size, reverse=True)
     return matches[:limit]

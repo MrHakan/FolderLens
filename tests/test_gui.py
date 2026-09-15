@@ -20,6 +20,7 @@ if sys.platform != "win32" and not os.environ.get("DISPLAY"):
     pytest.skip("no display available", allow_module_level=True)
 
 import locations
+import analysis
 import treemap_render
 from scanner import TreeScanner
 
@@ -103,6 +104,10 @@ def gui(app_window, sample_tree):
     # clear anything a previous test left behind
     win.search_var.set("")
     win.search_query = ""
+    win.file_filter = "all"
+    win.settings.file_filter = "all"
+    win.filter_var.set("All file types")
+    win._invalidate_filter_index()
     win.treemap_stack = []
     win.dup_groups = []
     win._hover_tile = None
@@ -322,6 +327,32 @@ def test_treemap_renders_an_image_not_flat_rectangles(gui):
 
     assert gui._tiles, "no tiles laid out"
     assert gui._treemap_photo is not None, "treemap image was not produced"
+
+
+def test_image_filter_projects_all_views(gui):
+    """The selected type must change rows, rankings, and treemap leaves."""
+    gui.file_filter = "image"
+    gui.settings.file_filter = "image"
+    gui._filter_index = analysis.build_filter_index(gui.root_node, "image")
+    gui._filter_index_key = "image"
+
+    show(gui, "Tree")
+    direct = list(gui.iid_to_node.values())
+    assert [node.name for node in direct] == ["sub"]
+    folder_iid = next(iter(gui.iid_to_node))
+    gui._insert_tree_children(folder_iid, gui.iid_to_node[folder_iid])
+    assert {node.name for node in gui.iid_to_node.values()} == {"sub", "pic.png"}
+
+    show(gui, "Largest Files")
+    assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
+
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+    leaves = [tile.node.name for tile in gui._tiles
+              if not tile.node.is_dir and not getattr(tile.node, "is_aggregate", False)]
+    assert leaves == ["pic.png"]
 
 
 def test_treemap_hit_testing_uses_geometry(gui):
