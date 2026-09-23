@@ -24,6 +24,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Verify release tag matches application version
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $appVersion = python -c "from version import VERSION; print(VERSION)"
+          if ($env:RELEASE_TAG -ne "v$appVersion") {
+            throw "Release tag $env:RELEASE_TAG does not match version.py ($appVersion)"
+          }
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -44,6 +55,11 @@ jobs:
           if (-not (Test-Path dist\FolderLens.exe)) { throw "FolderLens.exe was not built" }
           $p = Start-Process -FilePath dist\FolderLens.exe -ArgumentList '--version' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "Smoke test failed with exit code $($p.ExitCode)" }
+          $expectedResource = python -c "from make_version_info import _version_tuple; from version import VERSION; print('.'.join(map(str, _version_tuple(VERSION))))"
+          $resourceVersion = (Get-Item dist\FolderLens.exe).VersionInfo.ProductVersion
+          if ($resourceVersion -ne $expectedResource) {
+            throw "Executable version $resourceVersion does not match $expectedResource"
+          }
 
       - name: Build one-directory variant (antivirus-friendly)
         shell: pwsh

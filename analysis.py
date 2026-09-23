@@ -48,14 +48,16 @@ def iter_all_nodes(root) -> Iterator:
 # ------------------------------------------------------------- largest files
 
 def largest_files(root, limit: int = 100, filter_key: str = "all",
-                  filter_index=None) -> List:
+                  filter_index=None, name_query: str = "") -> List:
     """Return the `limit` largest matching files, biggest first."""
     if limit <= 0:
         return []
     predicate = None
-    if filter_key != "all":
-        predicate = filter_index.matches if filter_index is not None else \
-            (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
+    if filter_key != "all" or name_query:
+        category_match = (lambda node: True) if filter_key == "all" else \
+            (filter_index.matches if filter_index is not None else
+             (lambda node: file_type_matches(node.name, filter_key, is_dir=False)))
+        predicate = lambda node: category_match(node) and match_query(node.name, name_query)
 
     # A bounded heap avoids retaining every file in memory just to find the
     # top 100 on a large drive.  nlargest still returns largest-first.
@@ -457,18 +459,24 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
 
 # --------------------------------------------------------------- csv export
 
-def export_tree_csv(root, path: str) -> int:
-    """Write every node (folders and files) to a CSV. Returns rows written."""
+def export_tree_csv(root, path: str, filter_index=None) -> int:
+    """Write the full tree or a category projection to CSV. Returns rows written."""
     rows = 0
+    scope = filter_index.filter_key if filter_index is not None else "all"
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items"])
+        writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items", "Scope"])
         for node in iter_all_nodes(root):
+            if filter_index is not None and not (filter_index.count(node) if node.is_dir
+                                                  else filter_index.matches(node)):
+                continue
+            size = filter_index.size(node) if filter_index is not None else node.size
             kind = "Folder" if node.is_dir else get_file_category(node.name, is_dir=False)['label']
             writer.writerow([
-                node.path, node.name, kind, node.size,
-                format_size(node.size),
-                node.item_count if node.is_dir else "",
+                node.path, node.name, kind, size,
+                format_size(size),
+                (filter_index.count(node) if filter_index is not None else node.item_count)
+                if node.is_dir else "", scope,
             ])
             rows += 1
     return rows

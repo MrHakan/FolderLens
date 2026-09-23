@@ -184,3 +184,37 @@ def test_network_paths_use_a_smaller_worker_pool(tmp_path):
     assert TreeScanner.worker_limit(r"\\server\share\work") == min(
         TreeScanner.MAX_WORKERS, TreeScanner.NETWORK_WORKERS)
     assert TreeScanner.worker_limit(str(tmp_path)) == TreeScanner.MAX_WORKERS
+
+
+def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatch):
+    """A stuck share call may outlive cancellation; its event remains private."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (second / "new.txt").write_text("new")
+    scanner = TreeScanner()
+    entered = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    results = []
+    original = scanner._read_directory
+
+    def stalled(node, errors, on_progress=None, work_queue=None, session=None):
+        if node.path == str(first):
+            entered.set()
+            assert release.wait(timeout=10)
+        return original(node, errors, on_progress, work_queue, session)
+
+    monkeypatch.setattr(scanner, "_read_directory", stalled)
+    scanner.scan(str(first), on_complete=lambda *args: results.append("old"))
+    old_thread = scanner._current_thread
+    assert entered.wait(timeout=5)
+    scanner.scan(str(second), on_complete=lambda *args: (results.append("new"), done.set()))
+    assert done.wait(timeout=5), "a blocked old scan delayed the new one"
+    release.set()
+    old_thread.join(timeout=5)
+    scanner._current_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+    assert results == ["new"]
+    assert not scanner.is_scanning

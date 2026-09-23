@@ -53,6 +53,13 @@ def test_largest_files_order_and_limit():
     assert [f.size for f in all_files] == [500, 300, 100, 50]
 
 
+def test_largest_search_before_top_k():
+    root = make_tree()
+    assert [n.name for n in analysis.largest_files(root, limit=1, name_query="txt")] == ["a.txt"]
+    assert [n.name for n in analysis.largest_files(
+        root, limit=1, filter_key="document", name_query="d")] == ["d.txt"]
+
+
 def test_category_breakdown():
     root = make_tree()
     stats = {s.label: s for s in analysis.category_breakdown(root)}
@@ -134,6 +141,18 @@ def test_export_tree_csv(tmp_path):
     assert "Path,Name,Type,Size (bytes)" in content
     assert "b.mp4" in content
     assert "sub" in content
+
+
+def test_filtered_csv_has_matching_rows_and_projected_folder_size(tmp_path):
+    import csv
+    root = make_tree()
+    index = analysis.build_filter_index(root, "image")
+    out = tmp_path / "images.csv"
+    assert analysis.export_tree_csv(root, str(out), filter_index=index) == 2
+    with out.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [(r["Name"], r["Size (bytes)"], r["Scope"]) for r in rows] == [
+        ("sub", "300", "image"), ("c.png", "300", "image")]
 
 
 def test_match_query():

@@ -134,6 +134,15 @@ python -m pytest tests -v
 build.bat
 ```
 
+### Scan baseline for 4.0 development
+
+Run `python benchmarks/scan_baseline.py PATH --runs 3 --output scan-results.json`
+against the same unchanged local folder or network share on each version.
+The report includes scan duration, first progress event (after 500 entries),
+Python allocation peak, scanned item count, and inaccessible path count.
+Python allocation peak is not process RSS; use an external process monitor to
+compare total memory and record share latency and cache state separately.
+
 ### Project structure
 
 ```

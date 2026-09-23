@@ -154,17 +154,18 @@ class TreeScanner:
 
     def __init__(self):
         self._cancel_requested = threading.Event()
-        self._is_scanning = threading.Event()
         self._current_thread: Optional[threading.Thread] = None
-        self._progress_lock = threading.Lock()
-        self._progress_count = 0
+        self._session_lock = threading.Lock()
+        self._generation = 0
 
     @property
     def is_scanning(self) -> bool:
-        return self._is_scanning.is_set()
+        with self._session_lock:
+            return self._current_thread is not None and self._current_thread.is_alive()
 
     def cancel(self):
-        self._cancel_requested.set()
+        with self._session_lock:
+            self._cancel_requested.set()
 
     @classmethod
     def worker_limit(cls, folder_path: str) -> int:
@@ -173,14 +174,16 @@ class TreeScanner:
             return min(cls.MAX_WORKERS, cls.NETWORK_WORKERS)
         return cls.MAX_WORKERS
 
-    def _tick_progress(self, on_progress: Optional[Callable[[int], None]], n: int = 1):
+    def _tick_progress(self, on_progress: Optional[Callable[[int], None]],
+                       session: dict, n: int = 1):
         if on_progress is None:
             return
-        with self._progress_lock:
-            before = self._progress_count
-            self._progress_count += n
-            after = self._progress_count
-        if before // self.PROGRESS_EVERY != after // self.PROGRESS_EVERY:
+        with session["progress_lock"]:
+            before = session["progress_count"]
+            session["progress_count"] += n
+            after = session["progress_count"]
+        if (not session["cancel"].is_set()
+                and before // self.PROGRESS_EVERY != after // self.PROGRESS_EVERY):
             on_progress(after)
 
     @staticmethod
@@ -192,7 +195,8 @@ class TreeScanner:
 
     def _read_directory(self, node: Node, errors: List[str],
                         on_progress: Optional[Callable[[int], None]] = None,
-                        work_queue: Optional[queue.Queue] = None) -> Optional[str]:
+                        work_queue: Optional[queue.Queue] = None,
+                        session: Optional[dict] = None) -> Optional[str]:
         """Read one directory and enqueue child directories.
 
         The entry type and metadata come from one ``DirEntry.stat`` call.  In
@@ -205,7 +209,7 @@ class TreeScanner:
             with os.scandir(node.path) as entries:
                 batch = 0
                 for entry in entries:
-                    if self._cancel_requested.is_set():
+                    if session is not None and session["cancel"].is_set():
                         break
                     try:
                         entry_stat = entry.stat(follow_symlinks=False)
@@ -224,14 +228,14 @@ class TreeScanner:
                             work_queue.put(child)
                         batch += 1
                         if batch >= self.PROGRESS_EVERY:
-                            self._tick_progress(on_progress, batch)
+                            self._tick_progress(on_progress, session, batch)
                             batch = 0
                     except PermissionError:
                         errors.append(f"Access denied: {entry.path}")
                     except OSError as e:
                         errors.append(f"Error: {entry.path} - {str(e)}")
                 if batch:
-                    self._tick_progress(on_progress, batch)
+                    self._tick_progress(on_progress, session, batch)
             return None
         except PermissionError:
             node.error = "Access denied"
@@ -256,7 +260,8 @@ class TreeScanner:
 
     def _run_directory_workers(self, work_queue: queue.Queue, workers: int,
                                error_lists: List[List[str]],
-                               on_progress: Optional[Callable[[int], None]] = None):
+                               on_progress: Optional[Callable[[int], None]] = None,
+                               session: Optional[dict] = None):
         """Drain a directory queue with a fixed, bounded worker pool."""
         def worker(errors: List[str]):
             while True:
@@ -270,8 +275,8 @@ class TreeScanner:
                         return
                     continue
                 try:
-                    if not self._cancel_requested.is_set():
-                        self._read_directory(node, errors, on_progress, work_queue)
+                    if not session["cancel"].is_set():
+                        self._read_directory(node, errors, on_progress, work_queue, session)
                 except Exception as e:  # defensive: one bad share must not kill the pool
                     errors.append(f"Error: {node.path} - {str(e)}")
                 finally:
@@ -295,7 +300,9 @@ class TreeScanner:
         """Compatibility helper that walks one subtree with the shared queue."""
         work_queue: queue.Queue = queue.Queue()
         work_queue.put(root)
-        self._run_directory_workers(work_queue, 1, [errors], on_progress)
+        session = {"cancel": threading.Event(), "progress_lock": threading.Lock(),
+                   "progress_count": 0}
+        self._run_directory_workers(work_queue, 1, [errors], on_progress, session)
         self._aggregate_sizes(root)
 
     @staticmethod
@@ -327,8 +334,15 @@ class TreeScanner:
         on_complete: Optional[Callable[[Node, List[str], float], None]] = None,
         on_error: Optional[Callable[[str], None]] = None
     ):
+        with self._session_lock:
+            self._cancel_requested.set()
+            self._generation += 1
+            generation = self._generation
+            session = {"cancel": threading.Event(), "progress_lock": threading.Lock(),
+                       "progress_count": 0}
+            self._cancel_requested = session["cancel"]
+
         def _scan_worker():
-            self._is_scanning.set()
             start_time = time.time()
             errors: List[str] = []
 
@@ -350,40 +364,37 @@ class TreeScanner:
                 )
 
                 work_queue: queue.Queue = queue.Queue()
-                root_error = self._read_directory(root, errors, on_progress, work_queue)
+                root_error = self._read_directory(root, errors, on_progress, work_queue, session)
                 if root_error:
-                    if on_error:
+                    if on_error and not session["cancel"].is_set():
                         on_error(root_error)
                     return
 
-                if work_queue.qsize() and not self._cancel_requested.is_set():
+                if work_queue.qsize() and not session["cancel"].is_set():
                     workers = self.worker_limit(root.path)
                     error_lists = [[] for _ in range(workers)]
-                    self._run_directory_workers(work_queue, workers, error_lists, on_progress)
+                    self._run_directory_workers(work_queue, workers, error_lists, on_progress, session)
                     for lst in error_lists:
                         errors.extend(lst)
 
                 self._aggregate_sizes(root)
                 scan_time = time.time() - start_time
 
-                if on_complete and not self._cancel_requested.is_set():
+                if on_complete and not session["cancel"].is_set():
                     on_complete(root, errors, scan_time)
 
             except Exception as e:
-                if on_error:
+                if on_error and not session["cancel"].is_set():
                     on_error(f"Unexpected error: {str(e)}")
-            finally:
-                self._is_scanning.clear()
-
-        if self.is_scanning:
-            self.cancel()
-            if self._current_thread and self._current_thread.is_alive():
-                self._current_thread.join(timeout=5.0)
-
-        self._cancel_requested.clear()
-        self._progress_count = 0
-        self._current_thread = threading.Thread(target=_scan_worker, daemon=True)
-        self._current_thread.start()
+        # Never wait for an old network syscall on the UI thread.  Each worker
+        # captures its own cancellation event, so a newer scan cannot revive it.
+        thread = threading.Thread(target=_scan_worker, daemon=True,
+                                  name=f"folderlens-scan-{generation}")
+        with self._session_lock:
+            if generation != self._generation:
+                return
+            self._current_thread = thread
+            thread.start()
 
 
 class FolderScanner:

@@ -197,6 +197,54 @@ def test_top_level_selection_drops_nested_rows(gui):
     assert [n.name for _, n in selection] == [gui.iid_to_node[folder_iid].name]
 
 
+def test_sort_preserves_expanded_folders(gui):
+    folder_iid = next(i for i, n in gui.iid_to_node.items() if n.is_dir)
+    folder = gui.iid_to_node[folder_iid]
+    gui.tree.item(folder_iid, open=True)
+    gui.tree.focus(folder_iid)
+    gui._on_tree_open(None)
+    gui._sort_tree("name")
+    new_iid = next(i for i, n in gui.iid_to_node.items() if n is folder)
+    assert gui.tree.item(new_iid, "open")
+    assert any(n.name == "pic.png" for n in gui.iid_to_node.values())
+
+
+def test_stale_scan_callback_cannot_replace_current_tree(gui):
+    old_root = gui.root_node
+    gui._scan_generation += 1
+    gui._scan_done_if_current(gui._scan_generation - 1, old_root, [], 1.0)
+    gui._scan_failed_if_current(gui._scan_generation - 1, "stale error")
+    assert gui.root_node is old_root
+
+
+def test_filtered_folder_action_uses_real_size_and_all_types(gui, monkeypatch):
+    from app import messagebox
+    from scanner import Node
+    folder = next(node for node in gui.root_node.children if node.is_dir)
+    hidden = Node(path=None, name="hidden.txt", is_dir=False, size=4096, parent=folder)
+    folder.children.append(hidden)
+    folder.size += hidden.size
+    folder.item_count += 1
+    gui.root_node.size += hidden.size
+    gui.root_node.item_count += 1
+    gui.file_filter = "image"
+    gui._filter_index = analysis.build_filter_index(gui.root_node, "image")
+    gui._filter_index_key = "image"
+    show(gui, "Tree")
+    iid = next(i for i, n in gui.iid_to_node.items() if n.is_dir)
+    gui.tree.selection_set(iid)
+    node = gui.iid_to_node[iid]
+    assert gui._node_size(node) < node.size
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: (prompts.append(a[1]), False)[1])
+    gui._delete_selected()
+    gui._zip_selected()
+    assert all("ALL file types" in prompt for prompt in prompts)
+    assert all(f"{node.item_count + 1:,} scanned items" in prompt for prompt in prompts)
+    from file_utils import format_size
+    assert all(format_size(node.size) in prompt for prompt in prompts)
+
+
 def test_treemap_labels_are_hit_testable(gui):
     """Regression: hovering a tile where its name label is drawn used to lose
     the tooltip. Hit-testing is geometric now, so the label area belongs to its
@@ -402,6 +450,23 @@ def test_viewer_navigates_images_and_folders(gui, gallery):
         assert viewer.nav.folder.endswith("more")
         viewer._go_parent()
         assert viewer.nav.folder.endswith("gallery")
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_rejects_navigation_and_escape_when_annotations_are_dirty(gui, gallery, monkeypatch):
+    import app as appmod
+    viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
+    try:
+        current = viewer.nav.current
+        viewer._dirty = True
+        monkeypatch.setattr(viewer, "_confirm_discard", lambda: False)
+        monkeypatch.setattr(appmod.messagebox, "askyesno", lambda *a, **kw: False)
+        viewer._go_next()
+        assert viewer.nav.current == current
+        assert viewer.bind("<Escape>")
+        viewer._on_close()
+        assert viewer.winfo_exists()
     finally:
         viewer.destroy()
 
