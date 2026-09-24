@@ -138,8 +138,13 @@ build.bat
 
 Run `python benchmarks/scan_baseline.py PATH --runs 3 --output scan-results.json`
 against the same unchanged local folder or network share on each version.
-The report includes scan duration, first progress event (after 500 entries),
-Python allocation peak, scanned item count, and inaccessible path count.
+The report includes scan duration, first partial result, first 500-entry
+progress event, queue high-water marks, Python allocation peak, scanned item
+count, and inaccessible path count. Snapshot bytes are observed values until
+the scan finishes; inaccessible paths keep a completed result partial.
+Logical size counts each hardlink path separately. Extended allocated size
+uses optional filesystem block metadata and is unavailable on some shares;
+reparse points and symlinks are listed but never traversed by default.
 Python allocation peak is not process RSS; use an external process monitor to
 compare total memory and record share latency and cache state separately.
 

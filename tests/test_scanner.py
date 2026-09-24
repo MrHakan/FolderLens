@@ -200,11 +200,13 @@ def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatc
     results = []
     original = scanner._read_directory
 
-    def stalled(node, errors, on_progress=None, work_queue=None, session=None):
+    def stalled(node, errors, on_progress=None, work_queue=None, session=None,
+                on_snapshot=None, on_event=None, capture_extended=False):
         if node.path == str(first):
             entered.set()
             assert release.wait(timeout=10)
-        return original(node, errors, on_progress, work_queue, session)
+        return original(node, errors, on_progress, work_queue, session,
+                        on_snapshot, on_event, capture_extended)
 
     monkeypatch.setattr(scanner, "_read_directory", stalled)
     scanner.scan(str(first), on_complete=lambda *args: results.append("old"))
@@ -218,3 +220,153 @@ def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatc
     assert not old_thread.is_alive()
     assert results == ["new"]
     assert not scanner.is_scanning
+
+
+def test_bounded_queue_wide_tree_completes_with_small_worker_pool(tmp_path, monkeypatch):
+    """Producers never all block while the queue is full of child folders."""
+    for number in range(80):
+        folder = tmp_path / f"folder{number}"
+        folder.mkdir()
+        (folder / "file.txt").write_bytes(b"a" * 12)
+    monkeypatch.setattr(TreeScanner, "QUEUE_PER_WORKER", 1)
+    monkeypatch.setattr(TreeScanner, "worker_limit", lambda cls, path: 2)
+    scanner = TreeScanner()
+    snapshots, events, done = [], [], threading.Event()
+    result = {}
+    scanner.scan(str(tmp_path), on_snapshot=snapshots.append, on_event=events.append,
+                 on_complete=lambda root, errors, elapsed: (result.update(root=root, errors=errors), done.set()),
+                 on_error=lambda message: (result.update(error=message), done.set()))
+    assert done.wait(10), "workers deadlocked on a full queue"
+    scanner._current_thread.join(timeout=5)
+    assert "error" not in result
+    assert result["root"].item_count == 160
+    assert result["root"].size == 960
+    assert snapshots[-1].state == "complete"
+    assert snapshots[-1].partial is False
+    assert snapshots[-1].known_files == 80
+    assert snapshots[-1].known_bytes == 960
+    assert snapshots[-1].queue_high_water <= 8
+    assert snapshots[-1].deferred_high_water > 0
+    assert {e.kind for e in events} >= {
+        "directory-start", "directory-complete", "batch-of-entries", "complete"}
+
+
+def test_partial_snapshot_is_available_while_child_share_is_blocked(tmp_path, monkeypatch):
+    (tmp_path / "known.txt").write_bytes(b"12345")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    snapshot_ready = threading.Event()
+    scanner = TreeScanner()
+    scanner.SNAPSHOT_INTERVAL = 0
+    original = scanner._read_directory
+    snapshots = []
+
+    def slow(node, errors, on_progress=None, work_queue=None, session=None,
+             on_snapshot=None, on_event=None, capture_extended=False):
+        if node.path == str(blocked):
+            entered.set()
+            assert release.wait(5)
+        return original(node, errors, on_progress, work_queue, session,
+                        on_snapshot, on_event, capture_extended)
+
+    def observe(snapshot):
+        snapshots.append(snapshot)
+        if snapshot.state == "scanning" and snapshot.known_bytes == 5 and snapshot.partial:
+            snapshot_ready.set()
+
+    monkeypatch.setattr(scanner, "_read_directory", slow)
+    scanner.scan(str(tmp_path), on_snapshot=observe,
+                 on_complete=lambda *args: done.set())
+    try:
+        assert entered.wait(5)
+        assert snapshot_ready.wait(5)
+        assert not done.is_set()
+        assert any(s.state == "scanning" and s.known_bytes == 5 and s.partial
+                   for s in snapshots)
+    finally:
+        release.set()
+    assert done.wait(5)
+
+
+def test_inaccessible_subtree_keeps_observed_bytes_partial(tmp_path, monkeypatch):
+    good, denied = tmp_path / "good", tmp_path / "denied"
+    good.mkdir()
+    denied.mkdir()
+    (good / "known.txt").write_bytes(b"known")
+    scanner = TreeScanner()
+    original = os.scandir
+
+    def denied_scan(path):
+        if path == str(denied):
+            raise PermissionError("permission denied")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", denied_scan)
+    snapshots, done, result = [], threading.Event(), {}
+    scanner.scan(str(tmp_path), on_snapshot=snapshots.append,
+                 on_complete=lambda root, errors, elapsed: (result.update(root=root, errors=errors), done.set()))
+    assert done.wait(5)
+    scanner._current_thread.join(timeout=5)
+    assert result["root"].size == 5
+    assert len(result["errors"]) == 1
+    assert snapshots[-1].state == "complete"
+    assert snapshots[-1].partial is True
+    assert snapshots[-1].known_bytes == 5
+
+
+def test_closed_progress_consumer_does_not_break_scan(tmp_path):
+    (tmp_path / "file.txt").write_bytes(b"content")
+    scanner = TreeScanner()
+    done, result = threading.Event(), {}
+
+    def closed_ui(*args):
+        raise RuntimeError("window was closed")
+
+    scanner.scan(str(tmp_path), on_snapshot=closed_ui, on_event=closed_ui,
+                 on_complete=lambda root, errors, elapsed: (result.update(root=root), done.set()))
+    assert done.wait(5)
+    assert result["root"].size == 7
+
+
+def test_reparse_links_are_recorded_without_following_them(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    (folder / "one.txt").write_bytes(b"hi")
+    link = folder / "back"
+    try:
+        link.symlink_to(tmp_path, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks unavailable")
+    root = run_tree_scan(tmp_path)["root"]
+    scanned = root.children[0]
+    by_name = {child.name: child for child in scanned.children}
+    assert by_name["back"].is_reparse_point
+    assert not by_name["back"].is_dir
+    assert root.item_count == 3
+
+
+def test_extended_metadata_reports_hardlinks_without_claiming_unique_bytes(tmp_path):
+    first, second = tmp_path / "first.dat", tmp_path / "second.dat"
+    first.write_bytes(b"a" * 4096)
+    try:
+        os.link(first, second)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unavailable")
+    done, result = threading.Event(), {}
+    scanner = TreeScanner()
+    scanner.scan(str(tmp_path), capture_extended=True,
+                 on_complete=lambda root, errors, elapsed: (result.update(root=root), done.set()))
+    assert done.wait(5)
+    children = result["root"].children
+    if children[0].link_count is None:
+        # DirEntry.stat can omit this field on Windows. Do not infer identity.
+        assert all(child.link_count is None and child.file_identity is None
+                   for child in children)
+    else:
+        assert children[0].link_count >= 2
+        assert children[0].file_identity == children[1].file_identity
+    assert result["root"].logical_size == 8192  # logical paths, not unique blocks
+    assert children[0].mtime_ns > 0
+    if children[0].allocated_size is not None:
+        assert result["root"].allocated_size == sum(child.allocated_size for child in children)

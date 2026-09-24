@@ -29,6 +29,13 @@ def measure(path: str) -> dict:
     def progress(count):
         outcome.setdefault("first_progress_seconds", round(time.perf_counter() - start, 3))
 
+    def snapshot(value):
+        if value.state == "scanning" and (value.known_files or value.directories_completed):
+            outcome.setdefault("first_partial_seconds", round(time.perf_counter() - start, 3))
+        if value.state == "complete":
+            outcome["queue_high_water"] = value.queue_high_water
+            outcome["deferred_high_water"] = value.deferred_high_water
+
     def complete(root, errors, duration):
         outcome.update(items=root.item_count, logical_bytes=root.size,
                        inaccessible=len(errors), scan_seconds=round(duration, 3))
@@ -40,7 +47,8 @@ def measure(path: str) -> dict:
 
     scanner = TreeScanner()
     try:
-        scanner.scan(path, on_progress=progress, on_complete=complete, on_error=failed)
+        scanner.scan(path, on_progress=progress, on_snapshot=snapshot,
+                     on_complete=complete, on_error=failed)
         done.wait()
         _, peak = tracemalloc.get_traced_memory()
         outcome["python_alloc_peak_bytes"] = peak
