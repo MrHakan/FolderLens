@@ -1194,6 +1194,7 @@ class FolderLensApp(ctk.CTk):
         # tree-view state
         self.tree: Optional[ttk.Treeview] = None
         self.iid_to_node: Dict[str, Node] = {}
+        self._node_id_to_tree_iid: Dict[int, str] = {}
         self._tree_generation = 0
         self._tree_search_loading = False
         self._tree_search_matches: List[Node] = []
@@ -2126,6 +2127,8 @@ class FolderLensApp(ctk.CTk):
         # drop references to the widgets we just destroyed so nothing
         # reaches for a stale one later
         self.tree = None
+        self.iid_to_node = {}
+        self._node_id_to_tree_iid = {}
         self.largest_tree = None
         self.dup_tree = None
         self._treemap_focus_info = None
@@ -2400,6 +2403,7 @@ class FolderLensApp(ctk.CTk):
         self._tree_compact = compact
         self.tree = self._make_treeview(columns, headings, widths, parent=parent)
         self.iid_to_node = {}
+        self._node_id_to_tree_iid = {}
         page_counts = getattr(self, "_tree_sort_pages", {})
         self._tree_pages = {}
         self._tree_page_data = {}
@@ -2504,6 +2508,7 @@ class FolderLensApp(ctk.CTk):
             iid = self.tree.insert(parent_iid, "end", text=f"{icon} {child.name}",
                                    values=self._tree_values(child, parent_node), tags=tuple(tags))
             self.iid_to_node[iid] = child
+            self._node_id_to_tree_iid[id(child)] = iid
             self._register_row_thumbnail(self.tree, iid, child)
             if child.is_dir and self._node_count(child) > 0:
                 self.tree.insert(iid, "end", text="…", tags=("dummy",))
@@ -2662,6 +2667,7 @@ class FolderLensApp(ctk.CTk):
             iid = self.tree.insert("", "end", text=f"{icon} {node.name}",
                                    values=self._tree_values(node, self.root_node), tags=tuple(tags))
             self.iid_to_node[iid] = node
+            self._node_id_to_tree_iid[id(node)] = iid
             self._register_row_thumbnail(self.tree, iid, node)
         self._tree_search_offset = end
         if end < len(self._tree_search_matches):
@@ -3634,8 +3640,7 @@ class FolderLensApp(ctk.CTk):
         if self.active_view != "Explore" or tree is None or node is None:
             return
         if self.search_query:
-            selected_iid = next((iid for iid, candidate in self.iid_to_node.items()
-                                 if candidate is node), None)
+            selected_iid = self._tree_iid_for_node(node)
             if selected_iid is not None:
                 self._select_explore_tree_iid(selected_iid)
             return
@@ -3651,8 +3656,7 @@ class FolderLensApp(ctk.CTk):
         parent_iid = ""
         selected_iid = None
         for child_node in reversed(chain):
-            child_iid = next((iid for iid, candidate in self.iid_to_node.items()
-                              if candidate is child_node), None)
+            child_iid = self._tree_iid_for_node(child_node)
             if child_iid is None:
                 if parent_iid:
                     tree.item(parent_iid, open=True)
@@ -3675,8 +3679,7 @@ class FolderLensApp(ctk.CTk):
                         break
                     before = len(self.iid_to_node)
                     self._load_tree_page(page_iid)
-                    child_iid = next((iid for iid, candidate in self.iid_to_node.items()
-                                      if candidate is child_node), None)
+                    child_iid = self._tree_iid_for_node(child_node)
                     if parent_node.path in self._tree_sort_loading_paths:
                         self._pending_explore_select_node = node
                         break
@@ -3695,6 +3698,10 @@ class FolderLensApp(ctk.CTk):
         if selected_iid is None or not tree.exists(selected_iid):
             return
         self._select_explore_tree_iid(selected_iid)
+
+    def _tree_iid_for_node(self, node):
+        iid = self._node_id_to_tree_iid.get(id(node))
+        return iid if iid is not None and self.iid_to_node.get(iid) is node else None
 
     def _select_explore_tree_iid(self, iid):
         tree = self.tree
