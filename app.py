@@ -2660,6 +2660,9 @@ class FolderLensApp(ctk.CTk):
         if self.root_node:
             if deleted:
                 self._invalidate_filter_index()
+                # Delete mutates the completed tree in place. Projections
+                # cached for this root no longer describe its children.
+                self._query_engine = None
             self._set_view_total()
             status = f"{self._node_count(self.root_node):,} {self._count_label()}"
             if deleted:
