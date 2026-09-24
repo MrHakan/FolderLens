@@ -105,6 +105,7 @@ def gui(app_window, sample_tree):
     win.search_var.set("")
     win.search_query = ""
     win.file_filter = "all"
+    win._advanced_spec = None
     win.settings.file_filter = "all"
     win.filter_var.set("All file types")
     win._invalidate_filter_index()
@@ -417,6 +418,23 @@ def test_image_filter_projects_all_views(gui):
     leaves = [tile.node.name for tile in gui._tiles
               if not tile.node.is_dir and not getattr(tile.node, "is_aggregate", False)]
     assert leaves == ["pic.png"]
+
+
+def test_advanced_filter_projection_and_action_scope(gui):
+    from query import QueryEngine, QuerySpec
+    gui._advanced_spec = QuerySpec(categories=("image", "document"),
+                                   extensions=(".png",), min_size=1)
+    gui._filter_index = QueryEngine(gui.root_node).project(gui._advanced_spec)
+    gui._filter_index_key = gui._advanced_spec
+    assert gui.file_filter == "all"
+    assert gui._has_active_filter()
+    show(gui, "Tree")
+    assert [node.name for node in gui.iid_to_node.values()] == ["sub"]
+    folder = next(node for node in gui.root_node.children if node.is_dir)
+    prompt = gui._action_scope_prompt([("row", folder)], "Delete")
+    assert "ALL file types" in prompt
+    show(gui, "Largest Files")
+    assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
 
 
 def test_treemap_hit_testing_uses_geometry(gui):

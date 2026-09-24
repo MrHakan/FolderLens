@@ -6,7 +6,7 @@ import csv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from query import QueryEngine, QuerySpec
+from query import QueryEngine, QuerySpec, query_from_form
 import analysis
 from scanner import Node
 
@@ -117,3 +117,17 @@ def test_query_can_rank_by_allocated_bytes_without_changing_logical_size():
         "clip.mp4", "picture.png"]
     assert index.size(root) == 1024
     assert root.size == 950
+
+
+def test_advanced_form_combines_fields_and_rejects_invalid_ranges():
+    root, images, docs, image, hidden, video, note = tree()
+    spec = query_from_form(categories=("image", "video"), extensions="png; mp4",
+                           min_mib="0.0002", max_mib="0.001", include_hidden=False)
+    index = QueryEngine(root).project(spec)
+    assert index.children(root) == [images, video]
+    assert index.children(images) == [image]
+    assert index.count(root) == 2
+    with pytest.raises(ValueError):
+        query_from_form(min_mib="20", max_mib="10")
+    with pytest.raises(ValueError):
+        query_from_form(modified_after="2026-99-99")

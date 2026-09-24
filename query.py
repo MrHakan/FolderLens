@@ -9,6 +9,8 @@ import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Callable, Optional
 
 from file_utils import FILE_TYPE_FILTER_LABELS, get_file_category, get_file_category_key, natural_sort_key
@@ -55,6 +57,30 @@ class QuerySpec:
     @classmethod
     def category(cls, key: str) -> "QuerySpec":
         return cls(categories=() if key == "all" else (key,))
+
+
+def query_from_form(categories=(), extensions="", name="", min_mib="", max_mib="",
+                    modified_after="", modified_before="", include_hidden=True) -> QuerySpec:
+    """Parse the advanced filter form without involving Tk or the filesystem."""
+    def mib(value):
+        return int(Decimal(value) * 1048576) if value.strip() else None
+
+    def day(value, end=False):
+        if not value.strip():
+            return None
+        parsed = date.fromisoformat(value.strip())
+        if end:
+            parsed += timedelta(days=1)
+        boundary = int(datetime.combine(parsed, time.min).timestamp() * 1_000_000_000)
+        return boundary - 1 if end else boundary
+
+    return QuerySpec(categories=tuple(categories),
+                     extensions=tuple(ext.strip() for ext in extensions.replace(";", ",").split(",")
+                                      if ext.strip()),
+                     name=name, min_size=mib(min_mib), max_size=mib(max_mib),
+                     modified_after_ns=day(modified_after),
+                     modified_before_ns=day(modified_before, end=True),
+                     include_hidden=include_hidden)
 
 
 class QueryIndex:
