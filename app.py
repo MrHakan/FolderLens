@@ -2178,7 +2178,7 @@ class FolderLensApp(ctk.CTk):
         colors = self._colors()
         split = tk.PanedWindow(
             self.body, orient="horizontal", sashwidth=6, sashrelief="flat",
-            showhandle=False, bg=colors['head_bg'], bd=0, highlightthickness=0)
+            showhandle=False, bg=colors['head_bg'], bd=0)
         split.pack(fill="both", expand=True)
         tree_host = tk.Frame(split, bg=colors['tree_bg'])
         map_host = tk.Frame(split, bg=colors['canvas_bg'])
