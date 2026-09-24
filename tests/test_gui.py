@@ -569,6 +569,7 @@ def test_explore_shows_tree_map_details_and_syncs_selection(gui):
 
     note = next(node for node in gui.root_node.children if node.name == "notes.txt")
     note_iid = next(iid for iid, node in gui.iid_to_node.items() if node is note)
+    assert gui._find_treemap_tile_for_node(note) is not None
     gui.tree.selection_set(note_iid)
     gui._on_tree_select(None)
     assert gui._treemap_focus_tile.node is note

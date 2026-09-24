@@ -2114,6 +2114,10 @@ class FolderLensApp(ctk.CTk):
         if self.tooltip:
             self.tooltip.hide()
         self._invalidate_treemap_render()
+        self._tiles = []
+        self._hover_tile = None
+        self._treemap_focus_tile = None
+        self._treemap_image = None
         if self._treemap_redraw_after:
             self.after_cancel(self._treemap_redraw_after)
             self._treemap_redraw_after = None
