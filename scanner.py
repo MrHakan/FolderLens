@@ -14,6 +14,13 @@ _NO_CHILDREN: tuple = ()
 _REPARSE_FLAG = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 
 
+def _has_windows_hidden_attribute(entry_stat) -> bool:
+    """Detect the Windows FILE_ATTRIBUTE_HIDDEN bit when the platform exposes it."""
+    hidden_flag = getattr(stat_module, "FILE_ATTRIBUTE_HIDDEN", None)
+    attributes = getattr(entry_stat, "st_file_attributes", None)
+    return hidden_flag is not None and attributes is not None and bool(attributes & hidden_flag)
+
+
 class Node:
     """One file or directory in the scanned tree.
 
@@ -80,6 +87,13 @@ class Node:
     @property
     def is_reparse_point(self) -> bool:
         return bool(self._metadata and self._metadata[3])
+
+    @property
+    def is_hidden(self) -> bool:
+        # Dot-hidden names need no per-node metadata. Only nodes marked with
+        # Windows' hidden attribute carry an extra field in the rare metadata tuple.
+        return (self.name.startswith(".") or
+                bool(self._metadata and len(self._metadata) > 4 and self._metadata[4]))
 
     @property
     def path(self) -> str:
@@ -274,9 +288,11 @@ class TreeScanner:
     QUEUE_PER_WORKER = 32
 
     @staticmethod
-    def _entry_metadata(entry_stat, is_reparse: bool, capture_extended: bool):
+    def _entry_metadata(entry_stat, is_reparse: bool, capture_extended: bool,
+                        is_hidden: bool = False):
         if not capture_extended:
-            return (None, None, None, True) if is_reparse else None
+            return ((None, None, None, is_reparse, is_hidden)
+                    if is_reparse or is_hidden else None)
         blocks = getattr(entry_stat, "st_blocks", None)
         allocated = int(blocks * 512) if blocks is not None else None
         links = getattr(entry_stat, "st_nlink", None)
@@ -289,7 +305,7 @@ class TreeScanner:
             dev, inode = getattr(entry_stat, "st_dev", None), getattr(entry_stat, "st_ino", None)
             if dev is not None and inode:
                 identity = (dev, inode)
-        return (allocated, identity, links, is_reparse)
+        return (allocated, identity, links, is_reparse, is_hidden)
 
     def __init__(self):
         self._current_session: Optional[ScanSession] = None
@@ -412,6 +428,7 @@ class TreeScanner:
                         is_reparse = (stat_module.S_ISLNK(entry_stat.st_mode) or
                                       bool(getattr(entry_stat, "st_file_attributes", 0) &
                                            _REPARSE_FLAG))
+                        is_hidden = _has_windows_hidden_attribute(entry_stat)
                         child = Node(
                             path=entry.path if is_dir else None,
                             name=entry.name,
@@ -420,9 +437,8 @@ class TreeScanner:
                             creation_date=entry_stat.st_ctime,
                             parent=node,
                             modified_date=self._entry_modified_time(entry_stat),
-                            metadata=(self._entry_metadata(entry_stat, is_reparse, True)
-                                      if capture_extended else
-                                      ((None, None, None, True) if is_reparse else None)),
+                            metadata=self._entry_metadata(
+                                entry_stat, is_reparse, capture_extended, is_hidden),
                         )
                         node.children.append(child)
                         if is_dir and not is_reparse and work_queue is not None:
@@ -619,12 +635,18 @@ class TreeScanner:
                     # missing/not-a-folder/access-denied result.
                     root_stat = None
 
+                root_name = os.path.basename(root_path.rstrip("\\/")) or root_path
+                root_hidden = (root_name.startswith(".") or
+                               (root_stat is not None and
+                                _has_windows_hidden_attribute(root_stat)))
+                root_metadata = ((None, None, None, False, True) if root_hidden else None)
                 root = Node(
                     path=root_path,
-                    name=os.path.basename(root_path.rstrip("\\/")) or root_path,
+                    name=root_name,
                     is_dir=True,
                     creation_date=root_stat.st_ctime if root_stat else 0.0,
                     modified_date=self._entry_modified_time(root_stat) if root_stat else 0,
+                    metadata=root_metadata,
                 )
 
                 workers = self.worker_limit(root.path)

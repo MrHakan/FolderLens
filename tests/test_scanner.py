@@ -1,15 +1,18 @@
 import gc
 import os
+import stat as stat_module
 import sys
 import threading
 import time
 import traceback
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scanner import TreeScanner, FolderScanner, QuickScanner, Node, is_network_path
+import scanner as scanner_module
+from scanner import TreeScanner, FolderScanner, QuickScanner, Node, ScanSession, is_network_path
 
 
 @pytest.fixture
@@ -507,3 +510,39 @@ def test_extended_metadata_reports_hardlinks_without_claiming_unique_bytes(tmp_p
     assert children[0].mtime_ns > 0
     if children[0].allocated_size is not None:
         assert result["root"].allocated_size == sum(child.allocated_size for child in children)
+
+
+def test_windows_hidden_attribute_is_retained_without_extended_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(scanner_module.stat_module, "FILE_ATTRIBUTE_HIDDEN", 0x2,
+                        raising=False)
+    entry_stat = SimpleNamespace(
+        st_mode=stat_module.S_IFREG | 0o644,
+        st_size=5,
+        st_ctime=1.0,
+        st_mtime_ns=2,
+        st_file_attributes=0x2,
+    )
+
+    class Entry:
+        name = "system-hidden.jpg"
+        path = str(tmp_path / name)
+
+        def stat(self, follow_symlinks=False):
+            return entry_stat
+
+    class Entries:
+        def __enter__(self):
+            return iter((Entry(),))
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(scanner_module.os, "scandir", lambda _path: Entries())
+    root = Node(path=str(tmp_path), name=tmp_path.name, is_dir=True)
+
+    errors = TreeScanner()._read_directory(root, [], session=ScanSession(1, str(tmp_path)))
+
+    assert errors is None
+    assert root.children[0].name == "system-hidden.jpg"
+    assert root.children[0].is_hidden
+    assert not root.children[0].is_reparse_point

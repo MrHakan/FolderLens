@@ -4185,6 +4185,7 @@ class FolderLensApp(ctk.CTk):
     def _show_export_menu(self):
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Report as CSV…", command=self._export_csv)
+        menu.add_command(label="Report as JSON…", command=self._export_json)
         menu.add_command(label="Treemap as PNG…", command=self._export_treemap)
         try:
             x = self.winfo_pointerx()
@@ -4211,9 +4212,18 @@ class FolderLensApp(ctk.CTk):
             messagebox.showerror("Export failed", str(exc))
 
     def _export_csv(self):
+        self._export_report("csv")
+
+    def _export_json(self):
+        self._export_report("json")
+
+    def _export_report(self, format_name: str):
         if not self.root_node:
             messagebox.showwarning("No data", "Scan a folder first.")
             return
+        if format_name not in ("csv", "json"):
+            raise ValueError("Unsupported report format")
+        report_type = format_name.upper()
         index = None
         search_query = ""
         if self._has_active_filter() or self.search_query:
@@ -4229,28 +4239,36 @@ class FolderLensApp(ctk.CTk):
                 visible_scope.append(f"name contains {self.search_query!r}")
             description = " and ".join(visible_scope)
             choice = messagebox.askyesnocancel(
-                "CSV scope", f"Export the current visible results ({description}) or the full scan?\n\n"
-                "Yes: current visible results. No: all scanned files. Cancel: stop export.", parent=self)
+                f"{report_type} scope",
+                f"Export the current visible results ({description}) or the full scan?\n\n"
+                "Yes: current visible results. No: all scanned files. Cancel: stop export.",
+                parent=self)
             if choice is None:
                 return
             index = self._filter_index if choice else None
             search_query = self.search_query if choice else ""
-        save_path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                                 filetypes=[("CSV files", "*.csv")], title="Export report as")
+        report_filter = (("CSV files", "*.csv") if format_name == "csv"
+                         else ("JSON files", "*.json"))
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=f".{format_name}", filetypes=[report_filter],
+            title=f"Export report as {report_type}")
         if not save_path:
             return
         root = self.root_node
         partial = bool(self.scan_errors)
         inaccessible_count = len(self.scan_errors)
-        self._set_status("Exporting CSV…")
+        self._set_status(f"Exporting {report_type}…")
+        exporter = analysis.export_tree_csv if format_name == "csv" else analysis.export_tree_json
 
         def worker():
             try:
-                rows = analysis.export_tree_csv(
+                rows = exporter(
                     root, save_path, filter_index=index, search_query=search_query, partial=partial,
                     inaccessible_count=inaccessible_count)
                 self.after(0, lambda: (self._set_status(f"Exported {rows:,} rows"),
-                                       messagebox.showinfo("Export complete", f"Wrote {rows:,} rows to:\n{save_path}")))
+                                       messagebox.showinfo(
+                                           "Export complete",
+                                           f"Wrote {rows:,} rows to:\n{save_path}")))
             except Exception as exc:
                 msg = str(exc)
                 self.after(0, lambda: messagebox.showerror("Export failed", msg))
@@ -4446,6 +4464,7 @@ class FolderLensApp(ctk.CTk):
             try:
                 checked = file_actions.validate_selection(
                     nodes, cancel_event=cancel_event, reject_reparse=True,
+                    reject_protected=True,
                     on_progress=lambda done, total: post(lambda text=(
                         f"Verifying selection… {done:,}/{total:,} entries"): self._action_progress(
                             generation, text)))

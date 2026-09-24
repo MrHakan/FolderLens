@@ -1,11 +1,12 @@
 """Pure analysis helpers over a scanned Node tree.
 
-Everything here is side-effect free (except CSV export) and unit tested, so
+Everything here is side-effect free (except CSV/JSON export) and unit tested, so
 the UI layer can stay thin. Features inspired by WinDirStat / TreeSize /
 SpaceSniffer: a squarified treemap layout, largest-files ranking, and a
 file-type / extension breakdown.
 """
 import csv
+import json
 from dataclasses import dataclass
 from typing import Callable, Iterator, List, Dict, Tuple, Optional
 
@@ -430,11 +431,28 @@ def aggregate_members(aggregate: TreemapAggregate, children_getter=None,
 
 # --------------------------------------------------------------- csv export
 
-def export_tree_csv(root, path: str, filter_index=None, *,
-                    search_query: str = "", partial: bool = False,
-                    inaccessible_count: int = 0) -> int:
-    """Write a full or visible query result with explicit scope metadata."""
-    rows = 0
+def _query_spec_record(filter_index):
+    if filter_index is None:
+        return None
+    spec = filter_index.spec
+    return {
+        "root_scope": spec.root_scope,
+        "categories": list(spec.categories),
+        "extensions": list(spec.extensions),
+        "name": spec.name,
+        "name_terms": list(spec.name_terms),
+        "min_size": spec.min_size,
+        "max_size": spec.max_size,
+        "modified_after_ns": spec.modified_after_ns,
+        "modified_before_ns": spec.modified_before_ns,
+        "include_hidden": spec.include_hidden,
+        "sort": spec.sort,
+        "reverse": spec.reverse,
+        "metric": spec.metric,
+    }
+
+
+def _export_scope_label(filter_index, search_query: str) -> tuple[str, str]:
     scope = filter_index.filter_key if filter_index is not None else "all"
     if scope == "query":
         scope = repr(filter_index.spec)
@@ -445,26 +463,90 @@ def export_tree_csv(root, path: str, filter_index=None, *,
     if search_query and not query_records_search:
         scope += f"; name contains {search_query!r}"
     metric = filter_index.spec.metric if filter_index is not None else "logical"
+    return scope, metric
+
+
+def _iter_export_records(root, filter_index=None, search_query: str = ""):
+    """Yield records from one shared visible/full-scan query projection."""
+    for node in iter_all_nodes(root):
+        if search_query and not match_query(node.name, search_query):
+            continue
+        if filter_index is not None and not (
+                filter_index.count(node) if node.is_dir else filter_index.matches(node)):
+            continue
+        size = filter_index.size(node) if filter_index is not None else node.size
+        yield {
+            "path": node.path,
+            "name": node.name,
+            "type": "Folder" if node.is_dir else get_file_category(
+                node.name, is_dir=False)["label"],
+            "size_bytes": size,
+            "size": format_size(size),
+            "items": (filter_index.count(node) if filter_index is not None else node.item_count)
+                     if node.is_dir else None,
+            "modified_time_ns": int(getattr(node, "mtime_ns", 0)) or None,
+        }
+
+
+def export_tree_csv(root, path: str, filter_index=None, *,
+                    search_query: str = "", partial: bool = False,
+                    inaccessible_count: int = 0) -> int:
+    """Write a full or visible query result with explicit scope metadata."""
+    rows = 0
+    scope, metric = _export_scope_label(filter_index, search_query)
     scan_status = (f"partial · {inaccessible_count} inaccessible" if partial else "complete")
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items",
                          "Scope", "Root", "Metric", "Scan status"])
-        for node in iter_all_nodes(root):
-            if search_query and not match_query(node.name, search_query):
-                continue
-            if filter_index is not None and not (filter_index.count(node) if node.is_dir
-                                                  else filter_index.matches(node)):
-                continue
-            size = filter_index.size(node) if filter_index is not None else node.size
-            kind = "Folder" if node.is_dir else get_file_category(node.name, is_dir=False)['label']
+        for record in _iter_export_records(root, filter_index, search_query):
             writer.writerow([
-                node.path, node.name, kind, size,
-                format_size(size),
-                (filter_index.count(node) if filter_index is not None else node.item_count)
-                if node.is_dir else "", scope, root.path, metric, scan_status,
+                record["path"], record["name"], record["type"],
+                record["size_bytes"], record["size"], record["items"],
+                scope, root.path, metric, scan_status,
             ])
             rows += 1
+    return rows
+
+
+def export_tree_json(root, path: str, filter_index=None, *,
+                     search_query: str = "", partial: bool = False,
+                     inaccessible_count: int = 0) -> int:
+    """Stream a machine-readable report using the same scope as CSV export."""
+    scope_label, metric = _export_scope_label(filter_index, search_query)
+    metadata = {
+        "schema_version": 1,
+        "root": root.path,
+        "scope": {
+            "mode": ("visible_results" if filter_index is not None or search_query
+                     else "full_scan"),
+            "root": filter_index.scope.path if filter_index is not None else root.path,
+            "label": scope_label,
+            "search_query": search_query or None,
+            "query": _query_spec_record(filter_index),
+        },
+        "metric": metric,
+        "scan": {
+            "status": "partial" if partial else "complete",
+            "partial": bool(partial),
+            "inaccessible_count": max(0, int(inaccessible_count)),
+        },
+    }
+    rows = 0
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write("{\n")
+        for key, value in metadata.items():
+            f.write("  " + json.dumps(key, ensure_ascii=False) + ": ")
+            f.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+            f.write(",\n")
+        f.write('  "records": [')
+        for record in _iter_export_records(root, filter_index, search_query):
+            f.write("\n    " if rows == 0 else ",\n    ")
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            rows += 1
+        if rows:
+            f.write("\n")
+        f.write("  ]\n}\n")
     return rows
 
 

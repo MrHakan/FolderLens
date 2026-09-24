@@ -131,7 +131,7 @@ class QueryIndex:
         if not spec.include_hidden:
             current = node
             while current is not None and current is not self.scope.parent:
-                if current.name.startswith("."):
+                if bool(getattr(current, "is_hidden", current.name.startswith("."))):
                     return False
                 current = current.parent
         size = node.size if spec.metric == "logical" else node.allocated_size
