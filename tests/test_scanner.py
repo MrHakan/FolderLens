@@ -256,6 +256,7 @@ def test_partial_snapshot_is_available_while_child_share_is_blocked(tmp_path, mo
     blocked = tmp_path / "blocked"
     blocked.mkdir()
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    snapshot_ready = threading.Event()
     scanner = TreeScanner()
     scanner.SNAPSHOT_INTERVAL = 0
     original = scanner._read_directory
@@ -269,11 +270,17 @@ def test_partial_snapshot_is_available_while_child_share_is_blocked(tmp_path, mo
         return original(node, errors, on_progress, work_queue, session,
                         on_snapshot, on_event, capture_extended)
 
+    def observe(snapshot):
+        snapshots.append(snapshot)
+        if snapshot.state == "scanning" and snapshot.known_bytes == 5 and snapshot.partial:
+            snapshot_ready.set()
+
     monkeypatch.setattr(scanner, "_read_directory", slow)
-    scanner.scan(str(tmp_path), on_snapshot=snapshots.append,
+    scanner.scan(str(tmp_path), on_snapshot=observe,
                  on_complete=lambda *args: done.set())
     try:
         assert entered.wait(5)
+        assert snapshot_ready.wait(5)
         assert not done.is_set()
         assert any(s.state == "scanning" and s.known_bytes == 5 and s.partial
                    for s in snapshots)
@@ -352,8 +359,13 @@ def test_extended_metadata_reports_hardlinks_without_claiming_unique_bytes(tmp_p
                  on_complete=lambda root, errors, elapsed: (result.update(root=root), done.set()))
     assert done.wait(5)
     children = result["root"].children
-    assert children[0].file_identity == children[1].file_identity
-    assert children[0].link_count >= 2
+    if children[0].link_count is None:
+        # DirEntry.stat can omit this field on Windows. Do not infer identity.
+        assert all(child.link_count is None and child.file_identity is None
+                   for child in children)
+    else:
+        assert children[0].link_count >= 2
+        assert children[0].file_identity == children[1].file_identity
     assert result["root"].logical_size == 8192  # logical paths, not unique blocks
     assert children[0].mtime_ns > 0
     if children[0].allocated_size is not None:

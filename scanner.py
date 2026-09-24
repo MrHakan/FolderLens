@@ -252,6 +252,10 @@ class TreeScanner:
         blocks = getattr(entry_stat, "st_blocks", None)
         allocated = int(blocks * 512) if blocks is not None else None
         links = getattr(entry_stat, "st_nlink", None)
+        # Some platforms report zero when DirEntry cannot provide a link
+        # count. Zero is unknown, not evidence that the file has no links.
+        if links is not None and links <= 0:
+            links = None
         identity = None
         if links is not None and links > 1:
             dev, inode = getattr(entry_stat, "st_dev", None), getattr(entry_stat, "st_ino", None)
