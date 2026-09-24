@@ -1846,6 +1846,8 @@ class FolderLensApp(ctk.CTk):
 
     # ---- Tree view
 
+    TREE_PAGE_SIZE = 200
+
     def _render_tree(self):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
@@ -1874,10 +1876,13 @@ class FolderLensApp(ctk.CTk):
         }
         self.tree = self._make_treeview(("usage", "size", "items", "type", "modified"), headings, widths)
         self.iid_to_node = {}
+        page_counts = getattr(self, "_tree_sort_pages", {})
+        self._tree_pages = {}
 
         self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Double-Button-1>", self._on_tree_double)
+        self.tree.bind("<Return>", self._on_tree_page_key)
         self.tree.bind("<Button-3>", self._on_tree_right)
         self.tree.bind("<Delete>", lambda e: self._delete_selected())
 
@@ -1891,7 +1896,8 @@ class FolderLensApp(ctk.CTk):
         if self.search_query:
             self._fill_tree_search()
         else:
-            self._insert_tree_children("", self.root_node)
+            self._insert_tree_children("", self.root_node,
+                                       limit=page_counts.get(self.root_node.path))
 
     def _tree_values(self, node: Node, parent: Node):
         node_size = self._node_size(node)
@@ -1948,8 +1954,11 @@ class FolderLensApp(ctk.CTk):
                 continue
         self._row_by_path[path] = alive
 
-    def _insert_tree_children(self, parent_iid: str, parent_node: Node):
-        for child in self._sorted_children(parent_node):
+    def _insert_tree_children(self, parent_iid: str, parent_node: Node,
+                              start: int = 0, limit: Optional[int] = None):
+        children = self._sorted_children(parent_node)
+        end = min(len(children), start + (limit or self.TREE_PAGE_SIZE))
+        for child in children[start:end]:
             icon = ICONS['folder'] if child.is_dir else get_file_icon(child.name, is_dir=False)
             tags = []
             if child.is_dir:
@@ -1962,6 +1971,12 @@ class FolderLensApp(ctk.CTk):
             self._register_row_thumbnail(self.tree, iid, child)
             if child.is_dir and self._node_count(child) > 0:
                 self.tree.insert(iid, "end", text="…", tags=("dummy",))
+        self._tree_pages[parent_node.path] = end
+        if end < len(children):
+            remaining = len(children) - end
+            self.tree.insert(parent_iid, "end",
+                             text=f"Show next {min(self.TREE_PAGE_SIZE, remaining):,} of {remaining:,} remaining…",
+                             tags=("page",))
 
     def _fill_tree_search(self):
         matches = analysis.find_matches(
@@ -1978,6 +1993,21 @@ class FolderLensApp(ctk.CTk):
 
     def _is_dummy(self, iid: str) -> bool:
         return "dummy" in self.tree.item(iid, "tags")
+
+    def _load_tree_page(self, iid: str) -> bool:
+        if not iid or "page" not in self.tree.item(iid, "tags"):
+            return False
+        parent_iid = self.tree.parent(iid)
+        parent_node = self.iid_to_node.get(parent_iid) if parent_iid else self.root_node
+        if parent_node is None:
+            return False
+        start = self._tree_pages.get(parent_node.path, 0)
+        self.tree.delete(iid)
+        self._insert_tree_children(parent_iid, parent_node, start=start)
+        return True
+
+    def _on_tree_page_key(self, event):
+        self._load_tree_page(self.tree.focus())
 
     def _on_tree_open(self, event):
         iid = self.tree.focus()
@@ -1998,6 +2028,7 @@ class FolderLensApp(ctk.CTk):
             self.sort_reverse = key != "name"
         if self.search_query:
             return
+        page_counts = dict(getattr(self, "_tree_pages", {}))
         expanded = set()
         pending = list(self.tree.get_children())
         while pending:
@@ -2006,7 +2037,11 @@ class FolderLensApp(ctk.CTk):
             if node and self.tree.item(iid, "open"):
                 expanded.add(node.path)
                 pending.extend(self.tree.get_children(iid))
-        self._render_active_view()      # rebuild headers and rows in new order
+        self._tree_sort_pages = page_counts
+        try:
+            self._render_active_view()      # rebuild headers and rows in new order
+        finally:
+            self._tree_sort_pages = {}
 
         pending = list(self.tree.get_children())
         while pending:
@@ -2016,7 +2051,7 @@ class FolderLensApp(ctk.CTk):
                 dummies = self.tree.get_children(iid)
                 if len(dummies) == 1 and self._is_dummy(dummies[0]):
                     self.tree.delete(dummies[0])
-                    self._insert_tree_children(iid, node)
+                    self._insert_tree_children(iid, node, limit=page_counts.get(node.path))
                 self.tree.item(iid, open=True)
                 pending.extend(self.tree.get_children(iid))
 
@@ -2031,6 +2066,8 @@ class FolderLensApp(ctk.CTk):
 
     def _on_tree_double(self, event):
         iid = self.tree.identify_row(event.y)
+        if self._load_tree_page(iid):
+            return
         node = self.iid_to_node.get(iid)
         if not node:
             return

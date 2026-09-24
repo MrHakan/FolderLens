@@ -210,6 +210,27 @@ def test_sort_preserves_expanded_folders(gui):
     assert any(n.name == "pic.png" for n in gui.iid_to_node.values())
 
 
+def test_wide_tree_loads_rows_in_pages_and_keeps_page_on_sort(gui, tmp_path):
+    for number in range(205):
+        (tmp_path / f"item{number:03}.txt").write_text("x")
+    gui.root_node = scan_sync(tmp_path)
+    show(gui, "Tree")
+
+    rows = gui.tree.get_children("")
+    assert len(rows) == 201
+    assert len(gui.iid_to_node) == 200
+    assert "page" in gui.tree.item(rows[-1], "tags")
+
+    gui.tree.focus(rows[-1])
+    gui._on_tree_page_key(None)
+    assert len(gui.tree.get_children("")) == 205
+    assert len(gui.iid_to_node) == 205
+
+    gui._sort_tree("name")
+    assert len(gui.tree.get_children("")) == 205
+    assert len(gui.iid_to_node) == 205
+
+
 def test_stale_scan_callback_cannot_replace_current_tree(gui):
     old_root = gui.root_node
     gui._scan_generation += 1
