@@ -3677,6 +3677,11 @@ class FolderLensApp(ctk.CTk):
         """Zoom the paired map to the selected row's containing folder."""
         if self.active_view != "Explore" or self.root_node is None or node is None:
             return
+        # A folder that is already the treemap root is represented by the
+        # map's contents, not by a tile. Its queued TreeviewSelect event must
+        # not undo the drill-down that selected it.
+        if self.treemap_stack and self.treemap_stack[-1] is node:
+            return
         ancestors = []
         parent = node.parent
         while parent is not None and parent is not self.root_node:
