@@ -49,9 +49,58 @@ def _is_reparse(value) -> bool:
     return stat.S_ISLNK(value.st_mode) or bool(getattr(value, "st_file_attributes", 0) & flag)
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _normalized_path(path: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.normcase(os.path.commonpath((path, root))) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _protected_path_reason(path: str) -> Optional[str]:
+    """Identify volume roots and high-impact Windows system directories."""
+    target = _normalized_path(path)
+    drive, _ = os.path.splitdrive(target)
+    volume_root = _normalized_path(drive + os.sep if drive else os.path.abspath(os.sep))
+    if target == volume_root:
+        return "filesystem root"
+
+    try:
+        if os.path.ismount(target):
+            return "filesystem or mounted-volume root"
+    except (OSError, ValueError):
+        pass
+
+    if not _is_windows():
+        return None
+
+    protected = (
+        ("Windows system directory", os.environ.get("SystemRoot") or os.environ.get("windir"), True),
+        ("Program Files directory", os.environ.get("ProgramFiles"), True),
+        ("32-bit Program Files directory", os.environ.get("ProgramFiles(x86)"), True),
+        ("shared application data directory", os.environ.get("ProgramData"), True),
+        ("user profile root", os.environ.get("USERPROFILE"), False),
+    )
+    for label, raw_root, protect_descendants in protected:
+        if not raw_root:
+            continue
+        root = _normalized_path(raw_root)
+        if target == root or (protect_descendants and _path_is_within(target, root)):
+            return label
+    return None
+
+
 def validate_selection(nodes: Iterable, *, cancel_event=None,
                        on_progress: Optional[Callable[[int, int], None]] = None,
-                       reject_reparse: bool = False) -> ValidationResult:
+                       reject_reparse: bool = False,
+                       reject_protected: bool = False) -> ValidationResult:
     """Compare selected scanned subtrees with current names and metadata.
 
     The check never follows symlinks or Windows reparse points. It compares
@@ -69,6 +118,14 @@ def validate_selection(nodes: Iterable, *, cancel_event=None,
         result.valid = False
         if len(result.issues) < 10:
             result.issues.append(message)
+
+    if reject_protected:
+        for node in selected:
+            reason = _protected_path_reason(node.path)
+            if reason:
+                problem(f"Protected path ({reason}): {node.path}")
+        if not result.valid:
+            return result
 
     def check_node(node, current, count=True):
         nonlocal checked
@@ -351,9 +408,13 @@ def remove_selected(node, *, recycle: bool, cancel_event=None,
                    on_progress: Optional[Callable[[int, int], None]] = None,
                    prevalidated: bool = False):
     """Remove a single validated selection without following reparse paths."""
+    reason = _protected_path_reason(node.path)
+    if reason:
+        raise ValueError(f"Refusing to delete a protected path ({reason}): {node.path}")
     if not prevalidated:
         check = validate_selection([node], cancel_event=cancel_event,
-                                   on_progress=on_progress, reject_reparse=True)
+                                   on_progress=on_progress, reject_reparse=True,
+                                   reject_protected=True)
         if not check.valid:
             raise ValueError("The selection changed or contains an unsafe reparse point. Rescan before deleting.\n"
                              + "\n".join(check.issues[:5]))

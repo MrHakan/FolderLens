@@ -4,8 +4,9 @@ import zipfile
 
 import pytest
 
+import file_actions
 from file_actions import ActionCancelled, create_zip, remove_selected, validate_selection
-from scanner import TreeScanner
+from scanner import Node, TreeScanner
 
 
 def scan(path):
@@ -141,3 +142,30 @@ def test_delete_blocks_reparse_points(tmp_path):
     with pytest.raises(ValueError, match="reparse point"):
         remove_selected(node, recycle=False)
     assert (target / "secret.txt").exists()
+
+ 
+def test_delete_blocks_filesystem_roots_without_traversing_them():
+    root_path = os.path.abspath(os.sep)
+    node = Node(path=root_path, name=root_path, is_dir=True)
+
+    result = validate_selection([node], reject_protected=True)
+
+    assert not result.valid
+    assert any("Protected path" in issue for issue in result.issues)
+    with pytest.raises(ValueError, match="protected path"):
+        remove_selected(node, recycle=False)
+
+
+def test_delete_blocks_windows_system_directories(monkeypatch, tmp_path):
+    system_root = tmp_path / "Windows"
+    protected = system_root / "System32"
+    monkeypatch.setattr(file_actions, "_is_windows", lambda: True)
+    monkeypatch.setenv("SystemRoot", str(system_root))
+    node = Node(path=str(protected), name="System32", is_dir=True)
+
+    result = validate_selection([node], reject_protected=True)
+
+    assert not result.valid
+    assert any("Windows system directory" in issue for issue in result.issues)
+    with pytest.raises(ValueError, match="protected path"):
+        remove_selected(node, recycle=False)

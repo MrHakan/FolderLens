@@ -37,7 +37,7 @@ explored six different ways with zero rescanning:
 - 🗺️ **Treemap** — a hierarchy-first cushion-shaded map where every rectangle's area is its size, folders get a reserved header band, labels are capped to the useful large tiles, and dense tails are grouped into a single “smaller items” tile. **Image files are painted with their own thumbnail** so you can recognise them at a glance. Hover for a **peek preview** of the picture, click a folder to zoom in, right-click to go back.
 - 🏆 **Largest files** — the top 100 biggest files anywhere in the tree, with their locations and small inline previews.
 - 🧩 **File types** — size and count broken down by category (video, image, code, …) with proportional bars.
-- 🎛️ **Type filter** — switch every view to Images, Videos, Audio, Documents, Archives, Code, Executables, Fonts, Databases, or Other. Matching folders remain as context, while all displayed sizes, counts, rankings, treemap areas, search results, and duplicate checks use only the selected file type.
+- 🎛️ **Type and advanced filters** — apply categories, extensions, filename terms, size and modified-date ranges, and hidden-file rules across every view. Matching folders remain as context, and Windows hidden attributes are respected.
 - 👯 **Duplicates** — finds byte-identical copies and shows exactly how much space keeping one of each would free. Narrowed by size, then a head/tail sample, then a full hash, so almost nothing is read twice.
 
 ### Image viewer & annotation
@@ -62,7 +62,7 @@ Plus:
 - 🔎 **Instant search** across the whole tree (Ctrl+F)
 - 🧵 **Fully responsive** — scanning, zipping, deleting, and exporting all run off the UI thread, with live progress and a **Stop** button
 - 🗑️ **Manage** — multi-select to zip, delete, or open in Explorer (right-click, toolbar, or Delete key); sizes update without rescanning
-- 📤 **Export** the full report to CSV, or the treemap itself as a PNG
+- 📤 **Export** the current visible results or full scan as a scoped CSV or JSON report, or the treemap as a PNG
 - ♻️ **Recycle Bin** — deletions are undoable by default (permanent delete is a setting)
 - 💽 **Disk usage** shown in the status bar (free / total)
 - 🌗 **Light / dark** theme, remembered between sessions, along with your last folder and view

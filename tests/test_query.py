@@ -144,3 +144,21 @@ def test_advanced_form_combines_fields_and_rejects_invalid_ranges():
         query_from_form(min_mib="20", max_mib="10")
     with pytest.raises(ValueError):
         query_from_form(modified_after="2026-99-99")
+
+ 
+def test_include_hidden_filters_windows_hidden_files_and_folders():
+    root, images, *_ = tree()
+    flagged = Node(None, "system-hidden.jpg", False, size=40, parent=images,
+                   metadata=(None, None, None, False, True))
+    hidden_dir = Node("/root/images/private", "private", True, parent=images,
+                      metadata=(None, None, None, False, True))
+    nested = Node(None, "inside.jpg", False, size=60, parent=hidden_dir)
+    hidden_dir.children.append(nested)
+    images.children.extend((flagged, hidden_dir))
+
+    index = QueryEngine(root).project(
+        QuerySpec(categories=("image",), include_hidden=False))
+
+    assert not index.matches(flagged)
+    assert not index.matches(nested)
+    assert index.size(images) == 300

@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import sys
 
@@ -279,3 +281,32 @@ def test_treemap_collapses_large_sibling_tail_into_an_aggregate():
         root, 0, 0, 100, 100, min_area=1, max_depth=1, max_children=1)
     assert len(only_aggregate) == 1
     assert getattr(only_aggregate[0].node, "is_aggregate", False)
+
+ 
+def test_json_and_csv_exports_share_query_scope_and_partial_metadata(tmp_path):
+    from query import QueryEngine, QuerySpec
+
+    root = make_tree()
+    index = QueryEngine(root).project(QuerySpec(categories=("image",)))
+    csv_path = tmp_path / "visible.csv"
+    json_path = tmp_path / "visible.json"
+
+    csv_count = analysis.export_tree_csv(
+        root, str(csv_path), filter_index=index, partial=True, inaccessible_count=2)
+    json_count = analysis.export_tree_json(
+        root, str(json_path), filter_index=index, partial=True, inaccessible_count=2)
+
+    with csv_path.open(newline="", encoding="utf-8") as source:
+        csv_rows = list(csv.DictReader(source))
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert json_count == csv_count == len(report["records"]) == 2
+    assert [(row["Path"], int(row["Size (bytes)"])) for row in csv_rows] == [
+        (row["path"], row["size_bytes"]) for row in report["records"]]
+    assert report["schema_version"] == 1
+    assert report["root"] == root.path
+    assert report["scope"]["mode"] == "visible_results"
+    assert report["scope"]["query"]["categories"] == ["image"]
+    assert report["metric"] == "logical"
+    assert report["scan"] == {
+        "status": "partial", "partial": True, "inaccessible_count": 2}
