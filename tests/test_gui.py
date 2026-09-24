@@ -555,6 +555,33 @@ def test_treemap_details_follow_focus_and_offer_file_actions(gui, monkeypatch):
     assert copied == [tile.node.path]
 
 
+def test_explore_shows_tree_map_details_and_syncs_selection(gui):
+    show(gui, "Explore")
+    wait_treemap(gui)
+    gui.update_idletasks()
+
+    assert gui.tree is not None
+    assert gui.treemap_canvas is not None
+    assert gui._treemap_detail_panel.winfo_manager() == "pack"
+
+    note = next(node for node in gui.root_node.children if node.name == "notes.txt")
+    note_iid = next(iid for iid, node in gui.iid_to_node.items() if node is note)
+    gui.tree.selection_set(note_iid)
+    gui._on_tree_select(None)
+    assert gui._treemap_focus_tile.node is note
+
+    video_tile = next(tile for tile in gui._tiles if tile.node.name == "big.mp4")
+    gui._treemap_set_focus(video_tile, sync_tree=True)
+    assert gui._selected_nodes() == [video_tile.node]
+
+    tree = gui.tree
+    folder = next(node for node in gui.root_node.children if node.name == "sub")
+    gui._treemap_drill_to(folder)
+    assert gui.tree is tree, "map navigation should preserve the paired tree"
+    wait_treemap(gui)
+    assert gui.treemap_node is folder
+
+
 def test_deletion_updates_model_without_the_original_widget(gui, sample_tree):
     """Deleting is async; the user may switch views before it lands. The model
     must still update and nothing may touch the destroyed widget."""

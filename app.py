@@ -96,7 +96,7 @@ class AppSettings:
                 self.dark_mode = data['dark_mode']
             if isinstance(data.get('last_folder'), str):
                 self.last_folder = data['last_folder']
-            if data.get('view') in ("Tree", "Treemap", "Largest Files", "File Types", "Duplicates"):
+            if data.get('view') in ("Explore", "Tree", "Treemap", "Largest Files", "File Types", "Duplicates"):
                 self.view = data['view']
             if (isinstance(data.get('file_filter'), str)
                     and data['file_filter'] in FILE_TYPE_FILTER_LABELS):
@@ -1148,7 +1148,7 @@ class FolderLensApp(ctk.CTk):
     """Fast, multi-view folder size explorer."""
 
     BAR_WIDTH = 10
-    VIEWS = ["Tree", "Treemap", "Largest Files", "File Types", "Duplicates"]
+    VIEWS = ["Explore", "Tree", "Treemap", "Largest Files", "File Types", "Duplicates"]
 
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
@@ -1199,10 +1199,16 @@ class FolderLensApp(ctk.CTk):
         self._tree_search_matches: List[Node] = []
         self._tree_search_offset = 0
         self._tree_search_has_more = False
+        self._tree_compact = False
         self._tree_sort_loading_paths = set()
         self._tree_sort_rows = {}
         self._pending_tree_expansions = set()
         self._pending_tree_expansion_pages = {}
+        self._pending_explore_select_node: Optional[Node] = None
+        self._cross_selection_path: Optional[str] = None
+        self._selection_sync_in_progress = False
+        self._explore_tree_host = None
+        self._explore_map_host = None
         self.sort_key = "size"
         self.sort_reverse = True
 
@@ -1985,6 +1991,9 @@ class FolderLensApp(ctk.CTk):
         self.settings.save()
         self._render_active_view()
 
+    def _tree_is_active(self):
+        return self.active_view in ("Tree", "Explore")
+
     def _on_filter_change(self, label: str):
         """Build a background projection for the selected file category."""
         reverse = {display: key for key, display in FILE_TYPE_FILTERS}
@@ -2095,6 +2104,7 @@ class FolderLensApp(ctk.CTk):
         self._tree_sort_rows.clear()
         self._pending_tree_expansions.clear()
         self._pending_tree_expansion_pages.clear()
+        self._pending_explore_select_node = None
         self._largest_generation += 1
         self._largest_loading = False
         self._types_generation += 1
@@ -2122,6 +2132,9 @@ class FolderLensApp(ctk.CTk):
         self._treemap_detail_location = None
         self._treemap_detail_action = None
         self._treemap_details_toggle = None
+        self._explore_tree_host = None
+        self._explore_map_host = None
+        self._tree_compact = False
         self._scan_preview_tree = None
         self._scan_preview_status = None
         self._scan_preview_signature = None
@@ -2140,7 +2153,9 @@ class FolderLensApp(ctk.CTk):
             else:
                 self._empty_hint("Scanning folder…")
             return
-        if self.active_view == "Tree":
+        if self.active_view == "Explore":
+            self._render_explore()
+        elif self.active_view == "Tree":
             self._render_tree()
         elif self.active_view == "Treemap":
             self._render_treemap()
@@ -2150,6 +2165,41 @@ class FolderLensApp(ctk.CTk):
             self._render_types()
         elif self.active_view == "Duplicates":
             self._render_duplicates()
+
+    def _render_explore(self):
+        """Show the hierarchy, size map, and selected-item details together."""
+        if not self.root_node:
+            self._empty_hint("Select a folder to analyze")
+            return
+        if not self._filter_ready_for_view():
+            return
+
+        self._treemap_details_expanded = None
+        colors = self._colors()
+        split = tk.PanedWindow(
+            self.body, orient="horizontal", sashwidth=6, sashrelief="flat",
+            showhandle=False, bg=colors['head_bg'], bd=0, highlightthickness=0)
+        split.pack(fill="both", expand=True)
+        tree_host = tk.Frame(split, bg=colors['tree_bg'])
+        map_host = tk.Frame(split, bg=colors['canvas_bg'])
+        split.add(tree_host, minsize=250, stretch="always")
+        split.add(map_host, minsize=430, stretch="always")
+        self._explore_tree_host = tree_host
+        self._explore_map_host = map_host
+
+        tk.Label(tree_host, text="FOLDER TREE", bg=colors['head_bg'],
+                 fg=colors['muted_fg'], font=("Segoe UI", 9, "bold"),
+                 anchor="w", padx=12, pady=7).pack(fill="x")
+        self._render_tree(parent=tree_host, compact=True)
+        self._render_treemap(parent=map_host)
+
+        def set_initial_split():
+            try:
+                if split.winfo_exists() and split.winfo_width() >= 700:
+                    split.sashpos(0, int(split.winfo_width() * 0.38))
+            except tk.TclError:
+                pass
+        self.after_idle(set_initial_split)
 
     def _empty_hint(self, text: str):
         """Shown when a view has nothing to display.
@@ -2267,7 +2317,7 @@ class FolderLensApp(ctk.CTk):
 
     # ---- shared treeview styling
 
-    def _make_treeview(self, columns, headings, widths):
+    def _make_treeview(self, columns, headings, widths, parent=None):
         colors = self._colors()
         fs = self.settings.font_size()
         style = ttk.Style(self)
@@ -2281,7 +2331,7 @@ class FolderLensApp(ctk.CTk):
                         borderwidth=0, font=("Segoe UI", fs - 1, "bold"))
         style.map("FolderLens.Treeview.Heading", background=[("active", colors['head_bg'])])
 
-        wrap = tk.Frame(self.body, bg=colors['tree_bg'])
+        wrap = tk.Frame(parent or self.body, bg=colors['tree_bg'])
         wrap.pack(fill="both", expand=True)
         tree = ttk.Treeview(wrap, columns=columns, selectmode="extended", style="FolderLens.Treeview")
         for col, (text, cmd) in headings.items():
@@ -2304,7 +2354,7 @@ class FolderLensApp(ctk.CTk):
     TREE_PAGE_SIZE = 200
     TREE_ASYNC_SORT_THRESHOLD = 5000
 
-    def _render_tree(self):
+    def _render_tree(self, parent=None, compact=False):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
             return
@@ -2330,7 +2380,21 @@ class FolderLensApp(ctk.CTk):
             "type": (100, 80, "w", False),
             "modified": (130, 110, "w", False),
         }
-        self.tree = self._make_treeview(("usage", "size", "items", "type", "modified"), headings, widths)
+        columns = ("usage", "size", "items", "type", "modified")
+        if compact:
+            headings = {
+                "#0": ("Name" + marks["name"], lambda: self._sort_tree("name")),
+                "size": ("Size" + marks["size"], lambda: self._sort_tree("size")),
+                "items": ("Items", lambda: self._sort_tree("size")),
+            }
+            widths = {
+                "#0": (260, 130, "w", True),
+                "size": (90, 76, "e", False),
+                "items": (62, 52, "e", False),
+            }
+            columns = ("size", "items")
+        self._tree_compact = compact
+        self.tree = self._make_treeview(columns, headings, widths, parent=parent)
         self.iid_to_node = {}
         page_counts = getattr(self, "_tree_sort_pages", {})
         self._tree_pages = {}
@@ -2358,6 +2422,10 @@ class FolderLensApp(ctk.CTk):
 
     def _tree_values(self, node: Node, parent: Node):
         node_size = self._node_size(node)
+        if self._tree_compact:
+            if node.is_dir:
+                return (format_size(node_size), f"{self._node_count(node):,}")
+            return (format_size(node_size), "")
         parent_size = self._node_size(parent) if parent else 0
         pct = calculate_percentage(node_size, parent_size) if parent_size else 0.0
         filled = round(pct / 100 * self.BAR_WIDTH)
@@ -2496,7 +2564,7 @@ class FolderLensApp(ctk.CTk):
                 or filter_generation != self._filter_generation
                 or projection_key != self._projection_key()
                 or root is not self.root_node
-                or self.active_view != "Tree"
+                or not self._tree_is_active()
                 or self.tree is None):
             return
         self._tree_sort_loading_paths.discard(parent_node.path)
@@ -2511,6 +2579,10 @@ class FolderLensApp(ctk.CTk):
         self._tree_page_data[parent_node.path] = children
         self._insert_tree_children(parent_iid, parent_node, start=start, limit=limit)
         self._restore_pending_tree_expansions()
+        pending_node = self._pending_explore_select_node
+        if pending_node is not None and self.active_view == "Explore":
+            self._pending_explore_select_node = None
+            self._sync_explore_tree_selection(pending_node)
 
     def _fill_tree_search(self):
         root = self.root_node
@@ -2561,7 +2633,7 @@ class FolderLensApp(ctk.CTk):
                 or filter_generation != self._filter_generation
                 or projection_key != self._projection_key()
                 or root is not self.root_node
-                or self.active_view != "Tree"
+                or not self._tree_is_active()
                 or self.tree is None):
             return
         self._tree_search_loading = False
@@ -2694,6 +2766,16 @@ class FolderLensApp(ctk.CTk):
             return
         total = sum(self._node_size(n) for n in nodes)
         self._set_status(f"{len(nodes)} selected · {format_size(total)}")
+        if self._tree_is_active() and not self._selection_sync_in_progress:
+            if len(nodes) == 1:
+                node = nodes[0]
+                self._cross_selection_path = node.path
+                if self.active_view == "Explore":
+                    tile = self._find_treemap_tile_for_node(node)
+                    if tile is not None:
+                        self._treemap_set_focus(tile)
+            else:
+                self._cross_selection_path = None
 
     def _on_tree_double(self, event):
         iid = self.tree.identify_row(event.y)
@@ -3095,7 +3177,7 @@ class FolderLensApp(ctk.CTk):
 
     # ---- Treemap view
 
-    def _render_treemap(self):
+    def _render_treemap(self, parent=None):
         if not self.root_node:
             self._empty_hint("Select a folder to analyze")
             return
@@ -3104,7 +3186,7 @@ class FolderLensApp(ctk.CTk):
         colors = self._colors()
         node = self.treemap_stack[-1] if self.treemap_stack else self.root_node
 
-        wrap = tk.Frame(self.body, bg=colors['canvas_bg'])
+        wrap = tk.Frame(parent or self.body, bg=colors['canvas_bg'])
         wrap.pack(fill="both", expand=True)
 
         # A compact context bar makes the map self-explanatory after a drill
@@ -3198,6 +3280,7 @@ class FolderLensApp(ctk.CTk):
             self.tooltip = Tooltip(self)
         self.treemap_node = node
         self._hover_tile = None
+        self._treemap_focus_tile = None
         self.treemap_canvas.bind("<Configure>", lambda e: self._schedule_treemap_redraw())
         self.treemap_canvas.bind("<Motion>", self._treemap_hover)
         self.treemap_canvas.bind("<Leave>", self._treemap_leave)
@@ -3317,7 +3400,8 @@ class FolderLensApp(ctk.CTk):
         )
 
         def worker():
-            cancelled = lambda: generation != self._treemap_generation or self.active_view != "Treemap"
+            cancelled = lambda: (generation != self._treemap_generation
+                                 or self.active_view not in ("Treemap", "Explore"))
             if index is not None:
                 layout_children_getter = lambda item: index.children(
                     item, should_cancel=cancelled)
@@ -3371,8 +3455,8 @@ class FolderLensApp(ctk.CTk):
             if generation != self._treemap_generation:
                 continue
             self._treemap_rendering = False
-            if self.active_view != "Treemap" or image is None:
-                if error and self.active_view == "Treemap":
+            if self.active_view not in ("Treemap", "Explore") or image is None:
+                if error and self.active_view in ("Treemap", "Explore"):
                     self.treemap_canvas.delete("all")
                     self.treemap_canvas.create_text(
                         self.treemap_canvas.winfo_width() // 2,
@@ -3395,7 +3479,17 @@ class FolderLensApp(ctk.CTk):
             if self._treemap_focus_info is not None:
                 self._treemap_focus_info.configure(
                     text="Map: arrows select · Enter opens · Backspace goes up")
-            if self.treemap_canvas.focus_get() is self.treemap_canvas:
+            if self.active_view == "Explore" and self._cross_selection_path:
+                tile = next((item for item in self._tiles
+                             if getattr(item.node, "path", None) == self._cross_selection_path), None)
+                if tile is not None:
+                    self._treemap_set_focus(tile)
+                    self._sync_explore_tree_selection(tile.node)
+                elif self.active_view == "Explore" and self._tiles:
+                    self._treemap_set_focus(max(self._tiles,
+                                                key=lambda item: (item.w * item.h, item.depth)))
+            if (self._treemap_focus_tile is None
+                    and self.treemap_canvas.focus_get() is self.treemap_canvas):
                 self._treemap_focus_in()
         if self._treemap_rendering:
             self._schedule_treemap_result_poll()
@@ -3460,7 +3554,8 @@ class FolderLensApp(ctk.CTk):
         canvas = getattr(self, "treemap_canvas", None)
         if panel is None or canvas is None:
             return
-        visible = (width >= 1120 if self._treemap_details_expanded is None
+        default_visible = self.active_view == "Explore" or width >= 1120
+        visible = (default_visible if self._treemap_details_expanded is None
                    else self._treemap_details_expanded)
         is_visible = panel.winfo_manager() == "pack"
         if visible and not is_visible:
@@ -3505,11 +3600,102 @@ class FolderLensApp(ctk.CTk):
             tile = max(self._tiles, key=lambda item: (item.w * item.h, item.depth))
             self._treemap_set_focus(tile)
 
-    def _treemap_set_focus(self, tile):
+    def _treemap_set_focus(self, tile, sync_tree=False):
         self._treemap_focus_tile = tile
         self._hover_tile = tile
         self._draw_highlight(tile)
         self._announce_treemap_tile(tile)
+        if sync_tree and tile is not None and self.active_view == "Explore":
+            node = tile.node.parent if getattr(tile.node, "is_aggregate", False) else tile.node
+            if node is not None:
+                self._cross_selection_path = node.path
+                self._sync_explore_tree_selection(node)
+
+    def _find_treemap_tile_for_node(self, node):
+        for tile in self._tiles:
+            if tile.node is node:
+                return tile
+        return None
+
+    def _sync_explore_tree_selection(self, node):
+        """Reveal a map selection in the tree when the scanned row can be loaded."""
+        tree = self.tree
+        if self.active_view != "Explore" or tree is None or node is None:
+            return
+        if self.search_query:
+            selected_iid = next((iid for iid, candidate in self.iid_to_node.items()
+                                 if candidate is node), None)
+            if selected_iid is not None:
+                self._select_explore_tree_iid(selected_iid)
+            return
+        chain = []
+        current = node
+        while current is not None and current is not self.root_node:
+            chain.append(current)
+            current = current.parent
+        if current is not self.root_node:
+            return
+
+        parent_node = self.root_node
+        parent_iid = ""
+        selected_iid = None
+        for child_node in reversed(chain):
+            child_iid = next((iid for iid, candidate in self.iid_to_node.items()
+                              if candidate is child_node), None)
+            if child_iid is None:
+                if parent_iid:
+                    tree.item(parent_iid, open=True)
+                children = tree.get_children(parent_iid)
+                dummy = next((iid for iid in children if self._is_dummy(iid)), None)
+                if dummy:
+                    tree.delete(dummy)
+                    self._insert_tree_children(parent_iid, parent_node)
+
+                # The treemap is capped at 1,200 visible siblings. Load only
+                # the pages needed to reach the chosen tile; very large sorts
+                # continue asynchronously and resume from _tree_child_sort_ready.
+                while child_iid is None:
+                    if parent_node.path in self._tree_sort_loading_paths:
+                        self._pending_explore_select_node = node
+                        break
+                    page_iid = next((iid for iid in tree.get_children(parent_iid)
+                                     if "page" in tree.item(iid, "tags")), None)
+                    if page_iid is None:
+                        break
+                    before = len(self.iid_to_node)
+                    self._load_tree_page(page_iid)
+                    child_iid = next((iid for iid, candidate in self.iid_to_node.items()
+                                      if candidate is child_node), None)
+                    if parent_node.path in self._tree_sort_loading_paths:
+                        self._pending_explore_select_node = node
+                        break
+                    if child_iid is None and len(self.iid_to_node) == before:
+                        break
+                if child_iid is None:
+                    if parent_node.path in self._tree_sort_loading_paths:
+                        return
+                    break
+
+            selected_iid = child_iid
+            tree.item(child_iid, open=True)
+            parent_iid = child_iid
+            parent_node = child_node
+
+        if selected_iid is None or not tree.exists(selected_iid):
+            return
+        self._select_explore_tree_iid(selected_iid)
+
+    def _select_explore_tree_iid(self, iid):
+        tree = self.tree
+        if tree is None or not tree.exists(iid):
+            return
+        self._selection_sync_in_progress = True
+        try:
+            tree.selection_set(iid)
+            tree.focus(iid)
+            tree.see(iid)
+        finally:
+            self._selection_sync_in_progress = False
 
     def _treemap_move_focus(self, direction):
         if not self._tiles:
@@ -3540,7 +3726,7 @@ class FolderLensApp(ctk.CTk):
                 target = edge(self._tiles, key=lambda tile: tile.y + tile.h / 2)
         else:
             target = min(candidates, key=lambda item: item[0])[1]
-        self._treemap_set_focus(target)
+        self._treemap_set_focus(target, sync_tree=True)
         return "break"
 
     def _treemap_activate_focus(self, _event=None):
@@ -3550,6 +3736,7 @@ class FolderLensApp(ctk.CTk):
             tile = self._treemap_focus_tile
         if tile is None:
             return "break"
+        self._treemap_set_focus(tile, sync_tree=True)
         if getattr(tile.node, "is_aggregate", False):
             self._show_treemap_aggregate(tile.node)
         elif tile.node.is_dir and self._node_count(tile.node) > 0:
@@ -3569,7 +3756,7 @@ class FolderLensApp(ctk.CTk):
         self.after(0, lambda: self._apply_thumbnail(path))
 
     def _apply_thumbnail(self, path: str):
-        if self.active_view == "Treemap":
+        if self.active_view in ("Treemap", "Explore"):
             self._schedule_treemap_redraw()
             # the pointer may still be resting on this tile: fill the peek in
             # now rather than waiting for the next mouse move
@@ -3633,6 +3820,8 @@ class FolderLensApp(ctk.CTk):
     def _treemap_click(self, event):
         self.treemap_canvas.focus_set()
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
+        if tile:
+            self._treemap_set_focus(tile, sync_tree=True)
         if tile and getattr(tile.node, "is_aggregate", False):
             self._show_treemap_aggregate(tile.node)
             return
@@ -3764,7 +3953,7 @@ class FolderLensApp(ctk.CTk):
     def _treemap_back(self):
         if self.treemap_stack:
             self.treemap_forward_stack.append(self.treemap_stack.pop())
-            self._render_active_view()
+            self._refresh_explore_map()
 
     def _treemap_forward(self):
         if not self.treemap_forward_stack:
@@ -3774,13 +3963,39 @@ class FolderLensApp(ctk.CTk):
             self.treemap_forward_stack.clear()
             return
         self.treemap_stack.append(node)
-        self._render_active_view()
+        self._refresh_explore_map()
 
     def _treemap_drill_to(self, node: Node):
         self.treemap_forward_stack.clear()
         self.treemap_stack.append(node)
         self._hover_tile = None
-        self._render_active_view()
+        self._refresh_explore_map()
+
+    def _refresh_explore_map(self):
+        """Redraw only the map pane so its paired tree keeps its open rows."""
+        host = self._explore_map_host
+        if self.active_view != "Explore" or host is None:
+            self._render_active_view()
+            return
+        self._invalidate_treemap_render()
+        if self._treemap_redraw_after:
+            self.after_cancel(self._treemap_redraw_after)
+            self._treemap_redraw_after = None
+        for child in host.winfo_children():
+            child.destroy()
+        self._treemap_focus_info = None
+        self._treemap_workspace = None
+        self._treemap_detail_panel = None
+        self._treemap_detail_name = None
+        self._treemap_detail_summary = None
+        self._treemap_detail_location = None
+        self._treemap_detail_action = None
+        self._treemap_details_toggle = None
+        self.treemap_canvas = None
+        self._treemap_focus_tile = None
+        self._tiles = []
+        self._treemap_image = None
+        self._render_treemap(parent=host)
 
     def _treemap_keyboard_back(self, _event=None):
         self._treemap_back()
@@ -3825,7 +4040,7 @@ class FolderLensApp(ctk.CTk):
         Views are rebuilt on every switch, so the widget references are only
         valid for the view that is on screen right now.
         """
-        if self.active_view == "Tree" and self.tree is not None:
+        if self._tree_is_active() and self.tree is not None:
             return self.tree, self.iid_to_node
         if self.active_view == "Largest Files" and self.largest_tree is not None:
             return self.largest_tree, self.largest_map
@@ -4085,9 +4300,9 @@ class FolderLensApp(ctk.CTk):
                                 parent=self)
 
     def _no_selection_hint(self) -> str:
-        if self.active_view in ("Tree", "Largest Files", "Duplicates"):
+        if self.active_view in ("Explore", "Tree", "Largest Files", "Duplicates"):
             return "Select files or folders first."
-        return "Switch to the Tree, Largest Files or Duplicates view to select items."
+        return "Switch to Explore, Tree, Largest Files or Duplicates to select items."
 
     def _action_scope_prompt(self, selection: List[tuple], action: str) -> str:
         """A filtered folder row represents all files on disk for ZIP/delete."""

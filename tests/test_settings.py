@@ -54,3 +54,14 @@ def test_failed_settings_replacement_preserves_old_file(tmp_path, monkeypatch):
     settings.save()
     assert target.read_text(encoding="utf-8") == '{"file_filter": "all"}'
     assert list(tmp_path.iterdir()) == [target]
+
+
+def test_explore_view_setting_loads_and_round_trips(tmp_path, monkeypatch):
+    target = tmp_path / "settings.json"
+    target.write_text('{"view": "Explore"}', encoding="utf-8")
+    monkeypatch.setattr(app, "_settings_file", lambda: str(target))
+
+    settings = app.AppSettings()
+    assert settings.view == "Explore"
+    settings.save()
+    assert json.loads(target.read_text(encoding="utf-8"))["view"] == "Explore"

@@ -30,8 +30,9 @@ FolderLens scans a whole directory tree **once** — with a shared work queue an
 a bounded worker pool that keeps one large folder parallel, avoids creating
 one task per subtree, and automatically uses gentler metadata concurrency for
 UNC and mapped network drives. The complete in-memory tree can then be
-explored five different ways with zero rescanning:
+explored six different ways with zero rescanning:
 
+- 🧭 **Explore** — keep the folder hierarchy, treemap, and selection details visible together. Selecting a row or map tile follows the same item on the other side; zooming the map keeps the tree open.
 - 🌳 **Tree view** — expandable folder tree with a usage bar, size, item count, type, and date at every level. Expanding a folder is instant.
 - 🗺️ **Treemap** — a hierarchy-first cushion-shaded map where every rectangle's area is its size, folders get a reserved header band, labels are capped to the useful large tiles, and dense tails are grouped into a single “smaller items” tile. **Image files are painted with their own thumbnail** so you can recognise them at a glance. Hover for a **peek preview** of the picture, click a folder to zoom in, right-click to go back.
 - 🏆 **Largest files** — the top 100 biggest files anywhere in the tree, with their locations and small inline previews.
@@ -56,7 +57,7 @@ Plus:
 
 - 🧭 **Clickable breadcrumbs** — jump straight to any folder in the path
 - 🎨 **Colour legend** under the treemap, so the colours actually mean something
-- ⌨️ **Keyboard treemap navigation** — arrow keys move through tiles, Enter opens the focused item, and Backspace goes up. The item name and size are also shown as text; Tree view provides the full hierarchical table.
+- ⌨️ **Keyboard treemap navigation** — arrow keys move through tiles, Enter opens the focused item, and Backspace goes up. In Explore, the focused item also selects its row in the folder tree.
 - ⌨️ **Shortcut help** built in (F1), and hover hints on every icon button
 - 🔎 **Instant search** across the whole tree (Ctrl+F)
 - 🧵 **Fully responsive** — scanning, zipping, deleting, and exporting all run off the UI thread, with live progress and a **Stop** button
