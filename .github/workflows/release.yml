@@ -87,10 +87,19 @@ jobs:
           if (-not $installerItem) { throw "Installer asset is missing for version $version" }
           $installer = $installerItem.FullName
           $installDir = Join-Path $env:RUNNER_TEMP 'FolderLensInstall'
-          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) { throw "Installer exited with $LASTEXITCODE" }
+          $setupLog = Join-Path $env:RUNNER_TEMP 'FolderLens-setup.log'
+          $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$installDir", "/LOG=$setupLog")
+          $installProcess = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "Installer exited with $($installProcess.ExitCode)" }
           $installedExe = Join-Path $installDir 'FolderLens.exe'
-          if (-not (Test-Path $installedExe)) { throw 'Installed executable is missing' }
+          if (-not (Test-Path $installedExe)) {
+            Write-Host "Installed executable missing from $installDir. Setup log:"
+            if (Test-Path $setupLog) { Get-Content $setupLog -Tail 100 }
+            if (Test-Path $installDir) { Get-ChildItem $installDir -Force | Format-Table FullName, Length }
+            $actualInstall = Get-ItemProperty 'HKLM:\SOFTWARE\FolderLens' -ErrorAction SilentlyContinue
+            if ($actualInstall) { Write-Host "Registered install path: $($actualInstall.InstallPath)" }
+            throw 'Installed executable is missing'
+          }
           $reportedVersion = & $installedExe --version
           if ($reportedVersion -ne "FolderLens $version") {
             throw "Installed version '$reportedVersion' does not match '$version'"
