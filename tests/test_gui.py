@@ -23,7 +23,7 @@ if sys.platform != "win32" and not os.environ.get("DISPLAY"):
 import locations
 import analysis
 import treemap_render
-from scanner import TreeScanner, ScanSnapshot
+from scanner import TreeScanner, ScanSnapshot, Node
 
 
 def scan_sync(path):
@@ -179,6 +179,14 @@ def wait_tree_search(win, timeout=10):
     assert not win._tree_search_loading, "tree search did not finish"
 
 
+def wait_tree_sorts(win, timeout=10):
+    deadline = time.monotonic() + timeout
+    while win._tree_sort_loading_paths and time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+    assert not win._tree_sort_loading_paths, "large directory sort did not finish"
+
+
 def test_toolbar_actions_safe_in_view_without_selection(gui):
     """Regression: the app remembers the last view, so it can start in Treemap.
     The always-visible Zip/Delete buttons used to raise AttributeError there."""
@@ -286,6 +294,26 @@ def test_wide_tree_loads_rows_in_pages_and_keeps_page_on_sort(gui, tmp_path, mon
     gui._sort_tree("name")
     assert len(gui.tree.get_children("")) == 205
     assert len(gui.iid_to_node) == 205
+
+
+def test_very_wide_tree_sorts_children_off_the_ui_thread(gui):
+    root = Node("/synthetic-wide", "synthetic-wide", True)
+    for number in reversed(range(gui.TREE_ASYNC_SORT_THRESHOLD + 1)):
+        root.children.append(Node(
+            None, f"item{number:05}.txt", False, size=number, parent=root))
+    root.item_count = len(root.children)
+    root.size = sum(child.size for child in root.children)
+    gui.root_node = root
+
+    show(gui, "Tree")
+    assert gui._tree_sort_loading_paths == {root.path}
+    wait_tree_sorts(gui)
+
+    rows = gui.tree.get_children()
+    visible = [iid for iid in rows if iid in gui.iid_to_node]
+    assert len(visible) == gui.TREE_PAGE_SIZE
+    assert gui.iid_to_node[visible[0]].name == "item05000.txt"
+    assert any("page" in gui.tree.item(iid, "tags") for iid in rows)
 
 
 def test_stale_scan_callback_cannot_replace_current_tree(gui):

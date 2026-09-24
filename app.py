@@ -1195,6 +1195,8 @@ class FolderLensApp(ctk.CTk):
         self._tree_search_matches: List[Node] = []
         self._tree_search_offset = 0
         self._tree_search_has_more = False
+        self._tree_sort_loading_paths = set()
+        self._tree_sort_rows = {}
         self.sort_key = "size"
         self.sort_reverse = True
 
@@ -1298,6 +1300,8 @@ class FolderLensApp(ctk.CTk):
                 self._types_results_ready(*payload)
             elif kind == "tree-search":
                 self._tree_search_results_ready(*payload)
+            elif kind == "tree-sort":
+                self._tree_child_sort_ready(*payload)
         self.after(100, self._poll_io_results)
 
     # -------------------------------------------------------------- chrome
@@ -1999,6 +2003,8 @@ class FolderLensApp(ctk.CTk):
         self._tree_search_matches = []
         self._tree_search_offset = 0
         self._tree_search_has_more = False
+        self._tree_sort_loading_paths.clear()
+        self._tree_sort_rows.clear()
         self._largest_generation += 1
         self._largest_loading = False
         self._types_generation += 1
@@ -2188,6 +2194,7 @@ class FolderLensApp(ctk.CTk):
     # ---- Tree view
 
     TREE_PAGE_SIZE = 200
+    TREE_ASYNC_SORT_THRESHOLD = 5000
 
     def _render_tree(self):
         if not self.root_node:
@@ -2300,6 +2307,9 @@ class FolderLensApp(ctk.CTk):
                               start: int = 0, limit: Optional[int] = None):
         children = self._tree_page_data.get(parent_node.path)
         if children is None:
+            if len(parent_node.children) >= self.TREE_ASYNC_SORT_THRESHOLD:
+                self._start_tree_child_sort(parent_iid, parent_node, start, limit)
+                return
             children = self._sorted_children(parent_node)
             self._tree_page_data[parent_node.path] = children
         end = min(len(children), start + (limit or self.TREE_PAGE_SIZE))
@@ -2322,6 +2332,73 @@ class FolderLensApp(ctk.CTk):
             self.tree.insert(parent_iid, "end",
                              text=f"Show next {min(self.TREE_PAGE_SIZE, remaining):,} of {remaining:,} remaining…",
                              tags=("page",))
+
+    def _start_tree_child_sort(self, parent_iid: str, parent_node: Node,
+                               start: int, limit: Optional[int]):
+        if parent_node.path in self._tree_sort_loading_paths:
+            return
+        self._tree_sort_loading_paths.add(parent_node.path)
+        loading_iid = self.tree.insert(parent_iid, "end", text="Preparing directory listing…",
+                                       tags=("info",))
+        self._tree_sort_rows[parent_node.path] = loading_iid
+        root = self.root_node
+        scan_generation = self._scan_generation
+        filter_generation = self._filter_generation
+        generation = self._tree_generation
+        projection_key = self._projection_key()
+        filter_index = self._filter_index if self._has_active_filter() else None
+        sort_key, sort_reverse = self.sort_key, self.sort_reverse
+
+        def cancelled():
+            return (generation != self._tree_generation
+                    or scan_generation != self._scan_generation
+                    or root is not self.root_node
+                    or filter_generation != self._filter_generation
+                    or projection_key != self._projection_key())
+
+        def worker():
+            try:
+                children = (filter_index.sorted_children(
+                    parent_node, sort_key, sort_reverse, should_cancel=cancelled)
+                    if filter_index is not None else
+                    parent_node.sorted_children(sort_key, sort_reverse))
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, parent_iid, parent_node, start,
+                           limit, loading_iid, children, None)
+            except Exception as exc:
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, parent_iid, parent_node, start,
+                           limit, loading_iid, [], str(exc))
+            self._io_results.put(("tree-sort", payload))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-tree-sort-{generation}").start()
+
+    def _tree_child_sort_ready(self, generation, scan_generation, filter_generation,
+                               projection_key, root, parent_iid, parent_node, start,
+                               limit, loading_iid, children, error):
+        if (generation != self._tree_generation
+                or scan_generation != self._scan_generation
+                or filter_generation != self._filter_generation
+                or projection_key != self._projection_key()
+                or root is not self.root_node
+                or self.active_view != "Tree"
+                or self.tree is None):
+            return
+        self._tree_sort_loading_paths.discard(parent_node.path)
+        self._tree_sort_rows.pop(parent_node.path, None)
+        if self.tree.exists(loading_iid):
+            self.tree.delete(loading_iid)
+        if error:
+            self.tree.insert(parent_iid, "end", text=f"Could not sort directory: {error}",
+                             tags=("info",))
+            return
+        self._tree_page_data[parent_node.path] = children
+        self._insert_tree_children(parent_iid, parent_node, start=start, limit=limit)
 
     def _fill_tree_search(self):
         root = self.root_node

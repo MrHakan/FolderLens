@@ -163,16 +163,23 @@ class QueryIndex:
             return self.count_by_node.get(node, 0)
         return 1 if self.matches(node) else 0
 
-    def children(self, node) -> list:
+    def children(self, node, should_cancel: Optional[Callable[[], bool]] = None) -> list:
         if not node.is_dir or not self._in_scope(node):
             return []
-        return [child for child in node.children if self.count(child) > 0]
+        visible = []
+        for position, child in enumerate(node.children):
+            if should_cancel is not None and position % 256 == 0 and should_cancel():
+                return []
+            if self.count(child) > 0:
+                visible.append(child)
+        return visible
 
     def sorted_children(self, node, key: Optional[str] = None,
-                        reverse: Optional[bool] = None) -> list:
+                        reverse: Optional[bool] = None,
+                        should_cancel: Optional[Callable[[], bool]] = None) -> list:
         key = key or self.spec.sort
         reverse = self.spec.reverse if reverse is None else reverse
-        children = self.children(node)
+        children = self.children(node, should_cancel)
         if key == "name":
             value = lambda n: natural_sort_key(n.name)
         elif key == "date":
