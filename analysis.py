@@ -16,6 +16,7 @@ from file_utils import (
     get_file_extension,
     format_size,
 )
+from query import QueryEngine, QueryIndex, QuerySpec
 
 
 # --------------------------------------------------------------------- walking
@@ -53,16 +54,17 @@ def largest_files(root, limit: int = 100, filter_key: str = "all",
     if limit <= 0:
         return []
     predicate = None
-    if filter_key != "all" or name_query:
-        category_match = (lambda node: True) if filter_key == "all" else \
-            (filter_index.matches if filter_index is not None else
-             (lambda node: file_type_matches(node.name, filter_key, is_dir=False)))
+    if filter_index is not None or filter_key != "all" or name_query:
+        category_match = (filter_index.matches if filter_index is not None else
+                          ((lambda node: True) if filter_key == "all" else
+                           (lambda node: file_type_matches(node.name, filter_key, is_dir=False))))
         predicate = lambda node: category_match(node) and match_query(node.name, name_query)
 
     # A bounded heap avoids retaining every file in memory just to find the
     # top 100 on a large drive.  nlargest still returns largest-first.
     from heapq import nlargest
-    return nlargest(limit, iter_file_nodes(root, predicate), key=lambda n: n.size)
+    return nlargest(limit, iter_file_nodes(root, predicate),
+                    key=filter_index.size if filter_index is not None else lambda n: n.size)
 
 
 # --------------------------------------------------------- type breakdown
@@ -80,14 +82,14 @@ def category_breakdown(root, filter_key: str = "all", filter_index=None) -> List
     """Aggregate total size and file count per file category, largest first."""
     totals: Dict[str, List[int]] = {}
     predicate = None
-    if filter_key != "all":
+    if filter_index is not None or filter_key != "all":
         predicate = filter_index.matches if filter_index is not None else \
             (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
     for node in iter_file_nodes(root, predicate):
         cat = get_file_category(node.name, is_dir=False)
         label = cat['label']
         entry = totals.setdefault(label, [0, 0, cat['color']])
-        entry[0] += node.size
+        entry[0] += filter_index.size(node) if filter_index is not None else node.size
         entry[1] += 1
 
     total_size = sum(v[0] for v in totals.values()) or 1
@@ -105,13 +107,13 @@ def extension_breakdown(root, limit: int = 15, filter_key: str = "all",
     """Return (extension, total_size, count) tuples, largest first."""
     totals: Dict[str, List[int]] = {}
     predicate = None
-    if filter_key != "all":
+    if filter_index is not None or filter_key != "all":
         predicate = filter_index.matches if filter_index is not None else \
             (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
     for node in iter_file_nodes(root, predicate):
         ext = get_file_extension(node.name, is_dir=False)
         entry = totals.setdefault(ext, [0, 0])
-        entry[0] += node.size
+        entry[0] += filter_index.size(node) if filter_index is not None else node.size
         entry[1] += 1
     rows = [(ext, vals[0], vals[1]) for ext, vals in totals.items()]
     rows.sort(key=lambda r: r[1], reverse=True)
@@ -157,108 +159,16 @@ class TreemapAggregate:
         return ""
 
 
-class FilterIndex:
-    """In-memory projection of a scanned tree for one file category.
-
-    Only directories need stored aggregates; matching files continue to use
-    their existing size.  This keeps the filter cheap in memory while making
-    folder rows and treemap areas reflect the selected type exactly.
-    """
-
-    __slots__ = ("root", "filter_key", "size_by_node", "count_by_node")
-
-    def __init__(self, root, filter_key: str, size_by_node: Dict[object, int],
-                 count_by_node: Dict[object, int]):
-        self.root = root
-        self.filter_key = filter_key
-        self.size_by_node = size_by_node
-        self.count_by_node = count_by_node
-
-    def matches(self, node) -> bool:
-        return (not node.is_dir and
-                file_type_matches(node.name, self.filter_key, is_dir=False))
-
-    def size(self, node) -> int:
-        if getattr(node, "is_aggregate", False):
-            return node.size
-        if node.is_dir:
-            return self.size_by_node.get(node, 0)
-        return node.size if self.matches(node) else 0
-
-    def count(self, node) -> int:
-        if getattr(node, "is_aggregate", False):
-            return node.item_count
-        if node.is_dir:
-            return self.count_by_node.get(node, 0)
-        return 1 if self.matches(node) else 0
-
-    def children(self, node) -> List:
-        if not node.is_dir:
-            return []
-        return [child for child in node.children if self.count(child) > 0]
-
-    def sorted_children(self, node, key: str = "size", reverse: bool = True) -> List:
-        children = self.children(node)
-        if key == "name":
-            from file_utils import natural_sort_key
-            return sorted(children, key=lambda n: natural_sort_key(n.name), reverse=reverse)
-        if key == "date":
-            return sorted(children, key=lambda n: n.creation_date, reverse=reverse)
-        if key == "type":
-            return sorted(
-                children,
-                key=lambda n: (
-                    not n.is_dir,
-                    "" if n.is_dir else get_file_category(n.name, is_dir=False)['label'],
-                    n.name.lower(),
-                ),
-                reverse=reverse,
-            )
-        return sorted(children, key=self.size, reverse=reverse)
+# Keep the public category API while the GUI migrates to the shared engine.
+FilterIndex = QueryIndex
 
 
-def build_filter_index(root, filter_key: str, should_cancel: Optional[Callable[[], bool]] = None) -> Optional[FilterIndex]:
-    """Build directory totals for a category without any filesystem I/O.
-
-    ``should_cancel`` lets the UI abandon a stale projection when the user
-    changes filters again while a very large in-memory tree is being reduced.
-    """
+def build_filter_index(root, filter_key: str,
+                       should_cancel: Optional[Callable[[], bool]] = None) -> Optional[QueryIndex]:
+    """Project a single category from an already completed scan."""
     if filter_key not in FILE_TYPE_FILTER_LABELS or filter_key == "all":
         raise ValueError(f"Unsupported file filter: {filter_key}")
-
-    sizes: Dict[object, int] = {}
-    counts: Dict[object, int] = {}
-    stack = [(root, False)]
-    while stack:
-        if should_cancel and should_cancel():
-            return None
-        node, processed = stack.pop()
-        if not node.is_dir:
-            continue
-        if not processed:
-            stack.append((node, True))
-            for child in node.children:
-                if child.is_dir:
-                    stack.append((child, False))
-            continue
-
-        total_size = 0
-        total_count = 0
-        for index, child in enumerate(node.children):
-            if should_cancel and index % 256 == 0 and should_cancel():
-                return None
-            if child.is_dir:
-                child_count = counts.get(child, 0)
-                if child_count:
-                    total_size += sizes.get(child, 0)
-                    total_count += child_count
-            elif file_type_matches(child.name, filter_key, is_dir=False):
-                total_size += child.size
-                total_count += 1
-        sizes[node] = total_size
-        counts[node] = total_count
-
-    return FilterIndex(root, filter_key, sizes, counts)
+    return QueryEngine(root).project(QuerySpec.category(filter_key), should_cancel)
 
 
 def _normalize(sizes: List[float], area: float) -> List[float]:
@@ -460,9 +370,11 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
 # --------------------------------------------------------------- csv export
 
 def export_tree_csv(root, path: str, filter_index=None) -> int:
-    """Write the full tree or a category projection to CSV. Returns rows written."""
+    """Write the full tree or a query projection to CSV. Returns rows written."""
     rows = 0
     scope = filter_index.filter_key if filter_index is not None else "all"
+    if scope == "query":
+        scope = repr(filter_index.spec)
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items", "Scope"])
@@ -500,9 +412,11 @@ def find_matches(root, query: str, limit: int = 500, filter_key: str = "all",
     for node in iter_all_nodes(root):
         if not match_query(node.name, query):
             continue
-        if filter_key != "all":
+        if filter_index is not None or filter_key != "all":
             visible = (filter_index.count(node) if filter_index is not None
                        else (1 if file_type_matches(node.name, filter_key, is_dir=node.is_dir) else 0))
+            if filter_index is not None and not node.is_dir:
+                visible = filter_index.matches(node)
             if not visible:
                 continue
         matches.append(node)
