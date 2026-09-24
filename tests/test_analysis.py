@@ -212,6 +212,7 @@ def test_treemap_collapses_large_sibling_tail_into_an_aggregate():
     assert len(top) == 6
     assert aggregate.item_count == 15
     assert aggregate.size == sum(range(1, 16))
+    assert [node.size for node in analysis.aggregate_members(aggregate)] == list(range(15, 0, -1))
 
     only_aggregate = analysis.build_treemap(
         root, 0, 0, 100, 100, min_area=1, max_depth=1, max_children=1)

@@ -2577,7 +2577,7 @@ class FolderLensApp(ctk.CTk):
         if n.is_dir:
             lines.append(f"{self._node_count(n):,} {self._count_label()} · click to zoom in")
         elif getattr(n, "is_aggregate", False):
-            lines.append(f"{n.item_count:,} items represented here")
+            lines.append(f"{n.item_count:,} items represented here · click to browse")
         else:
             lines.append(os.path.dirname(n.path))
 
@@ -2601,10 +2601,103 @@ class FolderLensApp(ctk.CTk):
 
     def _treemap_click(self, event):
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
+        if tile and getattr(tile.node, "is_aggregate", False):
+            self._show_treemap_aggregate(tile.node)
+            return
         if tile and tile.node.is_dir and self._node_count(tile.node) > 0:
             self.treemap_stack.append(tile.node)
             self._hover_tile = None
             self._render_active_view()
+
+    def _show_treemap_aggregate(self, aggregate):
+        """Browse the omitted siblings without inserting them all into Tk."""
+        colors = self._colors()
+        window = tk.Toplevel(self)
+        window.title(f"Smaller items · {aggregate.parent.name}")
+        window.geometry("720x490")
+        window.configure(bg=colors['tree_bg'])
+        generation = self._scan_generation
+        index = self._filter_index if self._has_active_filter() else None
+        get_children = index.children if index else lambda node: node.children
+        get_size = index.size if index else lambda node: node.size
+        status = tk.Label(window, text="Preparing grouped items…", anchor="w",
+                          bg=colors['tree_bg'], fg=colors['tree_fg'])
+        status.pack(fill="x", padx=12, pady=(12, 4))
+        frame = tk.Frame(window, bg=colors['tree_bg'])
+        frame.pack(fill="both", expand=True, padx=12)
+        rows = ttk.Treeview(frame, columns=("size", "type"),
+                            style="FolderLens.Treeview", selectmode="browse")
+        rows.heading("#0", text="Name")
+        rows.heading("size", text="Logical size")
+        rows.heading("type", text="Type")
+        rows.column("#0", width=390)
+        rows.column("size", width=110, anchor="e")
+        rows.column("type", width=120)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=rows.yview)
+        rows.configure(yscrollcommand=scroll.set)
+        rows.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        button = ttk.Button(window, text="Load next 200", state="disabled")
+        button.pack(pady=9)
+        state = {"members": [], "offset": 0, "row_nodes": {}}
+
+        def load_page():
+            if generation != self._scan_generation:
+                status.configure(text="The scan changed. Reopen this list from the current map.")
+                button.configure(state="disabled")
+                return
+            members = state["members"]
+            end = min(len(members), state["offset"] + 200)
+            for node in members[state["offset"]:end]:
+                kind = "Folder" if node.is_dir else get_file_category(node.name, is_dir=False)['label']
+                iid = rows.insert("", "end", text=node.name,
+                                  values=(format_size(get_size(node)), kind))
+                state["row_nodes"][iid] = node
+            state["offset"] = end
+            status.configure(text=f"Showing {end:,} of {len(members):,} grouped entries · "
+                                  "double-click a folder to zoom")
+            button.configure(state="normal" if end < len(members) else "disabled")
+
+        def open_folder(event):
+            if generation != self._scan_generation:
+                return
+            node = state["row_nodes"].get(rows.focus())
+            if node is not None and node.is_dir:
+                self.treemap_stack.append(node)
+                window.destroy()
+                self._render_active_view()
+
+        rows.bind("<Double-Button-1>", open_folder)
+        rows.bind("<Return>", open_folder)
+        button.configure(command=load_page)
+        results = queue.SimpleQueue()
+
+        def present():
+            if not window.winfo_exists():
+                return
+            try:
+                members, error = results.get_nowait()
+            except queue.Empty:
+                window.after(25, present)
+                return
+            if error:
+                status.configure(text=f"Could not list grouped items: {error}")
+            else:
+                state["members"] = members
+                load_page()
+
+        window.after(25, present)
+
+        def worker():
+            try:
+                members = analysis.aggregate_members(aggregate, get_children, get_size)
+                error = None
+            except Exception as exc:
+                members, error = [], str(exc)
+            results.put((members, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return window
 
     def _treemap_double_click(self, event):
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
