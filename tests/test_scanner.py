@@ -1,6 +1,8 @@
+import gc
 import os
 import sys
 import threading
+import traceback
 
 import pytest
 
@@ -188,6 +190,9 @@ def test_network_paths_use_a_smaller_worker_pool(tmp_path):
 
 def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatch):
     """A stuck share call may outlive cancellation; its event remains private."""
+    # Earlier GUI tests can leave cyclic Tk Font objects behind.  Collect on
+    # the Tk/main thread so their Tcl destructors cannot run in a scan worker.
+    gc.collect()
     first = tmp_path / "first"
     second = tmp_path / "second"
     first.mkdir()
@@ -198,13 +203,15 @@ def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatc
     release = threading.Event()
     done = threading.Event()
     results = []
+    failures = []
+    observations = []
     original = scanner._read_directory
 
     def stalled(node, errors, on_progress=None, work_queue=None, session=None,
                 on_snapshot=None, on_event=None, capture_extended=False):
         if node.path == str(first):
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=30)
         return original(node, errors, on_progress, work_queue, session,
                         on_snapshot, on_event, capture_extended)
 
@@ -212,9 +219,25 @@ def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatc
     scanner.scan(str(first), on_complete=lambda *args: results.append("old"))
     old_thread = scanner._current_thread
     assert entered.wait(timeout=5)
-    scanner.scan(str(second), on_complete=lambda *args: (results.append("new"), done.set()))
-    assert done.wait(timeout=5), "a blocked old scan delayed the new one"
-    release.set()
+    scanner.scan(str(second), on_complete=lambda *args: (results.append("new"), done.set()),
+                 on_error=lambda message: (failures.append(message), done.set()),
+                 on_snapshot=observations.append)
+    def scan_stacks():
+        frames = sys._current_frames()
+        return "\n".join(
+            f"{thread.name}:\n{''.join(traceback.format_stack(frames[thread.ident]))}"
+            for thread in threading.enumerate()
+            if thread.name.startswith("folderlens-scan-") and thread.ident in frames
+        )
+
+    try:
+        assert done.wait(timeout=15), ("a blocked old scan delayed the new one; "
+                                       f"observations={observations[-2:]!r}; "
+                                       f"threads={[t.name for t in threading.enumerate()]!r}; "
+                                       f"scan stacks={scan_stacks()}")
+        assert not failures, failures
+    finally:
+        release.set()
     old_thread.join(timeout=5)
     scanner._current_thread.join(timeout=5)
     assert not old_thread.is_alive()

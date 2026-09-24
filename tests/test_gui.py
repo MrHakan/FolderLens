@@ -445,6 +445,24 @@ def test_slow_disk_usage_cannot_overwrite_new_scan_status(gui):
     assert gui.status_disk.cget("text") == "fresh"
 
 
+def test_old_duplicate_result_cannot_replace_new_scan(gui):
+    old_generation = gui._duplicate_generation
+    gui._invalidate_duplicate_scan()
+    gui._duplicate_scan_done([object()], old_generation)
+    assert gui.dup_groups == []
+
+
+def test_network_duplicate_read_requires_explicit_choice(gui, monkeypatch):
+    import app as appmod
+    gui._is_network_root = True
+    prompts = []
+    monkeypatch.setattr(appmod.messagebox, "askyesno",
+                        lambda *args, **kwargs: (prompts.append(args[1]), False)[1])
+    gui._start_duplicate_scan()
+    assert prompts and "reads file contents over the network" in prompts[0]
+    assert not gui._dup_running
+
+
 def test_treemap_hit_testing_uses_geometry(gui):
     show(gui, "Treemap")
     gui.treemap_canvas.configure(width=640, height=440)
