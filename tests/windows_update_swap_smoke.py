@@ -24,8 +24,11 @@ def run_swap(current: Path, replacement: Path, backup: Path, log: Path):
         "FL_UPDATE_TEST_DELAY": "0",
         "FL_UPDATE_NO_RESTART": "1",
     })
-    return subprocess.run(["cmd", "/c", script], env=env, timeout=60,
-                          capture_output=True, text=True)
+    try:
+        return subprocess.run(["cmd", "/c", script], env=env, timeout=60,
+                              capture_output=True, text=True)
+    finally:
+        os.unlink(script)
 
 
 def main(exe: str):

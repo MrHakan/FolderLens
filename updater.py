@@ -43,7 +43,6 @@ if "%FL_UPDATE_NO_RESTART%"=="1" goto success
 start "" "%FL_UPDATE_CURRENT%"
 if errorlevel 1 goto remove_new
 :success
-del "%~f0"
 exit /b 0
 :remove_new
 del /f /q "%FL_UPDATE_CURRENT%" >nul 2>&1
@@ -52,7 +51,6 @@ move /y "%FL_UPDATE_BACKUP%" "%FL_UPDATE_CURRENT%" >nul 2>&1
 if errorlevel 1 echo Rollback failed. Restore "%FL_UPDATE_BACKUP%" manually. > "%FL_UPDATE_LOG%"
 :failed
 del /f /q "%FL_UPDATE_NEW%" >nul 2>&1
-del "%~f0"
 exit /b 1
 '''
     fd, path = tempfile.mkstemp(prefix='folderlens_update_', suffix='.cmd')
