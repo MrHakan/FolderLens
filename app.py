@@ -8,6 +8,7 @@ import os
 import sys
 import shutil
 import subprocess
+import tempfile
 import threading
 import zipfile
 
@@ -80,6 +81,8 @@ class AppSettings:
         try:
             with open(_settings_file(), 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                return
             if data.get('row_size') in ("small", "medium", "large"):
                 self.row_size = data['row_size']
             if isinstance(data.get('preview_enabled'), bool):
@@ -103,11 +106,15 @@ class AppSettings:
             pass
 
     def save(self):
+        temporary_path = None
         try:
             path = _settings_file()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
+            fd, temporary_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp",
+                                                   dir=os.path.dirname(path))
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump({
+                    'schema_version': 1,
                     'row_size': self.row_size,
                     'preview_enabled': self.preview_enabled,
                     'dark_mode': self.dark_mode,
@@ -120,8 +127,18 @@ class AppSettings:
                     'annotation_mode': self.annotation_mode,
                     'use_recycle_bin': self.use_recycle_bin,
                 }, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
         except OSError:
             pass
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
 
 
 DARK = {
@@ -932,6 +949,9 @@ class FolderLensApp(ctk.CTk):
         self._filter_generation = 0
         self._filter_building = False
         self._is_network_root = False
+        self._places = None
+        self._places_loading = False
+        self._places_grid = None
 
         # tree-view state
         self.tree: Optional[ttk.Treeview] = None
@@ -981,11 +1001,31 @@ class FolderLensApp(ctk.CTk):
         self.bind("<Escape>", lambda e: self._clear_search())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        start = initial_path or (self.settings.last_folder if os.path.isdir(self.settings.last_folder or "") else None)
-        if start and os.path.isdir(start):
-            self.after(120, lambda: self.scan_folder(os.path.abspath(start)))
+        if initial_path:
+            self.after(120, lambda: self.scan_folder(os.path.abspath(initial_path)))
+        elif self.settings.last_folder:
+            last_folder = self.settings.last_folder
+
+            def check_last_folder():
+                exists = os.path.isdir(last_folder)
+                try:
+                    self.after(0, lambda: self._restore_last_folder(last_folder, exists))
+                except RuntimeError:  # window closed while a network path was checked
+                    pass
+
+            threading.Thread(target=check_last_folder, daemon=True).start()
+            self._set_status("Checking last folder…")
         else:
             self._set_status("Select a folder to analyze")
+
+    def _restore_last_folder(self, path: str, exists: bool):
+        # A selection made while a slow mapped drive was checked wins.
+        if self._scan_generation != 0 or self.root_node is not None:
+            return
+        if exists:
+            self.scan_folder(os.path.abspath(path))
+        else:
+            self._set_status("Last folder unavailable; choose a place to scan")
 
     # -------------------------------------------------------------- chrome
 
@@ -1471,16 +1511,29 @@ class FolderLensApp(ctk.CTk):
         if not self.root_node:
             return
         parent = os.path.dirname(self.root_node.path.rstrip("\\/"))
-        if parent and parent != self.root_node.path and os.path.isdir(parent):
+        if parent and parent != self.root_node.path:
             self.scan_folder(parent)
 
     def _update_disk(self, path: str):
-        try:
-            usage = shutil.disk_usage(path)
-            self.status_disk.configure(
-                text=f"Disk: {format_size(usage.free)} free of {format_size(usage.total)}")
-        except OSError:
-            self.status_disk.configure(text="")
+        generation = self._scan_generation
+
+        def worker():
+            try:
+                usage = shutil.disk_usage(path)
+                label = f"Disk: {format_size(usage.free)} free of {format_size(usage.total)}"
+            except OSError:
+                label = ""
+            try:
+                self.after(0, lambda: self._disk_usage_ready(generation, path, label))
+            except RuntimeError:  # window closed while filesystem I/O was blocked
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _disk_usage_ready(self, generation: int, path: str, label: str):
+        if (generation == self._scan_generation and self.root_node is not None
+                and self.root_node.path == path):
+            self.status_disk.configure(text=label)
 
     def _show_progress(self, active: bool):
         if active:
@@ -1658,15 +1711,46 @@ class FolderLensApp(ctk.CTk):
 
         grid = tk.Frame(centre, bg=colors['tree_bg'])
         grid.pack()
-        for index, place in enumerate(locations.start_places()[:12]):
-            self._place_card(grid, place, colors).grid(
-                row=index // 4, column=index % 4, padx=7, pady=7)
+        self._places_grid = grid
+        if self._places is None:
+            tk.Label(grid, text="Loading places…", bg=colors['tree_bg'],
+                     fg=colors['muted_fg']).pack()
+            if not self._places_loading:
+                self._places_loading = True
+
+                def load_places():
+                    try:
+                        places = locations.start_places()[:12]
+                    except OSError:
+                        places = []
+                    try:
+                        self.after(0, lambda: self._places_ready(places))
+                    except RuntimeError:  # app closed while a drive was checked
+                        pass
+
+                threading.Thread(target=load_places, daemon=True).start()
+        else:
+            self._render_places(grid, colors)
 
         browse = tk.Label(centre, text="⌕  Browse for another folder…",
                           bg=colors['tree_bg'], fg=ACCENT, cursor="hand2",
                           font=("Segoe UI", 11, "underline"))
         browse.pack(pady=(20, 0))
         browse.bind("<Button-1>", lambda e: self._browse_folder())
+
+    def _places_ready(self, places):
+        self._places = places
+        self._places_loading = False
+        grid = self._places_grid
+        if grid is not None and grid.winfo_exists():
+            for child in grid.winfo_children():
+                child.destroy()
+            self._render_places(grid, self._colors())
+
+    def _render_places(self, grid, colors):
+        for index, place in enumerate(self._places):
+            self._place_card(grid, place, colors).grid(
+                row=index // 4, column=index % 4, padx=7, pady=7)
 
     def _place_card(self, parent, place, colors):
         """One clickable tile on the start screen, with its free space."""

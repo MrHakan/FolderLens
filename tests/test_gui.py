@@ -437,6 +437,14 @@ def test_advanced_filter_projection_and_action_scope(gui):
     assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
 
 
+def test_slow_disk_usage_cannot_overwrite_new_scan_status(gui):
+    gui.status_disk.configure(text="current")
+    gui._disk_usage_ready(gui._scan_generation - 1, gui.root_node.path, "stale")
+    assert gui.status_disk.cget("text") == "current"
+    gui._disk_usage_ready(gui._scan_generation, gui.root_node.path, "fresh")
+    assert gui.status_disk.cget("text") == "fresh"
+
+
 def test_treemap_hit_testing_uses_geometry(gui):
     show(gui, "Treemap")
     gui.treemap_canvas.configure(width=640, height=440)
