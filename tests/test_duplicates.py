@@ -50,6 +50,15 @@ def test_finds_identical_files(tree):
     assert group.wasted == 18000            # two redundant copies
 
 
+def test_read_budget_stops_before_reporting_partial_duplicate_results(tree):
+    root = scan(tree)
+    with pytest.raises(duplicates.DuplicateBudgetExceeded, match="read budget"):
+        duplicates.find_duplicates(root, min_size=1, max_read_bytes=10_000)
+    with pytest.raises(duplicates.DuplicateBudgetExceeded, match="time budget"):
+        duplicates.find_duplicates(root, min_size=1, max_seconds=0)
+    assert duplicates.find_duplicates(root, min_size=1, max_read_bytes=100_000)[0].count == 3
+
+
 def test_same_size_different_content_is_not_a_duplicate(tree):
     groups = duplicates.find_duplicates(scan(tree), min_size=1)
     names = {n.name for g in groups for n in g.nodes}

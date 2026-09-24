@@ -971,6 +971,7 @@ class FolderLensApp(ctk.CTk):
         self.dup_groups: List[duplicates.DuplicateGroup] = []
         self._dup_running = False
         self._dup_cancel = False
+        self._duplicate_generation = 0
 
         # treemap state
         self.treemap_stack: List[Node] = []
@@ -1432,6 +1433,7 @@ class FolderLensApp(ctk.CTk):
         self._is_network_root = is_network_path(path)
         self._invalidate_filter_index()
         self._query_engine = None
+        self._invalidate_duplicate_scan()
         self.treemap_stack = []
         self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
@@ -1578,8 +1580,7 @@ class FolderLensApp(ctk.CTk):
         self.settings.save()
         self.treemap_stack = []
         # Duplicate results are specific to the active type projection.
-        self._dup_cancel = True
-        self.dup_groups = []
+        self._invalidate_duplicate_scan()
         self._invalidate_filter_index()
 
         if key == "all" or self.root_node is None:
@@ -1648,8 +1649,7 @@ class FolderLensApp(ctk.CTk):
             self.settings.file_filter = "all"
             self.settings.save()
             self.treemap_stack = []
-            self._dup_cancel = True
-            self.dup_groups = []
+            self._invalidate_duplicate_scan()
             self._invalidate_filter_index()
             window.destroy()
             if self.root_node is None or not self._has_active_filter():
@@ -2175,7 +2175,7 @@ class FolderLensApp(ctk.CTk):
         headings = {
             "#0": ("File / group", lambda: None),
             "size": ("Size", lambda: None),
-            "wasted": ("Reclaimable", lambda: None),
+            "wasted": ("Potential bytes", lambda: None),
             "path": ("Location", lambda: None),
         }
         widths = {
@@ -2194,7 +2194,7 @@ class FolderLensApp(ctk.CTk):
             self._fill_duplicates()
         else:
             self.dup_status.configure(
-                text="Find byte-identical copies and reclaim the space they waste")
+                text="Find byte-identical copies; potential bytes are not guaranteed disk savings")
 
     def _on_duplicate_double(self, event):
         node = self.dup_map.get(self.dup_tree.identify_row(event.y))
@@ -2207,12 +2207,27 @@ class FolderLensApp(ctk.CTk):
             return
         self._start_duplicate_scan()
 
+    def _invalidate_duplicate_scan(self):
+        self._duplicate_generation += 1
+        self._dup_cancel = True
+        self._dup_running = False
+        self.dup_groups = []
+
     def _start_duplicate_scan(self):
         root = self.root_node
         if not root:
             return
+        if self._is_network_root and not messagebox.askyesno(
+                "Read network files?",
+                "Finding duplicates reads file contents over the network. "
+                "Limit this scan to 1 GiB of reads or two minutes?",
+                parent=self):
+            return
         filter_index = self._filter_index
         filter_key = self.file_filter
+        network = self._is_network_root
+        self._duplicate_generation += 1
+        generation = self._duplicate_generation
         self._dup_running = True
         self._dup_cancel = False
         self.dup_button.configure(text="Stop")
@@ -2220,19 +2235,24 @@ class FolderLensApp(ctk.CTk):
 
         def report(stage, done, total):
             if total:
-                self.after(0, lambda: self._safe_dup_status(f"{stage}… {done:,}/{total:,}"))
+                self.after(0, lambda: self._safe_dup_status(f"{stage}… {done:,}/{total:,}")
+                           if generation == self._duplicate_generation else None)
 
         def worker():
             try:
                 found = duplicates.find_duplicates(
                     root, min_size=self.DUPLICATE_MIN_SIZE,
-                    progress=report, should_cancel=lambda: self._dup_cancel,
-                    filter_key=filter_key, filter_index=filter_index)
+                    progress=report,
+                    should_cancel=lambda: (self._dup_cancel or generation != self._duplicate_generation
+                                           or root is not self.root_node),
+                    filter_key=filter_key, filter_index=filter_index,
+                    max_read_bytes=(1 << 30) if network else None,
+                    max_seconds=120 if network else None)
             except Exception as exc:
                 message = str(exc)
-                self.after(0, lambda: self._duplicate_scan_failed(message))
+                self.after(0, lambda: self._duplicate_scan_failed(message, generation))
                 return
-            self.after(0, lambda: self._duplicate_scan_done(found))
+            self.after(0, lambda: self._duplicate_scan_done(found, generation))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2243,7 +2263,9 @@ class FolderLensApp(ctk.CTk):
             except tk.TclError:
                 pass
 
-    def _duplicate_scan_failed(self, message: str):
+    def _duplicate_scan_failed(self, message: str, generation: int):
+        if generation != self._duplicate_generation:
+            return
         self._dup_running = False
         self._safe_dup_status(f"Failed: {message}")
         if self.active_view == "Duplicates":
@@ -2252,7 +2274,9 @@ class FolderLensApp(ctk.CTk):
             except tk.TclError:
                 pass
 
-    def _duplicate_scan_done(self, groups):
+    def _duplicate_scan_done(self, groups, generation: int):
+        if generation != self._duplicate_generation:
+            return
         self._dup_running = False
         cancelled = self._dup_cancel
         self.dup_groups = groups
@@ -2278,9 +2302,9 @@ class FolderLensApp(ctk.CTk):
             self._safe_dup_status("No duplicate files found")
             return
 
-        reclaimable = duplicates.total_wasted(self.dup_groups)
+        potential = duplicates.total_wasted(self.dup_groups)
         self._safe_dup_status(
-            f"{len(self.dup_groups):,} groups · {format_size(reclaimable)} reclaimable")
+            f"{len(self.dup_groups):,} groups · {format_size(potential)} potential logical bytes")
 
         for group in self.dup_groups:
             parent = tree.insert(
@@ -2848,6 +2872,7 @@ class FolderLensApp(ctk.CTk):
         if self.root_node:
             if deleted:
                 self._invalidate_filter_index()
+                self._invalidate_duplicate_scan()
                 # Delete mutates the completed tree in place. Projections
                 # cached for this root no longer describe its children.
                 self._query_engine = None
