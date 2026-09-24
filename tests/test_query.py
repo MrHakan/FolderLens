@@ -162,3 +162,35 @@ def test_include_hidden_filters_windows_hidden_files_and_folders():
     assert not index.matches(flagged)
     assert not index.matches(nested)
     assert index.size(images) == 300
+
+
+def test_builtin_presets_resolve_relative_dates_and_validate():
+    from datetime import date
+    from query import builtin_presets
+    presets = builtin_presets(date(2026, 9, 24))
+    assert presets["Images only"]["categories"] == ["image"]
+    assert presets["Not modified for a year"]["modified_before"] == "2025-09-24"
+    spec = query_from_form(**presets["Large videos (1 GiB or more)"])
+    assert spec.categories == ("video",) and spec.min_size == 1024 * 1048576
+
+
+def test_user_presets_drop_invalid_entries_instead_of_failing():
+    from query import load_presets, normalize_preset
+    loaded = load_presets({
+        "Old logs": {"extensions": ".log", "modified_before": "2024-01-01"},
+        "bad category": {"categories": ["nope"]},
+        "bad date": {"modified_after": "yesterday"},
+        "": {"name": "x"},
+        "wrong type": ["image"],
+    })
+    assert list(loaded) == ["Old logs"]
+    assert loaded["Old logs"]["include_hidden"] is True
+    with pytest.raises(ValueError):
+        normalize_preset({"include_hidden": "yes"})
+    assert load_presets(None) == {}
+
+
+def test_query_from_form_carries_the_size_metric():
+    assert query_from_form(metric="allocated").metric == "allocated"
+    with pytest.raises(ValueError):
+        query_from_form(metric="cubits")

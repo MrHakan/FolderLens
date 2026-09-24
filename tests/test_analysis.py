@@ -310,3 +310,54 @@ def test_json_and_csv_exports_share_query_scope_and_partial_metadata(tmp_path):
     assert report["metric"] == "logical"
     assert report["scan"] == {
         "status": "partial", "partial": True, "inaccessible_count": 2}
+
+
+def test_age_breakdown_uses_modified_time_buckets_and_unknown():
+    day = 86_400 * 1_000_000_000
+    now = 10_000 * day
+    root = Node(path="/r", name="r", is_dir=True)
+    files = [
+        Node(path=None, name="new.txt", is_dir=False, size=10, parent=root,
+             modified_date=now - 2 * day),
+        Node(path=None, name="year.jpg", is_dir=False, size=20, parent=root,
+             modified_date=now - 400 * day),
+        Node(path=None, name="ancient.jpg", is_dir=False, size=30, parent=root,
+             modified_date=now - 2000 * day),
+        Node(path=None, name="nodate.jpg", is_dir=False, size=40, parent=root),
+    ]
+    root.children = files
+    stats = analysis.age_breakdown(root, now_ns=now)
+    assert [(s.label, s.size, s.count) for s in stats] == [
+        ("Last 30 days", 10, 1), ("1–3 years", 20, 1),
+        ("Older than 3 years", 30, 1), ("Unknown date", 40, 1)]
+    assert abs(sum(s.percent for s in stats) - 100) < 1e-9
+    images = analysis.age_breakdown(root, filter_key="image", now_ns=now)
+    assert [s.label for s in images] == ["1–3 years", "Older than 3 years", "Unknown date"]
+
+
+def test_storage_summary_counts_hardlinks_once_only_when_identity_is_known():
+    root = Node(path="/r", name="r", is_dir=True)
+    a = Node(path=None, name="a", is_dir=False, size=100, parent=root,
+             metadata=(4096, (1, 7), 2, False, False))
+    b = Node(path=None, name="b", is_dir=False, size=100, parent=root,
+             metadata=(4096, (1, 7), 2, False, False))
+    c = Node(path=None, name="c", is_dir=False, size=10, parent=root,
+             metadata=(4096, None, 1, False, False))
+    root.children = [a, b, c]
+    summary = analysis.storage_summary(root)
+    assert summary.logical_bytes == 210
+    assert summary.allocated_bytes == 3 * 4096
+    assert summary.unique_allocated_bytes == 2 * 4096
+    assert summary.hardlinked_files == 2 and summary.unknown_allocation == 0
+
+    b._metadata = (4096, None, 2, False, False)   # identity unavailable
+    assert analysis.storage_summary(root).unique_allocated_bytes is None
+
+
+def test_storage_summary_reports_unknown_allocation_without_guessing():
+    root = make_tree()
+    summary = analysis.storage_summary(root)
+    assert summary.allocated_bytes is None
+    assert summary.unique_allocated_bytes is None
+    assert summary.unknown_allocation == summary.files == 4
+    assert summary.logical_bytes == 950

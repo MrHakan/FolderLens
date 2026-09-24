@@ -5,6 +5,7 @@ import tkinter.font as tkfont
 from typing import Optional, List, Dict
 import copy
 from dataclasses import replace
+from types import SimpleNamespace
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import webbrowser
 
 from PIL import Image, ImageOps, ImageTk
@@ -26,7 +28,8 @@ from file_utils import (
 from scanner import TreeScanner, Node, ScanSnapshot, is_network_path
 import analysis
 import file_actions
-from query import QueryEngine, QueryIndex, QuerySpec, query_from_form
+from query import (QueryEngine, QueryIndex, QuerySpec, builtin_presets, load_presets,
+                   normalize_preset, query_from_form, MAX_PRESETS)
 import annotate
 import duplicates
 import imagenav
@@ -74,6 +77,8 @@ class AppSettings:
         self.peek_preview = True
         self.annotation_mode = "Basic"
         self.use_recycle_bin = True
+        self.measure_on_disk = False
+        self.filter_presets = {}
         self.load()
 
     def row_height(self) -> int:
@@ -102,11 +107,12 @@ class AppSettings:
                     and data['file_filter'] in FILE_TYPE_FILTER_LABELS):
                 self.file_filter = data['file_filter']
             for flag in ('treemap_thumbnails', 'list_thumbnails', 'peek_preview',
-                         'use_recycle_bin'):
+                         'use_recycle_bin', 'measure_on_disk'):
                 if isinstance(data.get(flag), bool):
                     setattr(self, flag, data[flag])
             if data.get('annotation_mode') in ("Basic", "Advanced"):
                 self.annotation_mode = data['annotation_mode']
+            self.filter_presets = dict(load_presets(data.get('filter_presets')))
         except (OSError, ValueError):
             pass
 
@@ -119,7 +125,7 @@ class AppSettings:
                                                    dir=os.path.dirname(path))
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'schema_version': 1,
+                    'schema_version': 2,
                     'row_size': self.row_size,
                     'preview_enabled': self.preview_enabled,
                     'dark_mode': self.dark_mode,
@@ -131,6 +137,8 @@ class AppSettings:
                     'peek_preview': self.peek_preview,
                     'annotation_mode': self.annotation_mode,
                     'use_recycle_bin': self.use_recycle_bin,
+                    'measure_on_disk': self.measure_on_disk,
+                    'filter_presets': self.filter_presets,
                 }, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
@@ -1011,6 +1019,15 @@ class SettingsMenu(ctk.CTkToplevel):
         ctk.CTkSwitch(main, text="Show small previews in lists",
                       variable=self.list_thumbs_var).pack(anchor="w", pady=6)
 
+        ctk.CTkLabel(main, text="Scanning", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(12, 0))
+        self.on_disk_var = ctk.BooleanVar(value=self.settings.measure_on_disk)
+        ctk.CTkSwitch(main, text="Measure on-disk size and hardlinks",
+                      variable=self.on_disk_var).pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(main, text="Local drives only. Adds file-system calls per file, so\n"
+                                "scans are slower. Applies to the next scan.",
+                     font=ctk.CTkFont(size=11), text_color="gray",
+                     justify="left").pack(anchor="w", pady=(2, 6))
+
         ctk.CTkLabel(main, text="Deleting", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(12, 0))
         self.recycle_var = ctk.BooleanVar(value=self.settings.use_recycle_bin)
         ctk.CTkSwitch(main, text="Send deleted files to the Recycle Bin",
@@ -1032,6 +1049,7 @@ class SettingsMenu(ctk.CTkToplevel):
         self.settings.list_thumbnails = self.list_thumbs_var.get()
         self.settings.annotation_mode = self.annotation_var.get()
         self.settings.use_recycle_bin = self.recycle_var.get()
+        self.settings.measure_on_disk = self.on_disk_var.get()
         self.on_apply()
         self.destroy()
 
@@ -1176,6 +1194,8 @@ class FolderLensApp(ctk.CTk):
         self._search_after = None
         self.file_filter = self.settings.file_filter
         self._advanced_spec: Optional[QuerySpec] = None
+        self._advanced_filter_controls = None
+        self._scan_measures_on_disk = False
         self._filter_index: Optional[QueryIndex] = None
         self._filter_index_key: Optional[object] = None
         self._query_engine: Optional[QueryEngine] = None
@@ -1385,6 +1405,13 @@ class FolderLensApp(ctk.CTk):
         add_hint(refresh, "Rescan this folder  (F5)")
         self.cancel_btn = ctk.CTkButton(r1, text="✕ Stop", width=68, height=34, font=ctk.CTkFont(size=12),
                                         fg_color="#b91c1c", hover_color="#991b1b", command=self._cancel_scan)
+        self.skip_btn = ctk.CTkButton(r1, text="⏭ Skip folder", width=104, height=34,
+                                      font=ctk.CTkFont(size=12), fg_color="transparent",
+                                      border_width=1, text_color=("gray20", "gray80"),
+                                      command=self._skip_slow_folder)
+        add_hint(self.skip_btn, "Stop waiting for the folder that is not responding.\n"
+                                "The scan finishes without it and is marked partial.")
+        self._skip_candidate = None
 
         self.view_switch = ctk.CTkSegmentedButton(
             r1, values=self.VIEWS, command=self._on_view_change,
@@ -1745,6 +1772,7 @@ class FolderLensApp(ctk.CTk):
         self._scan_completed = False
         self._scan_observed_count = 0
         self._latest_scan_snapshot = None
+        self._hide_skip_button()
         self.settings.last_folder = path
         self.settings.save()
         self._is_network_root = is_network_path(path)
@@ -1767,6 +1795,9 @@ class FolderLensApp(ctk.CTk):
         self._clear_body()
         self._empty_hint("Scanning folder…")
 
+        # On-disk sizes cost extra calls per file; never on a network share.
+        self._scan_measures_on_disk = (self.settings.measure_on_disk
+                                       and not self._is_network_root)
         self.scanner.scan(
             path,
             on_complete=lambda root, errors, t: self.after(
@@ -1774,7 +1805,47 @@ class FolderLensApp(ctk.CTk):
             on_error=lambda msg: self.after(0, lambda: self._scan_failed_if_current(generation, msg)),
             on_snapshot=lambda snapshot: self.after(
                 0, lambda: self._scan_snapshot(generation, snapshot)),
+            capture_extended=self._scan_measures_on_disk,
         )
+        self.after(self.SCAN_WATCH_MS, lambda: self._watch_scan(generation))
+
+    SCAN_WATCH_MS = 500
+
+    def _watch_scan(self, generation: int):
+        """Poll the scan while it runs: a stuck share call fires no callbacks,
+        so a slow folder is only noticed by asking."""
+        if generation != self._scan_generation or self._scan_completed:
+            return
+        try:
+            snapshot = self.scanner.current_snapshot()
+        except Exception:
+            snapshot = None
+        slow = snapshot.slow_directories if snapshot is not None else ()
+        if slow:
+            path, seconds = slow[0]
+            self._skip_candidate = path
+            name = os.path.basename(path.rstrip("\\/")) or path
+            self._set_status(f"Waiting {seconds:.0f}s for “{name}” to respond… "
+                             f"You can skip this folder.")
+            if not self.skip_btn.winfo_manager():
+                placement = ({"after": self.cancel_btn} if self.cancel_btn.winfo_manager()
+                             else {})
+                self.skip_btn.pack(side="left", padx=3, pady=9, **placement)
+        else:
+            self._hide_skip_button()
+        self.after(self.SCAN_WATCH_MS, lambda: self._watch_scan(generation))
+
+    def _hide_skip_button(self):
+        self._skip_candidate = None
+        if self.skip_btn.winfo_manager():
+            self.skip_btn.pack_forget()
+
+    def _skip_slow_folder(self):
+        path = self._skip_candidate
+        self._hide_skip_button()
+        if path and self.scanner.skip_directory(path):
+            name = os.path.basename(path.rstrip("\\/")) or path
+            self._set_status(f"Skipped “{name}”. The results will be marked partial.")
 
     def _scan_snapshot(self, generation: int, snapshot: ScanSnapshot):
         if (generation != self._scan_generation or self._scan_completed
@@ -1875,9 +1946,14 @@ class FolderLensApp(ctk.CTk):
         self._show_progress(False)
         self.cancel_btn.pack_forget()
 
+        self._hide_skip_button()
+        skipped = sum(1 for message in errors if message.startswith("Skipped by user:"))
+        inaccessible = len(errors) - skipped
         status = f"{root.item_count:,} items · {scan_time:.1f}s"
-        if errors:
-            status += f"  ·  ⚠ {len(errors)} inaccessible"
+        if inaccessible:
+            status += f"  ·  ⚠ {inaccessible} inaccessible"
+        if skipped:
+            status += f"  ·  ⏭ {skipped} skipped (partial)"
         self._set_status(status)
         self._set_view_total()
         self._update_disk(root.path)
@@ -1888,6 +1964,7 @@ class FolderLensApp(ctk.CTk):
 
     def _scan_failed(self, message: str):
         self._scan_completed = True
+        self._hide_skip_button()
         self._show_progress(False)
         self.cancel_btn.pack_forget()
         self._set_status("Scan failed")
@@ -1897,13 +1974,31 @@ class FolderLensApp(ctk.CTk):
 
     def _cancel_scan(self):
         self._scan_generation += 1
+        generation = self._scan_generation
         self._scan_completed = True
         self.scanner.cancel()
-        self._set_status("Scan cancelled")
+        self._hide_skip_button()
         self._show_progress(False)
         self.cancel_btn.pack_forget()
         self._clear_body()
         self._empty_hint("Scan cancelled")
+        self._report_scan_stopping(generation, time.monotonic())
+
+    def _report_scan_stopping(self, generation: int, started: float):
+        """Say "cancelled" only once the scan has really stopped; a share call
+        that is stuck in the OS cannot be interrupted, so say so honestly.
+        A new scan can start at any time; this report then just ends."""
+        if generation != self._scan_generation:
+            return
+        if not self.scanner.is_scanning:
+            self._set_status("Scan cancelled")
+            return
+        waited = time.monotonic() - started
+        if waited < 1.0:
+            self._set_status("Stopping scan…")
+        else:
+            self._set_status(f"Stopping scan… waiting {waited:.0f}s for the file system to respond")
+        self.after(250, lambda: self._report_scan_stopping(generation, started))
 
     def _begin_file_action(self, status: str):
         if self._action_running:
@@ -2035,6 +2130,19 @@ class FolderLensApp(ctk.CTk):
         ctk.CTkLabel(body, text="Match files", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(body, text="Within a field, choices use OR. Between fields, conditions use AND.",
                      text_color="gray", wraplength=450).pack(anchor="w", pady=(2, 10))
+
+        preset_row = ctk.CTkFrame(body, fg_color="transparent")
+        preset_row.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(preset_row, text="Preset").pack(side="left", padx=(0, 8))
+        preset_var = ctk.StringVar(value="Choose…")
+        preset_menu = ctk.CTkOptionMenu(preset_row, variable=preset_var, width=250,
+                                        dynamic_resizing=False)
+        preset_menu.pack(side="left")
+        delete_preset = ctk.CTkButton(preset_row, text="Delete", width=64,
+                                      fg_color="transparent", border_width=1,
+                                      text_color=("gray20", "gray80"))
+        delete_preset.pack(side="left", padx=(8, 0))
+
         ctk.CTkLabel(body, text="File types (none selected means all)").pack(anchor="w")
         categories_frame = ctk.CTkFrame(body, fg_color="transparent")
         categories_frame.pack(fill="x")
@@ -2066,13 +2174,101 @@ class FolderLensApp(ctk.CTk):
         hidden = ctk.BooleanVar(value=spec.include_hidden)
         ctk.CTkCheckBox(body, text="Include hidden files", variable=hidden).pack(anchor="w", pady=12)
 
+        # On-disk sizes exist only when the scan measured every file.
+        on_disk_known = (self.root_node is not None
+                         and self.root_node.allocated_size is not None)
+        metric_var = ctk.StringVar(value="On disk" if spec.metric == "allocated" and on_disk_known
+                                   else "Logical")
+        ctk.CTkLabel(body, text="Size used for totals and size limits").pack(anchor="w")
+        metric_switch = ctk.CTkSegmentedButton(body, values=["Logical", "On disk"],
+                                               variable=metric_var)
+        metric_switch.pack(anchor="w", pady=(2, 2))
+        if not on_disk_known:
+            metric_switch.configure(state="disabled")
+            ctk.CTkLabel(body, text="On-disk size needs a local scan with “Measure on-disk size” "
+                                    "enabled in Settings.",
+                         text_color="gray", wraplength=450).pack(anchor="w")
+
+        fields = {"extensions": ext, "name": name, "min_mib": lower, "max_mib": upper,
+                  "modified_after": after, "modified_before": before}
+
+        def current_form():
+            form = {field_name: widget.get() for field_name, widget in fields.items()}
+            form["categories"] = [key for key, variable in category_vars.items() if variable.get()]
+            form["include_hidden"] = hidden.get()
+            return form
+
+        def fill_form(form):
+            for key, variable in category_vars.items():
+                variable.set(key in form["categories"])
+            for field_name, widget in fields.items():
+                widget.delete(0, "end")
+                if form[field_name]:
+                    widget.insert(0, form[field_name])
+            hidden.set(form["include_hidden"])
+
+        def refresh_presets():
+            names = list(builtin_presets()) + [f"★ {preset}" for preset in self.settings.filter_presets]
+            preset_menu.configure(values=names + ["Save current as preset…"])
+
+        def choose_preset(choice):
+            if choice == "Save current as preset…":
+                preset_var.set("Choose…")
+                save_preset()
+                return
+            if choice.startswith("★ "):
+                form = self.settings.filter_presets.get(choice[2:])
+            else:
+                form = builtin_presets().get(choice)
+            if form is not None:
+                fill_form(form)
+
+        def save_preset():
+            try:
+                form = normalize_preset(current_form())
+            except (ValueError, ArithmeticError, OverflowError) as exc:
+                messagebox.showerror("Invalid filter", str(exc), parent=window)
+                return
+            label = simpledialog.askstring("Save preset", "Preset name:", parent=window)
+            label = (label or "").strip()
+            if not label:
+                return
+            presets = self.settings.filter_presets
+            if label not in presets and len(presets) >= MAX_PRESETS:
+                messagebox.showerror("Save preset", f"You can keep up to {MAX_PRESETS} presets.",
+                                     parent=window)
+                return
+            presets[label] = form
+            self.settings.save()
+            refresh_presets()
+            preset_var.set(f"★ {label}")
+
+        def remove_preset():
+            choice = preset_var.get()
+            if not choice.startswith("★ "):
+                return
+            self.settings.filter_presets.pop(choice[2:], None)
+            self.settings.save()
+            refresh_presets()
+            preset_var.set("Choose…")
+
+        preset_menu.configure(command=choose_preset)
+        delete_preset.configure(command=remove_preset)
+        refresh_presets()
+        self._advanced_filter_controls = SimpleNamespace(
+            window=window, fill_form=fill_form, current_form=current_form,
+            choose_preset=choose_preset, save_preset=save_preset, remove_preset=remove_preset,
+            preset_var=preset_var, preset_menu=preset_menu, metric_var=metric_var)
+
         def apply():
             try:
                 chosen = query_from_form(
                     categories=(key for key, variable in category_vars.items() if variable.get()),
                     extensions=ext.get(), name=name.get(), min_mib=lower.get(), max_mib=upper.get(),
                     modified_after=after.get(), modified_before=before.get(),
-                    include_hidden=hidden.get())
+                    include_hidden=hidden.get(),
+                    metric="allocated" if metric_var.get() == "On disk" and on_disk_known
+                    else "logical")
             except (ValueError, ArithmeticError, OverflowError) as exc:
                 messagebox.showerror("Invalid filter", str(exc), parent=window)
                 return
@@ -2097,6 +2293,7 @@ class FolderLensApp(ctk.CTk):
         ctk.CTkButton(buttons, text="Apply", command=apply).pack(side="left")
         ctk.CTkButton(buttons, text="Cancel", fg_color="transparent", border_width=1,
                       text_color=("gray20", "gray80"), command=window.destroy).pack(side="right")
+        self._advanced_filter_controls.apply = apply
 
     def _clear_body(self):
         self._tree_generation += 1
@@ -2963,27 +3160,35 @@ class FolderLensApp(ctk.CTk):
                     or filter_generation != self._filter_generation
                     or projection_key != self._projection_key())
 
+        measured = getattr(self, "_scan_measures_on_disk", False)
+
         def worker():
             try:
                 stats = analysis.category_breakdown(
                     root, filter_key=filter_key, filter_index=filter_index,
                     should_cancel=cancelled)
+                ages = analysis.age_breakdown(
+                    root, filter_key=filter_key, filter_index=filter_index,
+                    should_cancel=cancelled)
+                storage = (analysis.storage_summary(root, should_cancel=cancelled)
+                           if measured else None)
                 if cancelled():
                     return
                 payload = (generation, scan_generation, filter_generation,
-                           projection_key, root, total, colors, stats, None)
+                           projection_key, root, total, colors, (stats, ages, storage), None)
             except Exception as exc:
                 if cancelled():
                     return
                 payload = (generation, scan_generation, filter_generation,
-                           projection_key, root, total, colors, [], str(exc))
+                           projection_key, root, total, colors, ([], [], None), str(exc))
             self._io_results.put(("types", payload))
 
         threading.Thread(target=worker, daemon=True,
                          name=f"folderlens-types-{generation}").start()
 
     def _types_results_ready(self, generation, scan_generation, filter_generation,
-                             projection_key, root, total, colors, stats, error):
+                             projection_key, root, total, colors, results, error):
+        stats, ages, storage = results
         if (generation != self._types_generation
                 or scan_generation != self._scan_generation
                 or filter_generation != self._filter_generation
@@ -3022,6 +3227,68 @@ class FolderLensApp(ctk.CTk):
             track.pack_propagate(False)
             fill = tk.Frame(track, bg=stat.color, height=14)
             fill.place(relx=0, rely=0, relwidth=max(stat.size / total, 0.004), relheight=1)
+
+        self._render_age_rows(self._types_host, colors, ages)
+        if storage is not None:
+            self._render_storage_summary(self._types_host, colors, storage)
+
+    def _render_age_rows(self, host, colors, ages):
+        """Last-modified age of the same files, as a table-like list."""
+        if not ages:
+            return
+        tk.Label(host, text="Last modified", bg=colors['tree_bg'], fg=colors['tree_fg'],
+                 font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=24, pady=(26, 2))
+        tk.Label(host, text="Based on each file's modified time; Windows does not keep "
+                            "last-access times reliably.",
+                 bg=colors['tree_bg'], fg=colors['muted_fg'],
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=24, pady=(0, 8))
+        largest = max(stat.size for stat in ages) or 1
+        for stat in ages:
+            row = tk.Frame(host, bg=colors['tree_bg'])
+            row.pack(fill="x", padx=24, pady=4)
+            head = tk.Frame(row, bg=colors['tree_bg'])
+            head.pack(fill="x")
+            tk.Label(head, text=stat.label, bg=colors['tree_bg'], fg=colors['tree_fg'],
+                     font=("Segoe UI", 11, "bold")).pack(side="left")
+            tk.Label(head, text=f"{format_size(stat.size)}  ·  {stat.count:,} files  ·  "
+                                f"{stat.percent:.1f}%",
+                     bg=colors['tree_bg'], fg=colors['muted_fg'],
+                     font=("Segoe UI", 10)).pack(side="right")
+            track = tk.Frame(row, bg=colors['head_bg'], height=10)
+            track.pack(fill="x", pady=(4, 0))
+            track.pack_propagate(False)
+            tk.Frame(track, bg=colors['folder_fg'], height=10).place(
+                relx=0, rely=0, relwidth=max(stat.size / largest, 0.004), relheight=1)
+
+    def _render_storage_summary(self, host, colors, storage):
+        """Logical versus on-disk bytes for the whole scan, without guessing."""
+        tk.Label(host, text="Storage on disk (whole scan)", bg=colors['tree_bg'],
+                 fg=colors['tree_fg'], font=("Segoe UI", 15, "bold")).pack(
+                     anchor="w", padx=24, pady=(26, 8))
+
+        def unknown_or(value):
+            return "unknown" if value is None else format_size(value)
+
+        rows = [
+            ("Logical size", f"{format_size(storage.logical_bytes)} in "
+                             f"{storage.files:,} files (hardlinks counted per path)"),
+            ("Allocated on disk", unknown_or(storage.allocated_bytes)
+             + (f" · {storage.unknown_allocation:,} files unknown"
+                if storage.unknown_allocation and storage.allocated_bytes is not None else "")),
+            ("Unique on disk", unknown_or(storage.unique_allocated_bytes)
+             + (" · each hardlinked file counted once" if storage.hardlinked_files else "")),
+            ("Hardlinked files", f"{storage.hardlinked_files:,}"),
+            ("Links and junctions", f"{storage.reparse_points:,} listed, not followed"),
+        ]
+        if storage.inaccessible:
+            rows.append(("Unread folders", f"{storage.inaccessible:,} — totals are partial"))
+        for label, value in rows:
+            row = tk.Frame(host, bg=colors['tree_bg'])
+            row.pack(fill="x", padx=24, pady=2)
+            tk.Label(row, text=label, width=18, anchor="w", bg=colors['tree_bg'],
+                     fg=colors['tree_fg'], font=("Segoe UI", 11)).pack(side="left")
+            tk.Label(row, text=value, anchor="w", bg=colors['tree_bg'],
+                     fg=colors['muted_fg'], font=("Segoe UI", 10)).pack(side="left")
 
     # ---- Duplicates view
 

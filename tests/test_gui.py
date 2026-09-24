@@ -1338,3 +1338,143 @@ def test_shortcuts_are_documented():
     keys = [k for rows in sections.values() for k, _ in rows]
     for expected in ("F5", "Ctrl+F", "Delete"):
         assert expected in keys, f"{expected} is bound but undocumented"
+
+
+# ------------------------------------------------------------ 4.0 completion
+
+def collect_label_texts(widget):
+    texts = []
+    for child in widget.winfo_children():
+        if isinstance(child, tk.Label):
+            texts.append(child.cget("text"))
+        texts.extend(collect_label_texts(child))
+    return texts
+
+
+class _StuckScanner:
+    """Stands in for TreeScanner while one folder read is stuck."""
+
+    def __init__(self, slow_path):
+        self.slow_path = slow_path
+        self.skipped = []
+        self.cancelled = False
+        self.scanning = True
+
+    @property
+    def is_scanning(self):
+        return self.scanning
+
+    def current_snapshot(self):
+        slow = () if self.skipped or self.cancelled else ((self.slow_path, 7.0),)
+        return ScanSnapshot(1, "/root", "scanning", 0, 0, 0, 0, 1, 0, 0, 0, 7.0, True,
+                            (), slow, len(self.skipped), self.cancelled)
+
+    def skip_directory(self, path):
+        self.skipped.append(path)
+        return True
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def pump(win, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+
+
+def test_slow_folder_offers_skip_and_stop_waits_honestly(gui, monkeypatch):
+    real_scanner = gui.scanner
+    stuck = _StuckScanner(os.path.join("share", "slow-folder"))
+    monkeypatch.setattr(gui, "scanner", stuck)
+    monkeypatch.setattr(gui, "SCAN_WATCH_MS", 20)
+    root = gui.root_node
+    try:
+        gui._scan_generation += 1
+        gui._scan_completed = False
+        gui._watch_scan(gui._scan_generation)
+        assert gui.skip_btn.winfo_manager() == "pack"
+        assert "slow-folder" in gui.status_left.cget("text")
+        gui.skip_btn.invoke()
+        assert stuck.skipped == [stuck.slow_path]
+        assert gui.skip_btn.winfo_manager() == ""
+        assert "partial" in gui.status_left.cget("text")
+
+        gui._cancel_scan()
+        assert stuck.cancelled
+        pump(gui, 0.1)
+        assert gui.status_left.cget("text").startswith("Stopping scan")
+        stuck.scanning = False
+        pump(gui, 0.4)
+        assert gui.status_left.cget("text") == "Scan cancelled"
+    finally:
+        monkeypatch.setattr(gui, "scanner", real_scanner)
+        gui._scan_completed = True
+        gui.root_node = root
+
+
+def test_completed_scan_reports_skipped_folders_separately(gui):
+    root = gui.root_node
+    gui._scan_done(root, ["Access denied: x", "Skipped by user: y"], 1.0)
+    text = gui.status_left.cget("text")
+    assert "1 inaccessible" in text and "1 skipped" in text
+
+
+def test_advanced_filter_saves_loads_and_deletes_presets(gui, monkeypatch):
+    import app as appmod
+    gui.settings.filter_presets = {}
+    monkeypatch.setattr(appmod.simpledialog, "askstring", lambda *a, **k: "Big PNGs")
+    monkeypatch.setattr(gui.settings, "save", lambda: None)
+    gui._show_advanced_filter()
+    controls = gui._advanced_filter_controls
+    try:
+        controls.choose_preset("Images only")
+        assert controls.current_form()["categories"] == ["image"]
+        form = controls.current_form()
+        form["extensions"] = ".png"
+        controls.fill_form(form)
+        controls.save_preset()
+        assert gui.settings.filter_presets["Big PNGs"]["extensions"] == ".png"
+        assert "★ Big PNGs" in controls.preset_menu.cget("values")
+
+        controls.choose_preset("Large files (500 MiB or more)")
+        assert controls.current_form()["min_mib"] == "500"
+        controls.choose_preset("★ Big PNGs")
+        assert controls.current_form()["extensions"] == ".png"
+        assert controls.current_form()["categories"] == ["image"]
+        # no on-disk sizes in this scan: the metric stays logical
+        assert controls.metric_var.get() == "Logical"
+
+        controls.preset_var.set("★ Big PNGs")
+        controls.remove_preset()
+        assert gui.settings.filter_presets == {}
+    finally:
+        controls.window.destroy()
+        gui.settings.filter_presets = {}
+
+
+def test_file_types_view_adds_age_and_on_disk_sections(gui, monkeypatch):
+    monkeypatch.setattr(gui, "_scan_measures_on_disk", True)
+    show(gui, "File Types")
+    wait_types(gui)
+    texts = collect_label_texts(gui.body)
+    assert "Last modified" in texts
+    assert "Last 30 days" in texts          # the sample files were just written
+    assert "Storage on disk (whole scan)" in texts
+    assert "Unique on disk" in texts
+
+
+def test_on_disk_metric_filters_by_allocated_size(gui):
+    from query import QueryEngine, QuerySpec
+    root = gui.root_node
+    for node in analysis.iter_file_nodes(root):
+        node._metadata = (4096, None, 1, False, False)
+    for node in [n for n in analysis.iter_all_nodes(root) if n.is_dir] + [root]:
+        node._metadata = (sum(4096 for _ in analysis.iter_file_nodes(node)), None, None, False, False)
+    spec = QuerySpec(metric="allocated", max_size=4096)
+    index = QueryEngine(root).project(spec)
+    # every file occupies one 4 KiB cluster, so all match by on-disk size,
+    # although big.mp4 is 60,000 logical bytes
+    assert index.size(root) == 3 * 4096
+    assert index.count(root) == 3

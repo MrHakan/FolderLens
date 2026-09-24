@@ -64,7 +64,8 @@ class QuerySpec:
 
 
 def query_from_form(categories=(), extensions="", name="", min_mib="", max_mib="",
-                    modified_after="", modified_before="", include_hidden=True) -> QuerySpec:
+                    modified_after="", modified_before="", include_hidden=True,
+                    metric="logical") -> QuerySpec:
     """Parse the advanced filter form without involving Tk or the filesystem."""
     def mib(value):
         return int(Decimal(value) * 1048576) if value.strip() else None
@@ -84,7 +85,68 @@ def query_from_form(categories=(), extensions="", name="", min_mib="", max_mib="
                      name=name, min_size=mib(min_mib), max_size=mib(max_mib),
                      modified_after_ns=day(modified_after),
                      modified_before_ns=day(modified_before, end=True),
-                     include_hidden=include_hidden)
+                     include_hidden=include_hidden, metric=metric)
+
+
+# Saved filters are stored as the advanced-filter form's own fields, so a
+# preset loads back into the dialog exactly as it was typed and is validated
+# by query_from_form like any other input.
+PRESET_FIELDS = ("categories", "extensions", "name", "min_mib", "max_mib",
+                 "modified_after", "modified_before", "include_hidden")
+MAX_PRESETS = 50
+
+
+def _days_ago(today: date, days: int) -> str:
+    return (today - timedelta(days=days)).isoformat()
+
+
+def builtin_presets(today: Optional[date] = None) -> "OrderedDict[str, dict]":
+    """Ready-made filters.  Relative dates are resolved against *today*."""
+    today = today or date.today()
+    presets = OrderedDict()
+    presets["Images only"] = {"categories": ["image"]}
+    presets["Large videos (1 GiB or more)"] = {"categories": ["video"], "min_mib": "1024"}
+    presets["Large files (500 MiB or more)"] = {"min_mib": "500"}
+    presets["Not modified for a year"] = {"modified_before": _days_ago(today, 365)}
+    presets["Modified in the last 30 days"] = {"modified_after": _days_ago(today, 30)}
+    return OrderedDict((name, normalize_preset(form)) for name, form in presets.items())
+
+
+def normalize_preset(form) -> dict:
+    """Return a complete, JSON-safe preset form or raise ValueError."""
+    if not isinstance(form, dict):
+        raise ValueError("Preset must be a mapping")
+    categories = form.get("categories", [])
+    if (not isinstance(categories, (list, tuple))
+            or any(not isinstance(c, str) for c in categories)):
+        raise ValueError("Preset categories must be a list of names")
+    clean = {"categories": sorted(set(categories))}
+    for field_name in PRESET_FIELDS[1:-1]:
+        value = form.get(field_name, "")
+        if not isinstance(value, str):
+            raise ValueError(f"Preset field {field_name} must be text")
+        clean[field_name] = value.strip()
+    hidden = form.get("include_hidden", True)
+    if not isinstance(hidden, bool):
+        raise ValueError("Preset include_hidden must be true or false")
+    clean["include_hidden"] = hidden
+    query_from_form(**clean)  # rejects unknown categories and malformed values
+    return clean
+
+
+def load_presets(raw) -> "OrderedDict[str, dict]":
+    """Keep only valid user presets from settings; never raise."""
+    presets = OrderedDict()
+    if not isinstance(raw, dict):
+        return presets
+    for name, form in raw.items():
+        if not isinstance(name, str) or not name.strip() or len(presets) >= MAX_PRESETS:
+            continue
+        try:
+            presets[name.strip()] = normalize_preset(form)
+        except (ValueError, ArithmeticError, OverflowError, TypeError):
+            continue
+    return presets
 
 
 class QueryIndex:

@@ -144,6 +144,124 @@ def extension_breakdown(root, limit: int = 15, filter_key: str = "all",
     return rows[:limit]
 
 
+# ---------------------------------------------------------- age breakdown
+
+# Upper bound in days for each bucket, newest first.  Last-modified time is
+# used because Windows does not reliably maintain last-access times.
+AGE_BUCKETS = (
+    ("Last 30 days", 30),
+    ("1–6 months", 182),
+    ("6–12 months", 365),
+    ("1–3 years", 3 * 365),
+    ("Older than 3 years", None),
+)
+UNKNOWN_AGE = "Unknown date"
+_DAY_NS = 86_400 * 1_000_000_000
+
+
+@dataclass
+class AgeStat:
+    label: str
+    size: int
+    count: int
+    percent: float = 0.0
+
+
+def age_breakdown(root, filter_key: str = "all", filter_index=None,
+                  now_ns: Optional[int] = None,
+                  should_cancel: Optional[Callable[[], bool]] = None) -> List[AgeStat]:
+    """Group matching files by how long ago they were last modified.
+
+    Buckets keep their fixed newest-to-oldest order and empty buckets are
+    omitted.  Files without a usable timestamp are counted as unknown rather
+    than being placed in the oldest bucket.
+    """
+    import time as _time
+    now_ns = _time.time_ns() if now_ns is None else now_ns
+    labels = [label for label, _days in AGE_BUCKETS] + [UNKNOWN_AGE]
+    totals = {label: [0, 0] for label in labels}
+    predicate = None
+    if filter_index is not None or filter_key != "all":
+        predicate = filter_index.matches if filter_index is not None else \
+            (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
+    for node in iter_file_nodes(root, predicate, should_cancel):
+        mtime = int(getattr(node, "mtime_ns", 0) or 0)
+        if mtime <= 0:
+            label = UNKNOWN_AGE
+        else:
+            age_days = max(0, now_ns - mtime) / _DAY_NS
+            label = next(bucket for bucket, days in AGE_BUCKETS
+                         if days is None or age_days < days)
+        entry = totals[label]
+        entry[0] += filter_index.size(node) if filter_index is not None else node.size
+        entry[1] += 1
+    total_size = sum(size for size, _count in totals.values()) or 1
+    return [AgeStat(label, size, count, size / total_size * 100)
+            for label in labels
+            for size, count in (totals[label],) if count]
+
+
+# ------------------------------------------------------- storage accounting
+
+@dataclass
+class StorageSummary:
+    """Logical versus on-disk totals for one scanned tree.
+
+    ``allocated_bytes`` sums the on-disk size each path reports and is
+    ``None`` when no file reported one.  ``unique_allocated_bytes`` counts
+    each hardlinked file once; it is ``None`` whenever a hardlinked file's
+    identity is unknown, because a unique total would then be a guess.
+    Both only cover files inside this scan.
+    """
+    logical_bytes: int
+    files: int
+    allocated_bytes: Optional[int]
+    unique_allocated_bytes: Optional[int]
+    unknown_allocation: int
+    hardlinked_files: int
+    reparse_points: int
+    inaccessible: int
+
+
+def storage_summary(root, should_cancel: Optional[Callable[[], bool]] = None) -> StorageSummary:
+    logical = files = allocated = unique = unknown = hardlinked = reparse = inaccessible = 0
+    identity_unknown = False
+    seen_identities = set()
+    for node in iter_all_nodes(root, should_cancel):
+        if getattr(node, "is_reparse_point", False):
+            reparse += 1
+        if node.is_dir:
+            if node.error:
+                inaccessible += 1
+            continue
+        files += 1
+        logical += node.size
+        size = getattr(node, "allocated_size", None)
+        links = getattr(node, "link_count", None)
+        identity = getattr(node, "file_identity", None)
+        if links is not None and links > 1:
+            hardlinked += 1
+            if identity is None:
+                identity_unknown = True
+        if size is None:
+            unknown += 1
+            continue
+        allocated += size
+        if identity is not None:
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+        unique += size
+    has_allocation = files > unknown
+    return StorageSummary(
+        logical_bytes=logical, files=files,
+        allocated_bytes=allocated if has_allocation else None,
+        unique_allocated_bytes=(unique if has_allocation and not unknown
+                                and not identity_unknown else None),
+        unknown_allocation=unknown, hardlinked_files=hardlinked,
+        reparse_points=reparse, inaccessible=inaccessible)
+
+
 # --------------------------------------------------------------- treemap
 
 @dataclass
