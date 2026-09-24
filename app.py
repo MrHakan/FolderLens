@@ -1226,6 +1226,7 @@ class FolderLensApp(ctk.CTk):
 
         # treemap state
         self.treemap_stack: List[Node] = []
+        self.treemap_forward_stack: List[Node] = []
         self._tiles: List[analysis.Tile] = []
         self._hover_tile = None
         self._treemap_focus_tile = None
@@ -1679,6 +1680,7 @@ class FolderLensApp(ctk.CTk):
         self._filter_building = False
         if self.treemap_stack and index.count(self.treemap_stack[-1]) == 0:
             self.treemap_stack = []
+            self.treemap_forward_stack = []
         self._set_view_total()
         self._render_active_view()
 
@@ -1743,6 +1745,7 @@ class FolderLensApp(ctk.CTk):
         self._query_engine = None
         self._invalidate_duplicate_scan()
         self.treemap_stack = []
+        self.treemap_forward_stack = []
         self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
         self._show_progress(True)
@@ -1993,6 +1996,7 @@ class FolderLensApp(ctk.CTk):
         self.settings.file_filter = key
         self.settings.save()
         self.treemap_stack = []
+        self.treemap_forward_stack = []
         # Duplicate results are specific to the active type projection.
         self._invalidate_duplicate_scan()
         self._invalidate_filter_index()
@@ -2063,6 +2067,7 @@ class FolderLensApp(ctk.CTk):
             self.settings.file_filter = "all"
             self.settings.save()
             self.treemap_stack = []
+            self.treemap_forward_stack = []
             self._invalidate_duplicate_scan()
             self._invalidate_filter_index()
             window.destroy()
@@ -3119,6 +3124,11 @@ class FolderLensApp(ctk.CTk):
                             cursor="hand2", font=("Segoe UI", 10, "bold"))
             back.pack(side="right", padx=14, pady=11)
             back.bind("<Button-1>", lambda e: self._treemap_back())
+        if self.treemap_forward_stack:
+            forward = tk.Label(summary, text="Forward ➡", bg=colors['head_bg'], fg=ACCENT,
+                               cursor="hand2", font=("Segoe UI", 10, "bold"))
+            forward.pack(side="right", padx=(0, 10), pady=11)
+            forward.bind("<Button-1>", lambda e: self._treemap_forward())
         details_toggle = tk.Button(
             summary, text="Show details", command=self._toggle_treemap_details,
             bd=0, relief="flat", cursor="hand2", bg=colors['head_bg'], fg=ACCENT,
@@ -3127,7 +3137,7 @@ class FolderLensApp(ctk.CTk):
         details_toggle.pack(side="right", padx=(6, 12), pady=11)
         self._treemap_details_toggle = details_toggle
         self._treemap_focus_info = tk.Label(
-            summary, text="Map: arrows select · Enter opens · Backspace goes up",
+            summary, text="Arrows select · Enter opens · Backspace up",
             bg=colors['head_bg'], fg=colors['muted_fg'], font=("Segoe UI", 9), anchor="e")
         self._treemap_focus_info.pack(side="right", padx=(4, 12), pady=11)
 
@@ -3198,6 +3208,7 @@ class FolderLensApp(ctk.CTk):
         self.treemap_canvas.bind("<Up>", lambda e: self._treemap_move_focus("up"))
         self.treemap_canvas.bind("<Down>", lambda e: self._treemap_move_focus("down"))
         self.treemap_canvas.bind("<Return>", self._treemap_activate_focus)
+        self.treemap_canvas.bind("<Shift-BackSpace>", self._treemap_keyboard_forward)
         self.treemap_canvas.bind("<BackSpace>", self._treemap_keyboard_back)
 
     def _build_treemap_legend(self, parent, colors):
@@ -3540,8 +3551,7 @@ class FolderLensApp(ctk.CTk):
         if getattr(tile.node, "is_aggregate", False):
             self._show_treemap_aggregate(tile.node)
         elif tile.node.is_dir and self._node_count(tile.node) > 0:
-            self.treemap_stack.append(tile.node)
-            self._render_active_view()
+            self._treemap_drill_to(tile.node)
         elif is_image_file(tile.node.name):
             self._open_image(tile.node.path)
         else:
@@ -3625,9 +3635,7 @@ class FolderLensApp(ctk.CTk):
             self._show_treemap_aggregate(tile.node)
             return
         if tile and tile.node.is_dir and self._node_count(tile.node) > 0:
-            self.treemap_stack.append(tile.node)
-            self._hover_tile = None
-            self._render_active_view()
+            self._treemap_drill_to(tile.node)
 
     def _show_treemap_aggregate(self, aggregate):
         """Browse the omitted siblings without inserting them all into Tk."""
@@ -3697,9 +3705,8 @@ class FolderLensApp(ctk.CTk):
                 return
             node = state["row_nodes"].get(rows.focus())
             if node is not None and node.is_dir:
-                self.treemap_stack.append(node)
                 window.destroy()
-                self._render_active_view()
+                self._treemap_drill_to(node)
 
         rows.bind("<Double-Button-1>", open_folder)
         rows.bind("<Return>", open_folder)
@@ -3754,11 +3761,31 @@ class FolderLensApp(ctk.CTk):
 
     def _treemap_back(self):
         if self.treemap_stack:
-            self.treemap_stack.pop()
+            self.treemap_forward_stack.append(self.treemap_stack.pop())
             self._render_active_view()
+
+    def _treemap_forward(self):
+        if not self.treemap_forward_stack:
+            return
+        node = self.treemap_forward_stack.pop()
+        if self._has_active_filter() and self._node_count(node) == 0:
+            self.treemap_forward_stack.clear()
+            return
+        self.treemap_stack.append(node)
+        self._render_active_view()
+
+    def _treemap_drill_to(self, node: Node):
+        self.treemap_forward_stack.clear()
+        self.treemap_stack.append(node)
+        self._hover_tile = None
+        self._render_active_view()
 
     def _treemap_keyboard_back(self, _event=None):
         self._treemap_back()
+        return "break"
+
+    def _treemap_keyboard_forward(self, _event=None):
+        self._treemap_forward()
         return "break"
 
     # --------------------------------------------------------------- search
@@ -4203,6 +4230,8 @@ class FolderLensApp(ctk.CTk):
 
         if self.root_node:
             if deleted:
+                self.treemap_stack = []
+                self.treemap_forward_stack = []
                 self._invalidate_filter_index()
                 self._invalidate_duplicate_scan()
                 # Delete mutates the completed tree in place. Projections
@@ -4262,6 +4291,7 @@ class FolderLensApp(ctk.CTk):
             ("Hover", "Peek at a file, with a preview for images"),
             ("Click", "Zoom into a folder"),
             ("Right-click", "Zoom back out"),
+            ("Shift+Backspace", "Move forward in zoom history"),
         )),
     )
 

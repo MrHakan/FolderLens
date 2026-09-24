@@ -111,7 +111,8 @@ In the image viewer:
 | `Esc` | Close |
 
 In the Treemap, Tab to the map, use the arrow keys to focus a tile, press
-Enter to zoom into a folder or open an image, and press Backspace to move up.
+Enter to zoom into a folder or open an image, press Backspace to move up, and
+press Shift+Backspace to move forward in the zoom history.
 The Tree view provides the full hierarchy as a keyboard accessible table.
 
 ## Requirements

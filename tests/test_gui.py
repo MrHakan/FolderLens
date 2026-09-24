@@ -440,6 +440,26 @@ def test_treemap_labels_are_hit_testable(gui):
         assert hit is not None, "lost the hit over a tile label"
 
 
+def test_treemap_back_forward_navigation_history(gui, monkeypatch):
+    folder = next(node for node in gui.root_node.children if node.is_dir)
+    gui.treemap_stack = []
+    gui.treemap_forward_stack = []
+    monkeypatch.setattr(gui, "_render_active_view", lambda: None)
+
+    gui._treemap_drill_to(folder)
+    assert gui.treemap_stack == [folder]
+    gui._treemap_back()
+    assert gui.treemap_stack == []
+    assert gui.treemap_forward_stack == [folder]
+    gui._treemap_forward()
+    assert gui.treemap_stack == [folder]
+    assert gui.treemap_forward_stack == []
+
+    gui._treemap_back()
+    gui._treemap_drill_to(folder)
+    assert gui.treemap_forward_stack == []
+
+
 def test_treemap_aggregate_lists_omitted_siblings_in_pages(gui):
     from tkinter import ttk
     from scanner import Node
