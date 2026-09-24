@@ -1198,6 +1198,10 @@ class FolderLensApp(ctk.CTk):
         self.largest_map: Dict[str, Node] = {}
         self._largest_generation = 0
         self._largest_loading = False
+        self._types_generation = 0
+        self._types_loading = False
+        self._types_host = None
+        self._types_status = None
 
         # duplicates view state
         self.dup_tree: Optional[ttk.Treeview] = None
@@ -1285,6 +1289,8 @@ class FolderLensApp(ctk.CTk):
                 self._places_ready(payload)
             elif kind == "largest":
                 self._largest_results_ready(*payload)
+            elif kind == "types":
+                self._types_results_ready(*payload)
         self.after(100, self._poll_io_results)
 
     # -------------------------------------------------------------- chrome
@@ -1983,6 +1989,10 @@ class FolderLensApp(ctk.CTk):
     def _clear_body(self):
         self._largest_generation += 1
         self._largest_loading = False
+        self._types_generation += 1
+        self._types_loading = False
+        self._types_host = None
+        self._types_status = None
         if self.tooltip:
             self.tooltip.hide()
         self._invalidate_treemap_render()
@@ -2503,6 +2513,7 @@ class FolderLensApp(ctk.CTk):
             elif node:
                 self._reveal(node.path)
         self.largest_tree.bind("<Double-Button-1>", on_double)
+        self._set_status(f"Showing {len(files):,} largest files")
 
     # ---- File types view
 
@@ -2526,21 +2537,77 @@ class FolderLensApp(ctk.CTk):
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        stats = analysis.category_breakdown(
-            self.root_node, filter_key=self.file_filter,
-            filter_index=self._filter_index)
-        total = self._node_size(self.root_node) or 1
-
         tk.Label(inner, text="File type breakdown", bg=colors['tree_bg'], fg=colors['tree_fg'],
                  font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=24, pady=(20, 12))
 
+        status = tk.Label(inner, text="Calculating file type totals…", bg=colors['tree_bg'],
+                          fg=colors['muted_fg'], font=("Segoe UI", 11))
+        status.pack(anchor="w", padx=24)
+        self._types_host = inner
+        self._types_status = status
+        self._types_loading = True
+
+        root = self.root_node
+        scan_generation = self._scan_generation
+        filter_generation = self._filter_generation
+        generation = self._types_generation
+        projection_key = self._projection_key()
+        filter_index = self._filter_index if self._has_active_filter() else None
+        filter_key = self.file_filter
+        total = self._node_size(root) or 1
+
+        def cancelled():
+            return (generation != self._types_generation
+                    or scan_generation != self._scan_generation
+                    or root is not self.root_node
+                    or filter_generation != self._filter_generation
+                    or projection_key != self._projection_key())
+
+        def worker():
+            try:
+                stats = analysis.category_breakdown(
+                    root, filter_key=filter_key, filter_index=filter_index,
+                    should_cancel=cancelled)
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, total, colors, stats, None)
+            except Exception as exc:
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, total, colors, [], str(exc))
+            self._io_results.put(("types", payload))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-types-{generation}").start()
+
+    def _types_results_ready(self, generation, scan_generation, filter_generation,
+                             projection_key, root, total, colors, stats, error):
+        if (generation != self._types_generation
+                or scan_generation != self._scan_generation
+                or filter_generation != self._filter_generation
+                or projection_key != self._projection_key()
+                or root is not self.root_node
+                or self.active_view != "File Types"
+                or self._types_host is None):
+            return
+        self._types_loading = False
+        if self._types_status is not None:
+            self._types_status.destroy()
+            self._types_status = None
+        if error:
+            tk.Label(self._types_host, text=f"Could not calculate file type totals: {error}",
+                     bg=colors['tree_bg'], fg=colors['error_fg'],
+                     font=("Segoe UI", 11)).pack(anchor="w", padx=24)
+            return
         if not stats:
-            tk.Label(inner, text="No files found", bg=colors['tree_bg'], fg=colors['muted_fg'],
+            tk.Label(self._types_host, text="No files found", bg=colors['tree_bg'], fg=colors['muted_fg'],
                      font=("Segoe UI", 12)).pack(anchor="w", padx=24)
             return
 
         for stat in stats:
-            row = tk.Frame(inner, bg=colors['tree_bg'])
+            row = tk.Frame(self._types_host, bg=colors['tree_bg'])
             row.pack(fill="x", padx=24, pady=5)
 
             head = tk.Frame(row, bg=colors['tree_bg'])
@@ -3701,8 +3768,11 @@ class FolderLensApp(ctk.CTk):
             if deleted:
                 status = f"Deleted {len(deleted)} item(s) · " + status
             self._set_status(status)
-            if deleted and self._has_active_filter():
-                self._start_filter_build()
+            if deleted:
+                if self._has_active_filter():
+                    self._start_filter_build()
+                else:
+                    self._render_active_view()
         if errors:
             messagebox.showerror("Errors", "\n".join(errors[:5]))
 

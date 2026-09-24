@@ -91,14 +91,15 @@ class CategoryStat:
     percent: float = 0.0
 
 
-def category_breakdown(root, filter_key: str = "all", filter_index=None) -> List[CategoryStat]:
+def category_breakdown(root, filter_key: str = "all", filter_index=None,
+                       should_cancel: Optional[Callable[[], bool]] = None) -> List[CategoryStat]:
     """Aggregate total size and file count per file category, largest first."""
     totals: Dict[str, List[int]] = {}
     predicate = None
     if filter_index is not None or filter_key != "all":
         predicate = filter_index.matches if filter_index is not None else \
             (lambda node: file_type_matches(node.name, filter_key, is_dir=False))
-    for node in iter_file_nodes(root, predicate):
+    for node in iter_file_nodes(root, predicate, should_cancel):
         cat = get_file_category(node.name, is_dir=False)
         label = cat['label']
         entry = totals.setdefault(label, [0, 0, cat['color']])

@@ -163,6 +163,14 @@ def wait_largest(win, timeout=10):
     assert not win._largest_loading, "largest-files query did not finish"
 
 
+def wait_types(win, timeout=10):
+    deadline = time.monotonic() + timeout
+    while win._types_loading and time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+    assert not win._types_loading, "file-type totals did not finish"
+
+
 def test_toolbar_actions_safe_in_view_without_selection(gui):
     """Regression: the app remembers the last view, so it can start in Treemap.
     The always-visible Zip/Delete buttons used to raise AttributeError there."""
@@ -431,6 +439,26 @@ def test_deletion_updates_model_without_the_original_widget(gui, sample_tree):
     assert node not in gui.root_node.children
 
 
+def test_deletion_refreshes_async_file_type_totals(gui):
+    show(gui, "File Types")
+    wait_types(gui)
+    node = next(child for child in gui.root_node.children if child.name == "notes.txt")
+    os.remove(node.path)
+
+    gui._apply_deletions([(None, node)], [], action_root=gui.root_node)
+    wait_types(gui)
+
+    labels = []
+    def collect(widget):
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Label):
+                labels.append(child.cget("text"))
+            collect(child)
+    collect(gui.body)
+    from file_utils import get_file_category
+    assert get_file_category("notes.txt", is_dir=False)["label"] not in labels
+
+
 # --------------------------------------------------------------- toolbar reflow
 
 def packed_in(widget):
@@ -569,6 +597,7 @@ def test_global_search_projects_all_views(gui):
     assert leaves == ["pic.png"]
 
     show(gui, "File Types")
+    wait_types(gui)
     def label_texts(widget):
         found = []
         for child in widget.winfo_children():
@@ -638,6 +667,35 @@ def test_stale_largest_files_result_is_ignored_after_view_switch(gui, monkeypatc
         time.sleep(0.01)
     assert gui.active_view == "Tree"
     assert gui.largest_tree is None
+
+
+def test_stale_file_type_totals_are_ignored_after_view_switch(gui, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = analysis.category_breakdown
+
+    def slow_breakdown(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(analysis, "category_breakdown", slow_breakdown)
+    show(gui, "File Types")
+    assert entered.wait(timeout=2)
+    show(gui, "Tree")
+    release.set()
+    assert finished.wait(timeout=2)
+
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.01)
+    assert gui.active_view == "Tree"
+    assert gui._types_host is None
 
 
 def test_slow_disk_usage_cannot_overwrite_new_scan_status(gui):
