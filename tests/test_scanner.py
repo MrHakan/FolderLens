@@ -546,3 +546,122 @@ def test_windows_hidden_attribute_is_retained_without_extended_metadata(monkeypa
     assert root.children[0].name == "system-hidden.jpg"
     assert root.children[0].is_hidden
     assert not root.children[0].is_reparse_point
+
+
+def _stall_first_child_read(monkeypatch, scanner, root_path):
+    """Block the first directory read below *root_path* until released."""
+    entered, release = threading.Event(), threading.Event()
+    original = scanner._read_directory
+    stalled = []
+
+    def stall(node, errors, on_progress=None, work_queue=None, session=None,
+              on_snapshot=None, on_event=None, capture_extended=False):
+        if node.path != str(root_path) and not stalled:
+            stalled.append(node.path)
+            entered.set()
+            assert release.wait(timeout=30)
+        return original(node, errors, on_progress, work_queue, session,
+                        on_snapshot, on_event, capture_extended)
+
+    monkeypatch.setattr(scanner, "_read_directory", stall)
+    return entered, release, stalled
+
+
+def test_skipping_a_stuck_folder_finishes_the_scan_as_partial(tmp_path, monkeypatch):
+    gc.collect()
+    for number in range(20):
+        folder = tmp_path / f"folder{number:02d}"
+        folder.mkdir()
+        (folder / "file.bin").write_bytes(b"a" * 10)
+    # One worker whose overflow stack holds most folders: the replacement
+    # worker must inherit that stack, or those folders would silently vanish.
+    monkeypatch.setattr(TreeScanner, "worker_limit", lambda cls, path: 1)
+    monkeypatch.setattr(ScanSession, "SLOW_DIRECTORY_SECONDS", 0.0)
+    scanner = TreeScanner()
+    entered, release, stalled = _stall_first_child_read(monkeypatch, scanner, tmp_path)
+    done, result = threading.Event(), {}
+    snapshots = []
+    scanner.scan(str(tmp_path), on_snapshot=snapshots.append,
+                 on_complete=lambda root, errors, elapsed: (
+                     result.update(root=root, errors=errors), done.set()),
+                 on_error=lambda message: (result.update(error=message), done.set()))
+    try:
+        assert entered.wait(10)
+        live = scanner.current_snapshot()
+        assert live.state == "scanning"
+        assert [path for path, _age in live.slow_directories] == stalled
+        assert not scanner.skip_directory(str(tmp_path)), "the scan root cannot be skipped"
+        assert scanner.skip_directory(stalled[0])
+        assert not scanner.skip_directory(stalled[0]), "a folder is skipped only once"
+        assert done.wait(10), "the scan kept waiting on a skipped folder"
+    finally:
+        release.set()
+    assert "error" not in result
+    root = result["root"]
+    by_name = {child.name: child for child in root.children}
+    skipped = by_name[os.path.basename(stalled[0])]
+    assert skipped.error == "Skipped"
+    assert skipped.children == [] and skipped.size == 0
+    others = [child for child in root.children if child is not skipped]
+    assert len(others) == 19
+    assert all(child.error is None and child.size == 10 for child in others)
+    assert root.size == 190
+    assert any(message.startswith("Skipped by user:") for message in result["errors"])
+    final = snapshots[-1]
+    assert final.state == "complete" and final.partial
+    assert final.skipped_directories == 1
+    assert final.slow_directories == ()
+    # The stuck read returns late; it must not change the finished tree.
+    for thread in threading.enumerate():
+        if thread is not threading.current_thread() and thread.daemon:
+            thread.join(timeout=0.5)
+    assert skipped.children == [] and skipped.error == "Skipped"
+    assert root.size == 190
+
+
+def test_stop_reports_cancelling_while_a_folder_read_is_stuck(tmp_path, monkeypatch):
+    gc.collect()
+    (tmp_path / "child").mkdir()
+    scanner = TreeScanner()
+    entered, release, _stalled = _stall_first_child_read(monkeypatch, scanner, tmp_path)
+    finished = []
+    scanner.scan(str(tmp_path), on_complete=lambda *args: finished.append(True))
+    try:
+        assert entered.wait(10)
+        scanner.cancel()
+        snapshot = scanner.current_snapshot()
+        assert snapshot.state == "scanning" and snapshot.cancelling
+        assert scanner.is_scanning
+        assert not scanner.skip_directory(str(tmp_path / "child"))
+    finally:
+        release.set()
+    scanner._current_thread.join(timeout=10)
+    assert scanner.current_snapshot().state == "cancelled"
+    assert not scanner.current_snapshot().cancelling
+    assert not finished
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows on-disk metadata backend")
+def test_windows_extended_scan_reports_on_disk_size_and_hardlink_identity(tmp_path):
+    first, second = tmp_path / "first.dat", tmp_path / "second.dat"
+    first.write_bytes(b"a" * 5000)
+    os.link(first, second)
+    (tmp_path / "tiny.txt").write_bytes(b"x")
+    done, result = threading.Event(), {}
+    TreeScanner().scan(str(tmp_path), capture_extended=True,
+                       on_complete=lambda root, errors, elapsed: (
+                           result.update(root=root), done.set()))
+    assert done.wait(10)
+    children = {child.name: child for child in result["root"].children}
+    for child in children.values():
+        assert child.allocated_size is not None
+        assert child.allocated_size >= 0
+    assert children["first.dat"].allocated_size >= 5000
+    assert children["first.dat"].link_count == 2
+    assert children["first.dat"].file_identity == children["second.dat"].file_identity
+    assert children["tiny.txt"].link_count == 1
+    import analysis
+    summary = analysis.storage_summary(result["root"])
+    assert summary.hardlinked_files == 2
+    assert summary.unique_allocated_bytes == (summary.allocated_bytes
+                                              - children["second.dat"].allocated_size)

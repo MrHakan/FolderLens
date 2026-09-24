@@ -21,6 +21,80 @@ def _has_windows_hidden_attribute(entry_stat) -> bool:
     return hidden_flag is not None and attributes is not None and bool(attributes & hidden_flag)
 
 
+_cluster_sizes: dict = {}
+_kernel32 = None
+
+
+def _windows_api():
+    """kernel32 with typed signatures and reliable last-error reporting."""
+    global _kernel32
+    if _kernel32 is None:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD
+        kernel32.GetDiskFreeSpaceW.argtypes = [wintypes.LPCWSTR] + [
+            ctypes.POINTER(wintypes.DWORD)] * 4
+        kernel32.GetDiskFreeSpaceW.restype = wintypes.BOOL
+        _kernel32 = kernel32
+    return _kernel32
+
+
+def _cluster_size(path: str) -> Optional[int]:
+    """Allocation unit of the local volume holding *path* (cached)."""
+    if path.startswith(("\\\\", "//")):
+        return None   # a share's cluster size says little about its storage
+    drive = os.path.splitdrive(path)[0]
+    if not drive:
+        return None
+    root = drive + "\\"
+    if root not in _cluster_sizes:
+        import ctypes
+        from ctypes import wintypes
+        values = [wintypes.DWORD() for _ in range(4)]
+        ok = _windows_api().GetDiskFreeSpaceW(root, *(ctypes.byref(v) for v in values))
+        _cluster_sizes[root] = (values[0].value * values[1].value) if ok else None
+    return _cluster_sizes[root]
+
+
+def _complete_windows_metadata(path: str, metadata):
+    """Fill on-disk size and hardlink identity that ``DirEntry.stat`` omits.
+
+    On Windows ``DirEntry.stat`` reports neither allocated blocks nor link
+    counts.  With extended metadata enabled (local, opt-in scans only), one
+    ``os.stat`` supplies the link count and file id, and
+    ``GetCompressedFileSizeW`` the bytes a compressed or sparse file really
+    occupies, rounded up to whole clusters.  Anything that cannot be read
+    stays ``None`` (unknown) rather than being estimated.
+    """
+    if os.name != "nt" or metadata is None or metadata[0] is not None:
+        return metadata
+    _allocated, identity, links, is_reparse, is_hidden = metadata
+    allocated = None
+    try:
+        full = os.stat(path, follow_symlinks=False)
+        links = full.st_nlink if full.st_nlink > 0 else None
+        if links is not None and links > 1 and full.st_ino:
+            identity = (full.st_dev, full.st_ino)
+    except OSError:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        high = wintypes.DWORD(0)
+        low = _windows_api().GetCompressedFileSizeW(path, ctypes.byref(high))
+        if low != 0xFFFFFFFF or ctypes.get_last_error() == 0:
+            size = (high.value << 32) + low
+            cluster = _cluster_size(path)
+            if cluster:
+                size = -(-size // cluster) * cluster
+            allocated = size
+    except (AttributeError, OSError, ValueError):
+        pass
+    return (allocated, identity, links, is_reparse, is_hidden)
+
 class Node:
     """One file or directory in the scanned tree.
 
@@ -196,6 +270,12 @@ class ScanSnapshot:
     elapsed_seconds: float
     partial: bool
     observed_files: tuple = ()
+    # Directories whose read has been outstanding for a while, oldest first,
+    # as (path, seconds) pairs.  A stuck share call cannot be interrupted, so
+    # the UI offers to skip these instead of waiting on them indefinitely.
+    slow_directories: tuple = ()
+    skipped_directories: int = 0
+    cancelling: bool = False
 
 
 @dataclass
@@ -216,23 +296,66 @@ class ScanSession:
     deferred_high_water: int = 0
     observed_file_heap: list = field(default_factory=list)
     last_snapshot: float = 0.0
+    # path -> (node, monotonic start, worker state) for directories being read
+    in_flight: dict = field(default_factory=dict)
+    skipped_paths: set = field(default_factory=set)
+    skip_messages: list = field(default_factory=list)
+    spawn_worker: Optional[Callable] = None
+    abandoned_threads: set = field(default_factory=set)
 
     MAX_OBSERVED_FILES = 50
+    SLOW_DIRECTORY_SECONDS = 3.0
+    MAX_SLOW_DIRECTORIES = 3
+
+    def _slow_directories(self, now: float) -> tuple:
+        slow = [(now - started, path) for path, (_node, started, _state) in self.in_flight.items()
+                if path != self.root_path and now - started >= self.SLOW_DIRECTORY_SECONDS]
+        slow.sort(reverse=True)
+        return tuple((path, round(age, 1)) for age, path in slow[:self.MAX_SLOW_DIRECTORIES])
 
     def snapshot(self) -> ScanSnapshot:
         with self.lock:
+            now = time.monotonic()
             return ScanSnapshot(
                 self.generation, self.root_path, self.state, self.known_bytes,
                 self.known_files, self.progress_count, self.directories_completed,
                 max(0, self.directories_discovered - self.directories_completed),
                 self.error_count, self.queue_high_water, self.deferred_high_water,
-                round(time.monotonic() - self.started, 3),
-                self.state != "complete" or self.error_count > 0,
+                round(now - self.started, 3),
+                (self.state != "complete" or self.error_count > 0
+                 or bool(self.skipped_paths)),
                 tuple(
                     ObservedFile(path, os.path.basename(path) or path, size)
                     for size, path in sorted(self.observed_file_heap, reverse=True)
                 ),
+                self._slow_directories(now) if self.state == "scanning" else (),
+                len(self.skipped_paths),
+                self.state == "scanning" and self.cancel.is_set(),
             )
+
+    def is_skipped(self, node) -> bool:
+        """Whether *node* or one of its ancestors was skipped by the user."""
+        if not self.skipped_paths:
+            return False
+        current = node
+        while current is not None:
+            if current.is_dir and current.path in self.skipped_paths:
+                return True
+            current = current.parent
+        return False
+
+
+class _WorkerState:
+    """The directories one worker owns.  Skipping a stuck directory hands the
+    rest of them, and the worker's queue task, to a replacement worker."""
+
+    __slots__ = ("lock", "stack", "abandoned", "owner")
+
+    def __init__(self, stack=None):
+        self.lock = threading.Lock()
+        self.stack = list(stack or ())
+        self.abandoned = False
+        self.owner = threading.current_thread()
 
 
 @dataclass(frozen=True)
@@ -325,6 +448,50 @@ class TreeScanner:
                     if self._current_session.state == "scanning":
                         self._current_session.cancel.set()
 
+    def current_snapshot(self) -> Optional[ScanSnapshot]:
+        """Progress of the newest scan, for callers that poll while a share
+        call is stuck and no progress callback is firing."""
+        with self._session_lock:
+            session = self._current_session
+        return session.snapshot() if session is not None else None
+
+    def skip_directory(self, path: str) -> bool:
+        """Leave one folder of the running scan unread and mark it skipped.
+
+        The folder keeps an error, so the finished scan stays partial.  If a
+        worker is stuck reading it, that worker is abandoned and a new one
+        takes over the rest of its work; the stuck call returns on its own
+        and its result is discarded.  The scan root cannot be skipped.
+        """
+        with self._session_lock:
+            session = self._current_session
+        if session is None:
+            return False
+        with session.lock:
+            if (session.state != "scanning" or session.cancel.is_set()
+                    or path == session.root_path or path in session.skipped_paths):
+                return False
+            entry = session.in_flight.get(path)
+            session.skipped_paths.add(path)
+            session.skip_messages.append(f"Skipped by user: {path}")
+            if entry is not None:
+                entry[0].error = "Skipped"
+            spawn = session.spawn_worker
+        if entry is None:
+            return True
+        state = entry[2]
+        with state.lock:
+            if state.abandoned:
+                return True
+            state.abandoned = True
+            inherited, state.stack = state.stack, []
+        with session.lock:
+            session.abandoned_threads.add(state.owner)
+            session.directories_completed += 1
+        if spawn is not None:
+            spawn(inherited)
+        return True
+
     @classmethod
     def worker_limit(cls, folder_path: str) -> int:
         """Choose a sensible metadata-concurrency limit for a folder."""
@@ -399,11 +566,36 @@ class TreeScanner:
         metadata requests on filesystems where neither result is cached.
         Returns a user-facing error for a directory-open failure, otherwise
         ``None``.  Entry-level failures remain non-fatal and are collected.
+
+        Entries are collected locally and attached to *node* only at the end.
+        If the user skips this directory while a share call is stuck, the
+        late-returning read must not change a tree that is already complete.
         """
         if session is not None:
+            if session.is_skipped(node):
+                # skipped before its read began, or below a skipped folder
+                with session.lock:
+                    if node.path in session.skipped_paths:
+                        node.error = "Skipped"
+                    session.directories_completed += 1
+                return None
             self._event(session, on_event, "directory-start", node.path)
 
+        children: List[Node] = []
+        failure: Optional[str] = None
+        skip_seen = [-1, False]
+
+        def skipped() -> bool:
+            if session is None or not session.skipped_paths:
+                return False
+            marker = len(session.skipped_paths)
+            if skip_seen[0] != marker:
+                skip_seen[0], skip_seen[1] = marker, session.is_skipped(node)
+            return skip_seen[1]
+
         def report_error(message: str, path: str):
+            if skipped():
+                return message
             errors.append(message)
             if session is not None:
                 with session.lock:
@@ -420,7 +612,7 @@ class TreeScanner:
                 batch_observed = []
                 next_snapshot_check = time.monotonic() + self.SNAPSHOT_INTERVAL
                 for entry in entries:
-                    if session is not None and session.cancel.is_set():
+                    if session is not None and (session.cancel.is_set() or skipped()):
                         break
                     try:
                         entry_stat = entry.stat(follow_symlinks=False)
@@ -429,6 +621,12 @@ class TreeScanner:
                                       bool(getattr(entry_stat, "st_file_attributes", 0) &
                                            _REPARSE_FLAG))
                         is_hidden = _has_windows_hidden_attribute(entry_stat)
+                        if skipped():
+                            break
+                        metadata = self._entry_metadata(
+                            entry_stat, is_reparse, capture_extended, is_hidden)
+                        if capture_extended and not is_dir and not is_reparse:
+                            metadata = _complete_windows_metadata(entry.path, metadata)
                         child = Node(
                             path=entry.path if is_dir else None,
                             name=entry.name,
@@ -437,10 +635,9 @@ class TreeScanner:
                             creation_date=entry_stat.st_ctime,
                             parent=node,
                             modified_date=self._entry_modified_time(entry_stat),
-                            metadata=self._entry_metadata(
-                                entry_stat, is_reparse, capture_extended, is_hidden),
+                            metadata=metadata,
                         )
-                        node.children.append(child)
+                        children.append(child)
                         if is_dir and not is_reparse and work_queue is not None:
                             if session is not None:
                                 with session.lock:
@@ -466,34 +663,40 @@ class TreeScanner:
                         report_error(f"Access denied: {entry.path}", entry.path)
                     except OSError as e:
                         report_error(f"Error: {entry.path} - {str(e)}", entry.path)
-                if batch:
+                if batch and not skipped():
                     self._tick_progress(on_progress, session, batch, batch_bytes,
                                         batch_files, on_snapshot,
                                         observed_files=batch_observed)
                     self._event(session, on_event, "batch-of-entries", node.path, batch)
             return None
         except PermissionError:
-            node.error = "Access denied"
-            message = f"Access denied: {node.path}"
-            return report_error(message, node.path)
+            failure = "Access denied"
+            return report_error(f"Access denied: {node.path}", node.path)
         except FileNotFoundError:
-            node.error = "Folder not found"
-            message = f"Folder not found: {node.path}"
-            return report_error(message, node.path)
+            failure = "Folder not found"
+            return report_error(f"Folder not found: {node.path}", node.path)
         except NotADirectoryError:
-            node.error = "Not a folder"
-            message = f"Not a folder: {node.path}"
-            return report_error(message, node.path)
+            failure = "Not a folder"
+            return report_error(f"Not a folder: {node.path}", node.path)
         except OSError as e:
-            node.error = str(e)
-            message = f"Cannot read folder: {str(e)}"
-            return report_error(message, node.path)
+            failure = str(e)
+            return report_error(f"Cannot read folder: {str(e)}", node.path)
         finally:
-            if session is not None:
+            if session is None:
+                node.children.extend(children)
+                if failure is not None:
+                    node.error = failure
+            else:
                 with session.lock:
-                    session.directories_completed += 1
-                self._event(session, on_event, "directory-complete", node.path)
-                self._snapshot(session, on_snapshot)
+                    attach = not session.is_skipped(node)
+                    if attach:
+                        node.children.extend(children)
+                        if failure is not None:
+                            node.error = failure
+                        session.directories_completed += 1
+                if attach:
+                    self._event(session, on_event, "directory-complete", node.path)
+                    self._snapshot(session, on_snapshot)
 
     def _run_directory_workers(self, work_queue: queue.Queue, workers: int,
                                error_lists: List[List[str]],
@@ -505,8 +708,72 @@ class TreeScanner:
 
         When the shared queue fills, a worker walks the overflow itself using
         a local stack.  No worker waits to put while all consumers are busy.
+
+        Skipping a directory whose read is stuck abandons that worker: its
+        remaining stack and its queue task move to a fresh worker, so the scan
+        can finish while the stuck call is left to return on its own.
         """
-        def worker(errors: List[str]):
+        threads: List[threading.Thread] = []
+        threads_lock = threading.Lock()
+
+        def drain(state: _WorkerState, errors: List[str]) -> bool:
+            """Read the directories *state* owns; False once it was abandoned."""
+            class Scheduler:
+                def put(self, child):
+                    try:
+                        work_queue.put_nowait(child)
+                    except queue.Full:
+                        with state.lock:
+                            state.stack.append(child)
+                            depth = len(state.stack)
+                        with session.lock:
+                            session.deferred_high_water = max(
+                                session.deferred_high_water, depth)
+                    else:
+                        with session.lock:
+                            session.queue_high_water = max(session.queue_high_water,
+                                                           work_queue.qsize())
+
+            scheduler = Scheduler()
+            while not session.cancel.is_set():
+                with state.lock:
+                    if state.abandoned or not state.stack:
+                        break
+                    current = state.stack.pop()
+                with session.lock:
+                    session.in_flight[current.path] = (current, time.monotonic(), state)
+                try:
+                    self._read_directory(current, errors, on_progress, scheduler,
+                                         session, on_snapshot, on_event,
+                                         capture_extended)
+                except Exception as exc:  # one bad share must not kill the pool
+                    with session.lock:
+                        record = not session.is_skipped(current)
+                        if record:
+                            current.error = str(exc)
+                            session.error_count += 1
+                            session.directories_completed += 1
+                    if record:
+                        message = f"Error: {current.path} - {exc}"
+                        errors.append(message)
+                        self._event(session, on_event, "error", current.path, message=message)
+                        self._snapshot(session, on_snapshot)
+                finally:
+                    with session.lock:
+                        entry = session.in_flight.get(current.path)
+                        if entry is not None and entry[2] is state:
+                            del session.in_flight[current.path]
+            with state.lock:
+                if state.abandoned:
+                    return False
+                state.stack = []
+                return True
+
+        def worker(errors: List[str], inherited=None):
+            if inherited is not None:
+                # This worker took over an abandoned worker's queue task.
+                if drain(_WorkerState(inherited), errors):
+                    work_queue.task_done()
             while True:
                 try:
                     node = work_queue.get(timeout=0.05)
@@ -517,54 +784,36 @@ class TreeScanner:
                     if work_queue.unfinished_tasks == 0:
                         return
                     continue
-                local_stack = [node]
+                if not drain(_WorkerState((node,)), errors):
+                    return  # abandoned: the replacement owns this task now
+                work_queue.task_done()
 
-                class Scheduler:
-                    def put(self, child):
-                        try:
-                            work_queue.put_nowait(child)
-                        except queue.Full:
-                            local_stack.append(child)
-                            with session.lock:
-                                session.deferred_high_water = max(
-                                    session.deferred_high_water, len(local_stack))
-                        else:
-                            with session.lock:
-                                session.queue_high_water = max(session.queue_high_water,
-                                                               work_queue.qsize())
-
-                scheduler = Scheduler()
-                try:
-                    while local_stack and not session.cancel.is_set():
-                        current = local_stack.pop()
-                        try:
-                            self._read_directory(current, errors, on_progress, scheduler,
-                                                 session, on_snapshot, on_event,
-                                                 capture_extended)
-                        except Exception as exc:  # one bad share must not kill the pool
-                            message = f"Error: {current.path} - {exc}"
-                            current.error = str(exc)
-                            errors.append(message)
-                            with session.lock:
-                                session.error_count += 1
-                                session.directories_completed += 1
-                            self._event(session, on_event, "error", current.path, message=message)
-                            self._snapshot(session, on_snapshot)
-                finally:
-                    work_queue.task_done()
-
-        threads = [
-            threading.Thread(target=worker, args=(error_lists[i],), daemon=True)
-            for i in range(workers)
-        ]
-        for thread in threads:
+        def start(errors: List[str], inherited=None):
+            thread = threading.Thread(target=worker, args=(errors, inherited), daemon=True)
+            with threads_lock:
+                threads.append(thread)
             thread.start()
+
+        def spawn_replacement(inherited):
+            errors: List[str] = []
+            with threads_lock:
+                error_lists.append(errors)
+            start(errors, inherited)
+
+        session.spawn_worker = spawn_replacement
+        for i in range(workers):
+            start(error_lists[i])
 
         # Queue.join also drains cleanly after cancellation: workers still
         # call task_done for queued directories but skip their filesystem I/O.
         work_queue.join()
-        for thread in threads:
-            thread.join(timeout=1.0)
+        session.spawn_worker = None
+        with threads_lock:
+            finished = list(threads)
+        for thread in finished:
+            # an abandoned worker may still be inside a stuck share call
+            if thread not in session.abandoned_threads:
+                thread.join(timeout=1.0)
 
     def _build_subtree(self, root: Node, errors: List[str],
                        on_progress: Optional[Callable[[int], None]] = None):
@@ -594,7 +843,9 @@ class TreeScanner:
                 if capture_extended and not node.is_reparse_point:
                     allocated = [child.allocated_size for child in node.children]
                     if all(value is not None for value in allocated):
-                        node._metadata = (sum(allocated), None, None, False)
+                        hidden = bool(node._metadata and len(node._metadata) > 4
+                                      and node._metadata[4])
+                        node._metadata = (sum(allocated), None, None, False, hidden)
             else:
                 stack.append((node, True))
                 for child in node.children:
@@ -658,6 +909,8 @@ class TreeScanner:
                                             capture_extended)
                 for lst in error_lists:
                     errors.extend(lst)
+                with session.lock:
+                    errors.extend(session.skip_messages)
                 if root.error:
                     with session.lock:
                         session.state = "failed"
