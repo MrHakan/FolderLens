@@ -18,7 +18,7 @@ from file_utils import (
     calculate_percentage, get_file_icon, is_image_file, ICONS,
     FILE_CATEGORIES, FILE_TYPE_FILTERS, FILE_TYPE_FILTER_LABELS,
 )
-from scanner import TreeScanner, Node, is_network_path
+from scanner import TreeScanner, Node, ScanSnapshot, is_network_path
 import analysis
 import annotate
 import duplicates
@@ -915,6 +915,8 @@ class FolderLensApp(ctk.CTk):
 
         self.scanner = TreeScanner()
         self._scan_generation = 0
+        self._scan_completed = True
+        self._scan_observed_count = 0
         self.root_node: Optional[Node] = None
         self.scan_errors: List[str] = []
         self.scan_time = 0.0
@@ -1303,13 +1305,15 @@ class FolderLensApp(ctk.CTk):
     def _set_view_total(self):
         if not self.root_node:
             return
+        qualifier = "Known (partial scan)" if self.scan_errors else "Total"
         if self.file_filter == "all" or self._filter_index is None:
-            self.status_right.configure(text=f"Total: {format_size(self.root_node.size)}")
+            self.status_right.configure(text=f"{qualifier}: {format_size(self.root_node.size)}")
             return
         visible_size = self._filter_index.size(self.root_node)
         visible_count = self._filter_index.count(self.root_node)
         self.status_right.configure(
-            text=f"{self._filter_label()} · {visible_count:,} files · {format_size(visible_size)}")
+            text=f"{self._filter_label()} · {visible_count:,} files · "
+                 f"{format_size(visible_size)}{(' · partial scan' if self.scan_errors else '')}")
 
     def _node_size(self, node: Node) -> int:
         if self.file_filter != "all" and self._filter_index is not None:
@@ -1343,6 +1347,8 @@ class FolderLensApp(ctk.CTk):
     def scan_folder(self, path: str):
         self._scan_generation += 1
         generation = self._scan_generation
+        self._scan_completed = False
+        self._scan_observed_count = 0
         self.settings.last_folder = path
         self.settings.save()
         self._is_network_root = is_network_path(path)
@@ -1360,15 +1366,25 @@ class FolderLensApp(ctk.CTk):
 
         self.scanner.scan(
             path,
-            on_progress=lambda n: self.after(0, lambda: self._scan_progress(generation, n)),
             on_complete=lambda root, errors, t: self.after(
                 0, lambda: self._scan_done_if_current(generation, root, errors, t)),
             on_error=lambda msg: self.after(0, lambda: self._scan_failed_if_current(generation, msg)),
+            on_snapshot=lambda snapshot: self.after(
+                0, lambda: self._scan_snapshot(generation, snapshot)),
         )
 
-    def _scan_progress(self, generation: int, count: int):
-        if generation == self._scan_generation:
-            self._set_status(f"Scanning… {count:,} items")
+    def _scan_snapshot(self, generation: int, snapshot: ScanSnapshot):
+        if (generation != self._scan_generation or self._scan_completed
+                or snapshot.state != "scanning"
+                or snapshot.observed_items < self._scan_observed_count):
+            return
+        self._scan_observed_count = snapshot.observed_items
+        self._set_status(f"Scanning… {snapshot.observed_items:,} items seen · "
+                         f"at least {format_size(snapshot.known_bytes)}")
+        suffix = f" · {snapshot.errors} inaccessible" if snapshot.errors else ""
+        self.status_right.configure(
+            text=f"Observed: {snapshot.known_files:,} files · "
+                 f"at least {format_size(snapshot.known_bytes)}{suffix}")
 
     def _scan_done_if_current(self, generation: int, root: Node,
                               errors: List[str], scan_time: float):
@@ -1380,6 +1396,7 @@ class FolderLensApp(ctk.CTk):
             self._scan_failed(message)
 
     def _scan_done(self, root: Node, errors: List[str], scan_time: float):
+        self._scan_completed = True
         self.root_node = root
         self._is_network_root = is_network_path(root.path)
         self.scan_errors = errors
@@ -1399,6 +1416,7 @@ class FolderLensApp(ctk.CTk):
             self._start_filter_build()
 
     def _scan_failed(self, message: str):
+        self._scan_completed = True
         self._show_progress(False)
         self.cancel_btn.pack_forget()
         self._set_status("Scan failed")
@@ -1408,6 +1426,7 @@ class FolderLensApp(ctk.CTk):
 
     def _cancel_scan(self):
         self._scan_generation += 1
+        self._scan_completed = True
         self.scanner.cancel()
         self._set_status("Scan cancelled")
         self._show_progress(False)

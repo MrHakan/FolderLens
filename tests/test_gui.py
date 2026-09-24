@@ -22,7 +22,7 @@ if sys.platform != "win32" and not os.environ.get("DISPLAY"):
 import locations
 import analysis
 import treemap_render
-from scanner import TreeScanner
+from scanner import TreeScanner, ScanSnapshot
 
 
 def scan_sync(path):
@@ -215,6 +215,22 @@ def test_stale_scan_callback_cannot_replace_current_tree(gui):
     gui._scan_done_if_current(gui._scan_generation - 1, old_root, [], 1.0)
     gui._scan_failed_if_current(gui._scan_generation - 1, "stale error")
     assert gui.root_node is old_root
+
+
+def test_partial_progress_is_labeled_observed_and_cannot_replace_completion(gui):
+    gui._scan_generation += 1
+    gui._scan_completed = False
+    gui._scan_observed_count = 0
+    generation = gui._scan_generation
+    snapshot = ScanSnapshot(generation, gui.root_node.path, "scanning", 4096, 2, 3,
+                            1, 4, 1, 2, 0, 0.5, True)
+    gui._scan_snapshot(generation, snapshot)
+    assert "at least" in gui.status_left.cget("text")
+    assert "inaccessible" in gui.status_right.cget("text")
+    gui._scan_completed = True
+    gui._set_status("finished")
+    gui._scan_snapshot(generation, snapshot)
+    assert gui.status_left.cget("text") == "finished"
 
 
 def test_filtered_folder_action_uses_real_size_and_all_types(gui, monkeypatch):
