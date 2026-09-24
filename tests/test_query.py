@@ -145,7 +145,7 @@ def test_advanced_form_combines_fields_and_rejects_invalid_ranges():
     with pytest.raises(ValueError):
         query_from_form(modified_after="2026-99-99")
 
- 
+
 def test_include_hidden_filters_windows_hidden_files_and_folders():
     root, images, *_ = tree()
     flagged = Node(None, "system-hidden.jpg", False, size=40, parent=images,

@@ -282,7 +282,7 @@ def test_treemap_collapses_large_sibling_tail_into_an_aggregate():
     assert len(only_aggregate) == 1
     assert getattr(only_aggregate[0].node, "is_aggregate", False)
 
- 
+
 def test_json_and_csv_exports_share_query_scope_and_partial_metadata(tmp_path):
     from query import QueryEngine, QuerySpec
 

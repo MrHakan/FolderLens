@@ -143,7 +143,7 @@ def test_delete_blocks_reparse_points(tmp_path):
         remove_selected(node, recycle=False)
     assert (target / "secret.txt").exists()
 
- 
+
 def test_delete_blocks_filesystem_roots_without_traversing_them():
     root_path = os.path.abspath(os.sep)
     node = Node(path=root_path, name=root_path, is_dir=True)

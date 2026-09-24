@@ -14,10 +14,8 @@ _NO_CHILDREN: tuple = ()
 _REPARSE_FLAG = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 
 
-def _is_hidden_entry(name: str, entry_stat) -> bool:
-    """Detect dot-hidden files and Windows FILE_ATTRIBUTE_HIDDEN entries."""
-    if name.startswith("."):
-        return True
+def _has_windows_hidden_attribute(entry_stat) -> bool:
+    """Detect the Windows FILE_ATTRIBUTE_HIDDEN bit when the platform exposes it."""
     hidden_flag = getattr(stat_module, "FILE_ATTRIBUTE_HIDDEN", None)
     attributes = getattr(entry_stat, "st_file_attributes", None)
     return hidden_flag is not None and attributes is not None and bool(attributes & hidden_flag)
@@ -430,7 +428,7 @@ class TreeScanner:
                         is_reparse = (stat_module.S_ISLNK(entry_stat.st_mode) or
                                       bool(getattr(entry_stat, "st_file_attributes", 0) &
                                            _REPARSE_FLAG))
-                        is_hidden = _is_hidden_entry(entry.name, entry_stat)
+                        is_hidden = _has_windows_hidden_attribute(entry_stat)
                         child = Node(
                             path=entry.path if is_dir else None,
                             name=entry.name,
@@ -638,8 +636,9 @@ class TreeScanner:
                     root_stat = None
 
                 root_name = os.path.basename(root_path.rstrip("\\/")) or root_path
-                root_hidden = (_is_hidden_entry(root_name, root_stat) if root_stat
-                               else root_name.startswith("."))
+                root_hidden = (root_name.startswith(".") or
+                               (root_stat is not None and
+                                _has_windows_hidden_attribute(root_stat)))
                 root_metadata = ((None, None, None, False, True) if root_hidden else None)
                 root = Node(
                     path=root_path,
