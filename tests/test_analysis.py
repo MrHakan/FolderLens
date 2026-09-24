@@ -131,6 +131,12 @@ def test_build_treemap_tiny_canvas():
     assert analysis.build_treemap(root, 0, 0, 1, 1) == []
 
 
+def test_build_treemap_stops_for_a_stale_render_generation():
+    root = make_tree()
+    assert analysis.build_treemap(root, 0, 0, 200, 120,
+                                  should_cancel=lambda: True) == []
+
+
 def test_export_tree_csv(tmp_path):
     root = make_tree()
     out = tmp_path / "report.csv"
@@ -153,6 +159,22 @@ def test_filtered_csv_has_matching_rows_and_projected_folder_size(tmp_path):
         rows = list(csv.DictReader(stream))
     assert [(r["Name"], r["Size (bytes)"], r["Scope"]) for r in rows] == [
         ("sub", "300", "image"), ("c.png", "300", "image")]
+    assert all(r["Root"] == "/root" and r["Metric"] == "logical"
+               and r["Scan status"] == "complete" for r in rows)
+
+
+def test_search_csv_records_visible_scope_and_partial_status(tmp_path):
+    import csv
+    root = make_tree()
+    out = tmp_path / "search.csv"
+    assert analysis.export_tree_csv(root, str(out), search_query="txt",
+                                    partial=True, inaccessible_count=2) == 2
+    with out.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert {row["Name"] for row in rows} == {"a.txt", "d.txt"}
+    assert all(row["Scope"] == "all; name contains 'txt'" for row in rows)
+    assert all(row["Root"] == "/root" and row["Scan status"] == "partial · 2 inaccessible"
+               for row in rows)
 
 
 def test_match_query():

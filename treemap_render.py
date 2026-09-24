@@ -245,7 +245,8 @@ def _ellipsize(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> st
 
 def render_treemap(tiles: Sequence, width: int, height: int,
                    options: Optional[RenderOptions] = None,
-                   thumb_provider: Optional[Callable] = None) -> Image.Image:
+                   thumb_provider: Optional[Callable] = None,
+                   should_cancel: Optional[Callable[[], bool]] = None) -> Optional[Image.Image]:
     """Paint ``tiles`` into one image with hierarchy-first visual grouping.
 
     Folder containers are painted first, leaves are separated with gutters,
@@ -283,6 +284,8 @@ def render_treemap(tiles: Sequence, width: int, height: int,
         thumb_candidates = set()
 
     for tile in draw_tiles:
+        if should_cancel is not None and should_cancel():
+            return None
         left, top, right, bottom = _inset_rect(tile, opts.gutter, width, height)
         tw, th = right - left, bottom - top
         if tw < 1 or th < 1:
@@ -323,6 +326,8 @@ def render_treemap(tiles: Sequence, width: int, height: int,
     # each visible tile keeps very small adjacent tiles legible without the
     # heavy grid that made the old map look like an exploded bar chart.
     for tile in draw_tiles:
+        if should_cancel is not None and should_cancel():
+            return None
         left, top, right, bottom = _inset_rect(tile, opts.gutter, width, height)
         if right - left < 4 or bottom - top < 4:
             continue
@@ -343,6 +348,8 @@ def render_treemap(tiles: Sequence, width: int, height: int,
         ]
         label_tiles.sort(key=lambda tile: tile.w * tile.h, reverse=True)
         for tile in label_tiles[:max(0, opts.max_file_labels)]:
+            if should_cancel is not None and should_cancel():
+                return None
             left, top, right, bottom = _inset_rect(tile, opts.gutter, width, height)
             px = 11 if bottom - top >= 40 else 9
             font = _font(px)
@@ -353,6 +360,8 @@ def render_treemap(tiles: Sequence, width: int, height: int,
         # Folder names sit in the reserved header band, above the leaves.  A
         # subtle depth tint makes nested folder groups readable at a glance.
         for tile in draw_tiles:
+            if should_cancel is not None and should_cancel():
+                return None
             node = tile.node
             if not node.is_dir or tile.w < 80 or tile.h < 30:
                 continue

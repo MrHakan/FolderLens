@@ -300,7 +300,8 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
                   children_getter: Optional[Callable] = None,
                   count_getter: Optional[Callable] = None,
                   max_children: int = 1200,
-                  aggregate_category: Optional[str] = None) -> List[Tile]:
+                  aggregate_category: Optional[str] = None,
+                  should_cancel: Optional[Callable[[], bool]] = None) -> List[Tile]:
     """Build treemap tiles for a Node.
 
     Recurses into directories only while their tile is large enough
@@ -324,6 +325,8 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
 
     stack = [(root, x, y, width, height, 0)]
     while stack:
+        if should_cancel is not None and should_cancel():
+            return []
         node, nx, ny, nw, nh, depth = stack.pop()
         children = [c for c in get_children(node) if get_size(c) > 0]
         if not children:
@@ -353,6 +356,8 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
 
         rects = squarify([get_size(c) for c in children], nx, ny, nw, nh)
         for child, (rx, ry, rw, rh) in zip(children, rects):
+            if should_cancel is not None and should_cancel():
+                return []
             if rw <= 0 or rh <= 0:
                 continue
             tiles.append(Tile(node=child, x=rx, y=ry, w=rw, h=rh, depth=depth))
@@ -381,16 +386,25 @@ def aggregate_members(aggregate: TreemapAggregate, children_getter=None,
 
 # --------------------------------------------------------------- csv export
 
-def export_tree_csv(root, path: str, filter_index=None) -> int:
-    """Write the full tree or a query projection to CSV. Returns rows written."""
+def export_tree_csv(root, path: str, filter_index=None, *,
+                    search_query: str = "", partial: bool = False,
+                    inaccessible_count: int = 0) -> int:
+    """Write a full or visible query result with explicit scope metadata."""
     rows = 0
     scope = filter_index.filter_key if filter_index is not None else "all"
     if scope == "query":
         scope = repr(filter_index.spec)
+    if search_query:
+        scope += f"; name contains {search_query!r}"
+    metric = filter_index.spec.metric if filter_index is not None else "logical"
+    scan_status = (f"partial · {inaccessible_count} inaccessible" if partial else "complete")
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items", "Scope"])
+        writer.writerow(["Path", "Name", "Type", "Size (bytes)", "Size", "Items",
+                         "Scope", "Root", "Metric", "Scan status"])
         for node in iter_all_nodes(root):
+            if search_query and not match_query(node.name, search_query):
+                continue
             if filter_index is not None and not (filter_index.count(node) if node.is_dir
                                                   else filter_index.matches(node)):
                 continue
@@ -400,7 +414,7 @@ def export_tree_csv(root, path: str, filter_index=None) -> int:
                 node.path, node.name, kind, size,
                 format_size(size),
                 (filter_index.count(node) if filter_index is not None else node.item_count)
-                if node.is_dir else "", scope,
+                if node.is_dir else "", scope, root.path, metric, scan_status,
             ])
             rows += 1
     return rows

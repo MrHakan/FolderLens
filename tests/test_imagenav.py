@@ -55,6 +55,18 @@ def test_starts_on_the_opened_image(gallery):
     assert nav.position == "2 / 3"
 
 
+def test_deferred_navigator_does_not_list_before_commit(gallery, monkeypatch):
+    monkeypatch.setattr(imagenav, "list_images",
+                        lambda folder: (_ for _ in ()).throw(AssertionError("listed synchronously")))
+    nav = ImageNavigator.deferred(str(gallery / "b.png"))
+    assert nav.images == []
+    assert nav.current is None
+    nav.set_images(str(gallery), [str(gallery / "a.png"), str(gallery / "b.png")],
+                   str(gallery / "b.png"))
+    assert nav.current.endswith("b.png")
+    assert nav.position == "2 / 2"
+
+
 def test_next_and_previous_wrap(gallery):
     nav = ImageNavigator(str(gallery / "c.png"))
     assert os.path.basename(nav.next()) == "a.png"          # wraps forward

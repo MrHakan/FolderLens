@@ -18,6 +18,7 @@ Grab the latest build from the [Releases page](https://github.com/MrHakan/Folder
 
 - **`FolderLens.exe`** — standalone, no Python required. Just run it.
 - **`FolderLens-<version>-win64.zip`** — folder build; use this if your antivirus flags the single exe (see [Antivirus notes](docs/ANTIVIRUS.md)).
+- **`FolderLens_Setup_<version>.exe`** — versioned installer with Start Menu and optional Explorer context-menu integration.
 
 ## Features
 
@@ -55,6 +56,7 @@ Plus:
 
 - 🧭 **Clickable breadcrumbs** — jump straight to any folder in the path
 - 🎨 **Colour legend** under the treemap, so the colours actually mean something
+- ⌨️ **Keyboard treemap navigation** — arrow keys move through tiles, Enter opens the focused item, and Backspace goes up. The item name and size are also shown as text; Tree view provides the full hierarchical table.
 - ⌨️ **Shortcut help** built in (F1), and hover hints on every icon button
 - 🔎 **Instant search** across the whole tree (Ctrl+F)
 - 🧵 **Fully responsive** — scanning, zipping, deleting, and exporting all run off the UI thread, with live progress and a **Stop** button
@@ -108,6 +110,10 @@ In the image viewer:
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo annotation |
 | `Esc` | Close |
 
+In the Treemap, Tab to the map, use the arrow keys to focus a tile, press
+Enter to zoom into a folder or open an image, and press Backspace to move up.
+The Tree view provides the full hierarchy as a keyboard accessible table.
+
 ## Requirements
 
 - Windows 10/11
@@ -132,6 +138,9 @@ python -m pytest tests -v
 
 # build both executables locally (Windows)
 build.bat
+
+# build the versioned installer (Windows, Inno Setup 6 required)
+python installer/build_installer.py
 ```
 
 ### Scan baseline for 4.0 development
@@ -155,7 +164,8 @@ FolderLens/
 ├── main.py               # entry point, CLI
 ├── app.py                # UI (customtkinter + ttk): views, image viewer, toolbars
 ├── scanner.py            # single-pass parallel tree scanner
-├── analysis.py           # treemap layout, largest-files, type breakdown, CSV (pure, tested)
+├── analysis.py           # query projections, treemap layout, largest-files, CSV
+├── file_actions.py       # stale-scan validation and safe ZIP/delete operations
 ├── duplicates.py         # size -> sample -> full hash duplicate detection (pure, tested)
 ├── locations.py          # start-screen places and path breadcrumbs (pure, tested)
 ├── trash.py              # Recycle Bin / XDG trash, with a permanent-delete fallback
@@ -170,19 +180,21 @@ FolderLens/
 ├── FolderLens.spec       # antivirus-friendly PyInstaller build
 ├── app.manifest          # asInvoker + DPI + supported-OS manifest
 ├── make_version_info.py  # generates the embedded Windows version resource
+├── installer/            # versioned Inno Setup installer and build script
 ├── assets/               # app icon (+ generator)
 ├── tests/                # pytest suite
 ├── docs/ANTIVIRUS.md     # false-positive guidance
-└── .github/workflows/    # CI (tests) + Release (builds signed-metadata exe + zip)
+└── .github/workflows/    # CI (tests) + Release (exe, folder zip, installer)
 ```
 
 ## Releasing
 
 Push a tag like `v3.0.0` (or run the **Release** workflow with a `tag` input).
 It runs the tests, generates the version resource, builds the AV-friendly
-one-file exe **and** the one-directory zip on Windows, smoke-tests the exe, and
-publishes a GitHub release with both assets attached. The in-app updater picks
-new releases up automatically.
+one-file exe, one-directory zip, and versioned installer on Windows, smoke-tests
+the executable and installer install/uninstall flow, and publishes a GitHub
+release with all three assets and their SHA-256 manifest. The in-app updater
+uses the one-file exe or folder zip; installer builds are for fresh installs.
 
 ## License
 

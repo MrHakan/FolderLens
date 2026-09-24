@@ -278,3 +278,9 @@ def test_thumbnail_sizes_are_bucketed_so_resizing_reuses_decodes():
     # buckets never shrink the request below what was asked for
     for size in [(9, 9), (33, 20), (200, 130)]:
         assert bucket_size(size)[0] >= max(size)
+
+
+def test_render_can_abort_a_stale_generation():
+    assert treemap_render.render_treemap(
+        tiles_for(100, 80), 100, 80,
+        should_cancel=lambda: True) is None

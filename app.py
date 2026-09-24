@@ -3,6 +3,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import tkinter as tk
 import tkinter.font as tkfont
 from typing import Optional, List, Dict
+import copy
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 import json
 import os
 import queue
@@ -12,17 +14,17 @@ import subprocess
 import tempfile
 import threading
 import webbrowser
-import zipfile
 
 from PIL import Image, ImageOps, ImageTk
 
 from file_utils import (
     get_file_category, format_size, format_date,
-    calculate_percentage, get_file_icon, is_image_file, ICONS,
+    calculate_percentage, get_file_icon, is_image_file, natural_sort_key, ICONS,
     FILE_CATEGORIES, FILE_TYPE_FILTERS, FILE_TYPE_FILTER_LABELS,
 )
 from scanner import TreeScanner, Node, ScanSnapshot, is_network_path
 import analysis
+import file_actions
 from query import QueryEngine, QueryIndex, QuerySpec, query_from_form
 import annotate
 import duplicates
@@ -279,12 +281,28 @@ class ImageViewer(ctk.CTkToplevel):
 
     # below this width the annotation actions move to their own row
     TOOLS_NARROW_WIDTH = 1180
+    MAX_PREVIEW_SIZE = 2048
 
     def __init__(self, master, image_path: str, settings: AppSettings, **kwargs):
         super().__init__(master, **kwargs)
 
         self.settings = settings
-        self.nav = imagenav.ImageNavigator(image_path)
+        self.nav = imagenav.ImageNavigator.deferred(image_path)
+        self._nav_ready = False
+        self._loading = False
+        self._load_generation = 0
+        self._load_results = queue.SimpleQueue()
+        self._load_poll_after = None
+        self._closed = False
+        self._saving = False
+        self._save_generation = 0
+        self._edit_generation = 0
+        self._image_file_size = 0
+        self._image_original_size = (0, 0)
+        self._subfolders = {}
+        self.prev_button = None
+        self.next_button = None
+        self.up_button = None
         self.doc = annotate.AnnotationDocument()
         self.image: Optional[Image.Image] = None
         self.photo = None
@@ -304,7 +322,7 @@ class ImageViewer(ctk.CTkToplevel):
         self.transient(master)
 
         self._build_ui()
-        self._load(self.nav.current or image_path)
+        self._load(image_path)
 
         self.bind("<Right>", lambda e: self._go_next())
         self.bind("<Left>", lambda e: self._go_prev())
@@ -319,17 +337,20 @@ class ImageViewer(ctk.CTkToplevel):
         nav = ctk.CTkFrame(self, fg_color=("gray93", "gray17"), corner_radius=0)
         nav.pack(fill="x")
 
-        ctk.CTkButton(nav, text="◀", width=42, height=32, command=self._go_prev,
-                      font=ctk.CTkFont(size=14)).pack(side="left", padx=(10, 4), pady=8)
-        ctk.CTkButton(nav, text="▶", width=42, height=32, command=self._go_next,
-                      font=ctk.CTkFont(size=14)).pack(side="left", padx=4, pady=8)
+        self.prev_button = ctk.CTkButton(nav, text="◀", width=42, height=32, command=self._go_prev,
+                                         font=ctk.CTkFont(size=14))
+        self.prev_button.pack(side="left", padx=(10, 4), pady=8)
+        self.next_button = ctk.CTkButton(nav, text="▶", width=42, height=32, command=self._go_next,
+                                         font=ctk.CTkFont(size=14))
+        self.next_button.pack(side="left", padx=4, pady=8)
 
         self.counter = ctk.CTkLabel(nav, text="", font=ctk.CTkFont(size=12), width=64)
         self.counter.pack(side="left", padx=6)
 
-        ctk.CTkButton(nav, text="⬅ Up", width=64, height=32, font=ctk.CTkFont(size=12),
-                      fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
-                      command=self._go_parent).pack(side="left", padx=(12, 4), pady=8)
+        self.up_button = ctk.CTkButton(nav, text="⬅ Up", width=64, height=32, font=ctk.CTkFont(size=12),
+                                       fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
+                                       command=self._go_parent)
+        self.up_button.pack(side="left", padx=(12, 4), pady=8)
 
         self.folder_menu = ctk.CTkOptionMenu(nav, values=["(no subfolders)"], width=170, height=32,
                                              font=ctk.CTkFont(size=12), command=self._open_subfolder)
@@ -480,37 +501,154 @@ class ImageViewer(ctk.CTkToplevel):
     # -------------------------------------------------------------- loading
 
     def _load(self, path: str):
+        if self._loading:
+            return False
         if self._dirty and not self._confirm_discard():
             return False
-        try:
-            with Image.open(path) as src:
-                image = ImageOps.exif_transpose(src).convert("RGB")
-        except Exception as exc:
-            self.status.configure(text=f"Cannot load image: {exc}")
-            return False
+        path = os.path.abspath(path)
+        folder = os.path.dirname(path)
+        needs_index = (not self._nav_ready or
+                       os.path.normcase(self.nav.folder) != os.path.normcase(folder))
+        self._schedule_image_load(path, folder, needs_index)
+        return True
 
-        self.image = image
+    def _schedule_image_load(self, path: str, folder: str, needs_index: bool):
+        self._load_generation += 1
+        generation = self._load_generation
+        self._loading = True
+        self._set_navigation_controls()
+        self.status.configure(text=f"Loading {os.path.basename(path)}…")
+        cached_images = list(self.nav.images)
+        cached_subfolders = dict(self._subfolders)
+
+        def worker():
+            try:
+                images = imagenav.list_images(folder) if needs_index else cached_images
+                subfolders = imagenav.list_subfolders(folder) if needs_index else list(cached_subfolders.values())
+                normalized = os.path.normcase(os.path.abspath(path))
+                if not any(os.path.normcase(os.path.abspath(item)) == normalized for item in images):
+                    images.append(path)
+                    images.sort(key=lambda item: natural_sort_key(os.path.basename(item)))
+                preview, dimensions, file_size = self._decode_preview(path)
+                payload = (generation, path, folder, preview, dimensions, file_size,
+                           images, subfolders, None)
+            except Exception as exc:
+                payload = (generation, path, folder, None, None, None, None, None, str(exc))
+            self._load_results.put(("load", payload))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-image-load-{generation}").start()
+        self._schedule_load_poll()
+
+    @classmethod
+    def _decode_preview(cls, path: str):
+        """Decode and downsample off the Tk thread; keep full resolution for Save As."""
+        with Image.open(path) as source:
+            oriented = ImageOps.exif_transpose(source)
+            dimensions = oriented.size
+            preview = oriented.convert("RGB")
+            preview.thumbnail((cls.MAX_PREVIEW_SIZE, cls.MAX_PREVIEW_SIZE),
+                              Image.Resampling.LANCZOS)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        return preview, dimensions, size
+
+    def _load_folder(self, folder: str):
+        if self._loading:
+            return False
+        if self._dirty and not self._confirm_discard():
+            return False
+        folder = os.path.abspath(folder)
+        self._load_generation += 1
+        generation = self._load_generation
+        self._loading = True
+        self._set_navigation_controls()
+        self.status.configure(text=f"Finding images in {folder}…")
+
+        def worker():
+            try:
+                images = imagenav.list_images(folder)
+                subfolders = imagenav.list_subfolders(folder)
+                if not images:
+                    payload = (generation, None, folder, None, None, None,
+                               images, subfolders, "No images in this folder")
+                else:
+                    path = images[0]
+                    preview, dimensions, file_size = self._decode_preview(path)
+                    payload = (generation, path, folder, preview, dimensions,
+                               file_size, images, subfolders, None)
+            except Exception as exc:
+                payload = (generation, None, folder, None, None, None,
+                           None, None, str(exc))
+            self._load_results.put(("load", payload))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-folder-load-{generation}").start()
+        self._schedule_load_poll()
+        return True
+
+    def _schedule_load_poll(self):
+        if self._load_poll_after is None and not self._closed:
+            self._load_poll_after = self.after(40, self._poll_load_results)
+
+    def _poll_load_results(self):
+        self._load_poll_after = None
+        while True:
+            try:
+                kind, payload = self._load_results.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "load":
+                self._apply_loaded_image(*payload)
+            elif kind == "save":
+                self._apply_saved_image(*payload)
+        if (self._loading or self._saving) and not self._closed:
+            self._schedule_load_poll()
+
+    def _apply_loaded_image(self, generation, path, folder, preview, dimensions,
+                            file_size, images, subfolders, error):
+        if self._closed or generation != self._load_generation:
+            return
+        self._loading = False
+        if error:
+            self.status.configure(text=f"Cannot load image: {error}")
+            self._set_navigation_controls()
+            return
+
+        self.nav.set_images(folder, images, path)
+        self._nav_ready = True
+        self.image = preview
+        self._image_original_size = dimensions
+        self._image_file_size = file_size
         self.doc = annotate.AnnotationDocument()
         self._dirty = False
-        if os.path.normcase(self.nav.folder) != os.path.normcase(os.path.dirname(os.path.abspath(path))):
-            self.nav.open_folder(os.path.dirname(path))
-        self.nav.go_to(path)
+        self._edit_generation += 1
         self.title(os.path.basename(path))
         self.name_label.configure(text=os.path.basename(path))
         self.counter.configure(text=self.nav.position)
-
-        subfolders = self.nav.subfolders()
-        names = [os.path.basename(p) for p in subfolders] or ["(no subfolders)"]
-        self.folder_menu.configure(values=names)
-        self.folder_menu.set(names[0])
-        self._subfolders = {os.path.basename(p): p for p in subfolders}
-
-        if self.image is not None:
-            self.status.configure(
-                text=f"{self.image.width} × {self.image.height}  ·  {format_size(os.path.getsize(path))}"
-                if os.path.exists(path) else "")
+        self._subfolders = {os.path.basename(item): item for item in subfolders}
+        self._set_navigation_controls()
+        width, height = dimensions
+        self.status.configure(text=f"{width:,} × {height:,}  ·  {format_size(file_size)}")
         self._redraw()
-        return True
+
+    def _set_navigation_controls(self):
+        if self.prev_button is None:
+            return
+        ready = not self._loading
+        has_many = len(self.nav.images) > 1
+        self.prev_button.configure(state="normal" if ready and has_many else "disabled")
+        self.next_button.configure(state="normal" if ready and has_many else "disabled")
+        folder = self.nav.folder
+        drive, tail = os.path.splitdrive(folder)
+        is_root = bool(drive and tail in ("\\", "/")) or folder in (os.path.abspath(os.sep), "/")
+        self.up_button.configure(state="normal" if ready and not is_root else "disabled")
+        names = list(self._subfolders) or ["(no subfolders)"]
+        self.folder_menu.configure(values=names,
+                                    state="normal" if ready and self._subfolders else "disabled")
+        self.folder_menu.set(names[0])
 
     def _confirm_discard(self) -> bool:
         return messagebox.askyesno("Discard annotations?",
@@ -518,37 +656,37 @@ class ImageViewer(ctk.CTkToplevel):
                                    parent=self)
 
     def _go_next(self):
+        if self._loading:
+            return
         nxt = self.nav.images[(self.nav.index + 1) % self.nav.count] if self.nav.count else None
         if nxt:
             self._load(nxt)
 
     def _go_prev(self):
+        if self._loading:
+            return
         prev = self.nav.images[(self.nav.index - 1) % self.nav.count] if self.nav.count else None
         if prev:
             self._load(prev)
 
     def _go_parent(self):
-        parent = self.nav.parent()
-        if not parent:
+        if self._loading:
             return
-        images = imagenav.list_images(parent)
-        first = images[0] if images else None
-        if first:
-            self._load(first)
-        else:
-            self.status.configure(text="No images in that folder")
+        folder = self.nav.folder
+        drive, tail = os.path.splitdrive(folder)
+        if drive and tail in ("\\", "/"):
+            return
+        parent = os.path.dirname(folder.rstrip("\\/"))
+        if parent and os.path.normcase(parent) != os.path.normcase(folder):
+            self._load_folder(parent)
 
     def _open_subfolder(self, name: str):
+        if self._loading:
+            return
         folder = getattr(self, "_subfolders", {}).get(name)
         if not folder:
             return
-        images = imagenav.list_images(folder)
-        first = images[0] if images else None
-        if first:
-            self._load(first)
-        else:
-            self.status.configure(text=f"No images in {name}")
-            self.counter.configure(text=self.nav.position)
+        self._load_folder(folder)
 
     # ------------------------------------------------------------- drawing
 
@@ -625,7 +763,11 @@ class ImageViewer(ctk.CTkToplevel):
     # -------------------------------------------------------------- events
 
     def _annotating(self) -> bool:
-        return self.mode.get() != "Off" and self.image is not None
+        return not self._loading and not self._closed and self.mode.get() != "Off" and self.image is not None
+
+    def _mark_document_changed(self):
+        self._dirty = True
+        self._edit_generation += 1
 
     def _on_press(self, event):
         if not self._annotating():
@@ -633,7 +775,7 @@ class ImageViewer(ctk.CTkToplevel):
         point = self._to_image(event.x, event.y)
         if self.tool.get() == "eraser":
             if self.doc.erase_at(*point):
-                self._dirty = True
+                self._mark_document_changed()
                 self._redraw()
             return
         if self.tool.get() == "text":
@@ -641,7 +783,7 @@ class ImageViewer(ctk.CTkToplevel):
             if text:
                 self.doc.add(annotate.Shape(kind="text", points=[point], color=self.color.get(),
                                             width=self.brush.get(), text=text))
-                self._dirty = True
+                self._mark_document_changed()
                 self._redraw()
             return
         self._active_points = [point]
@@ -673,7 +815,7 @@ class ImageViewer(ctk.CTkToplevel):
         if len(shape.points) == 1 and shape.kind not in annotate.FREEHAND:
             return          # a click with no drag: nothing to draw
         self.doc.add(shape)
-        self._dirty = True
+        self._mark_document_changed()
         self._redraw()
 
     def _current_shape(self):
@@ -685,22 +827,30 @@ class ImageViewer(ctk.CTkToplevel):
     # ------------------------------------------------------------- actions
 
     def _undo(self):
+        if self._loading:
+            return
         if self.doc.undo():
             self._dirty = self.doc.can_undo
+            self._edit_generation += 1
             self._redraw()
 
     def _redo(self):
+        if self._loading:
+            return
         if self.doc.redo():
-            self._dirty = True
+            self._mark_document_changed()
             self._redraw()
 
     def _clear(self):
+        if self._loading:
+            return
         self.doc.clear()
         self._dirty = False
+        self._edit_generation += 1
         self._redraw()
 
     def _save_as(self):
-        if self.image is None:
+        if self.image is None or self._loading or self._saving:
             return
         if self.doc.is_empty:
             messagebox.showinfo("Nothing to save", "Draw something first.", parent=self)
@@ -714,18 +864,83 @@ class ImageViewer(ctk.CTkToplevel):
             title="Save annotated image as")
         if not target:
             return
-        try:
-            rendered = annotate.render_to_image(self.doc, self.image)
-            rendered.save(target)
+        current = os.path.normcase(os.path.abspath(self.nav.current or ""))
+        destination = os.path.normcase(os.path.abspath(target))
+        if current and current == destination:
+            messagebox.showerror("Choose another file", "Save the annotated copy under a different name.", parent=self)
+            return
+        overwrite = os.path.exists(target)
+        if overwrite and not messagebox.askyesno(
+                "Replace file?", f"Replace the existing file?\n{target}", parent=self):
+            return
+
+        self._save_generation += 1
+        generation = self._save_generation
+        edit_generation = self._edit_generation
+        image_generation = self._load_generation
+        source_path = self.nav.current
+        document = copy.deepcopy(self.doc)
+        self._saving = True
+        self.status.configure(text="Rendering full-resolution annotated copy…")
+        self._schedule_load_poll()
+
+        def worker():
+            temporary = None
+            try:
+                folder = os.path.dirname(os.path.abspath(target)) or os.curdir
+                descriptor, temporary = tempfile.mkstemp(prefix=".folderlens-annotated-", suffix=".tmp",
+                                                         dir=folder)
+                os.close(descriptor)
+                with Image.open(source_path) as original:
+                    full_image = ImageOps.exif_transpose(original).convert("RGB")
+                rendered = annotate.render_to_image(document, full_image)
+                extension = os.path.splitext(target)[1].lower()
+                image_format = "JPEG" if extension in (".jpg", ".jpeg") else "PNG"
+                rendered.save(temporary, format=image_format)
+                os.replace(temporary, target)
+                temporary = None
+                error = None
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                if temporary:
+                    try:
+                        os.remove(temporary)
+                    except OSError:
+                        pass
+            self._load_results.put(("save", (generation, target, error,
+                                               edit_generation, image_generation)))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-image-save-{generation}").start()
+
+    def _apply_saved_image(self, generation, target, error, edit_generation,
+                           image_generation):
+        if self._closed or generation != self._save_generation:
+            return
+        self._saving = False
+        if error:
+            self.status.configure(text=f"Save failed: {error}")
+            messagebox.showerror("Save failed", error, parent=self)
+            return
+        if (image_generation == self._load_generation
+                and edit_generation == self._edit_generation):
             self._dirty = False
-            self.status.configure(text=f"Saved {os.path.basename(target)}")
-        except Exception as exc:
-            messagebox.showerror("Save failed", str(exc), parent=self)
+        suffix = " · newer edits remain unsaved" if self._dirty else ""
+        self.status.configure(text=f"Saved {os.path.basename(target)}{suffix}")
 
     def _on_close(self):
         if self._dirty and not messagebox.askyesno(
                 "Discard annotations?", "You have unsaved annotations.\nClose anyway?", parent=self):
             return
+        self._closed = True
+        self._load_generation += 1
+        self._save_generation += 1
+        if self._load_poll_after is not None:
+            try:
+                self.after_cancel(self._load_poll_after)
+            except tk.TclError:
+                pass
         self.destroy()
 
 
@@ -966,6 +1181,10 @@ class FolderLensApp(ctk.CTk):
         self._places_loading = False
         self._places_grid = None
         self._io_results = queue.SimpleQueue()
+        self._action_generation = 0
+        self._action_running = False
+        self._action_cancel_event = None
+        self._pending_scan_path = None
 
         # tree-view state
         self.tree: Optional[ttk.Treeview] = None
@@ -989,9 +1208,17 @@ class FolderLensApp(ctk.CTk):
         self.treemap_stack: List[Node] = []
         self._tiles: List[analysis.Tile] = []
         self._hover_tile = None
+        self._treemap_focus_tile = None
+        self._treemap_focus_info = None
         self._highlight_id = None
         self._treemap_photo = None
         self._treemap_image = None
+        self._treemap_generation = 0
+        self._treemap_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="treemap")
+        self._treemap_future = None
+        self._treemap_results = queue.SimpleQueue()
+        self._treemap_poll_after = None
+        self._treemap_rendering = False
         self._peek_path: Optional[str] = None
         self._peek_args = None
         self._peek_mtime = None
@@ -1436,6 +1663,11 @@ class FolderLensApp(ctk.CTk):
         return value if value else None
 
     def scan_folder(self, path: str):
+        if self._action_running:
+            self._pending_scan_path = os.path.abspath(path)
+            self._cancel_file_action()
+            self._set_status("Stopping the current file action before scanning…")
+            return
         self._scan_generation += 1
         generation = self._scan_generation
         self._scan_completed = False
@@ -1444,12 +1676,14 @@ class FolderLensApp(ctk.CTk):
         self.settings.save()
         self._is_network_root = is_network_path(path)
         self._invalidate_filter_index()
+        self._invalidate_treemap_render()
         self._query_engine = None
         self._invalidate_duplicate_scan()
         self.treemap_stack = []
         self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
         self._show_progress(True)
+        self.cancel_btn.configure(text="✕ Stop", command=self._cancel_scan)
         self.cancel_btn.pack(side="left", padx=3, pady=9)
         self.root_node = None
         self.status_right.configure(text="")
@@ -1526,6 +1760,45 @@ class FolderLensApp(ctk.CTk):
         self.cancel_btn.pack_forget()
         self._clear_body()
         self._empty_hint("Scan cancelled")
+
+    def _begin_file_action(self, status: str):
+        if self._action_running:
+            return None
+        self._action_running = True
+        self._action_generation += 1
+        generation = self._action_generation
+        cancel_event = threading.Event()
+        self._action_cancel_event = cancel_event
+        self.cancel_btn.configure(text="✕ Stop", command=self._cancel_file_action)
+        if not self.cancel_btn.winfo_manager():
+            self.cancel_btn.pack(side="left", padx=3, pady=9)
+        self._set_status(status)
+        return generation, cancel_event
+
+    def _cancel_file_action(self):
+        if self._action_cancel_event is not None:
+            self._action_cancel_event.set()
+            self.cancel_btn.configure(text="Stopping…")
+            self._set_status("Stopping after the current file operation…")
+
+    def _action_progress(self, generation: int, text: str):
+        if self._action_running and generation == self._action_generation:
+            self._set_status(text)
+
+    def _finish_file_action(self, generation: int, status: Optional[str] = None):
+        if not self._action_running or generation != self._action_generation:
+            return False
+        self._action_running = False
+        self._action_cancel_event = None
+        self.cancel_btn.configure(text="✕ Stop", command=self._cancel_scan)
+        self.cancel_btn.pack_forget()
+        if status:
+            self._set_status(status)
+        pending = self._pending_scan_path
+        self._pending_scan_path = None
+        if pending:
+            self.after(0, lambda: self.scan_folder(pending))
+        return True
 
     def _refresh(self):
         if self.root_node:
@@ -1679,6 +1952,7 @@ class FolderLensApp(ctk.CTk):
     def _clear_body(self):
         if self.tooltip:
             self.tooltip.hide()
+        self._invalidate_treemap_render()
         if self._treemap_redraw_after:
             self.after_cancel(self._treemap_redraw_after)
             self._treemap_redraw_after = None
@@ -2405,8 +2679,13 @@ class FolderLensApp(ctk.CTk):
                             cursor="hand2", font=("Segoe UI", 10, "bold"))
             back.pack(side="right", padx=14, pady=11)
             back.bind("<Button-1>", lambda e: self._treemap_back())
+        self._treemap_focus_info = tk.Label(
+            summary, text="Map: arrows select · Enter opens · Backspace goes up",
+            bg=colors['head_bg'], fg=colors['muted_fg'], font=("Segoe UI", 9), anchor="e")
+        self._treemap_focus_info.pack(side="right", padx=(4, 12), pady=11)
 
-        self.treemap_canvas = tk.Canvas(wrap, bg=colors['canvas_bg'], highlightthickness=0)
+        self.treemap_canvas = tk.Canvas(wrap, bg=colors['canvas_bg'], highlightthickness=0,
+                                       takefocus=True)
         self.treemap_canvas.pack(fill="both", expand=True)
         self._build_treemap_legend(wrap, colors)
         if self.tooltip is None:
@@ -2419,6 +2698,13 @@ class FolderLensApp(ctk.CTk):
         self.treemap_canvas.bind("<Button-1>", self._treemap_click)
         self.treemap_canvas.bind("<Double-Button-1>", self._treemap_double_click)
         self.treemap_canvas.bind("<Button-3>", lambda e: self._treemap_back())
+        self.treemap_canvas.bind("<FocusIn>", self._treemap_focus_in)
+        self.treemap_canvas.bind("<Left>", lambda e: self._treemap_move_focus("left"))
+        self.treemap_canvas.bind("<Right>", lambda e: self._treemap_move_focus("right"))
+        self.treemap_canvas.bind("<Up>", lambda e: self._treemap_move_focus("up"))
+        self.treemap_canvas.bind("<Down>", lambda e: self._treemap_move_focus("down"))
+        self.treemap_canvas.bind("<Return>", self._treemap_activate_focus)
+        self.treemap_canvas.bind("<BackSpace>", self._treemap_keyboard_back)
 
     def _build_treemap_legend(self, parent, colors):
         """Render a compact colour key for the current map projection."""
@@ -2484,26 +2770,35 @@ class FolderLensApp(ctk.CTk):
         w = canvas.winfo_width()
         h = canvas.winfo_height()
         if w < 20 or h < 20:
+            self._invalidate_treemap_render()
             return
 
         node = self.treemap_node
-        if not self._visible_children(node) or self._node_size(node) <= 0:
+        if self._node_count(node) <= 0 or self._node_size(node) <= 0:
+            self._invalidate_treemap_render()
             canvas.delete("all")
             self._tiles = []
+            self._treemap_image = None
             canvas.create_text(w // 2, h // 2, text="Nothing to display",
                                fill=self._colors()['muted_fg'], font=("Segoe UI", 12))
             return
 
-        self._tiles = analysis.build_treemap(
-            node, 2, 2, w - 4, h - 4,
-            min_area=110, max_depth=7, padding=3,
-            header=treemap_render.RenderOptions.header,
-            size_getter=self._node_size,
-            children_getter=self._visible_children,
-            count_getter=self._node_count,
-            max_children=1200,
-            aggregate_category=self.file_filter)
-
+        self._treemap_generation += 1
+        generation = self._treemap_generation
+        if self._treemap_future is not None:
+            self._treemap_future.cancel()
+        self._treemap_rendering = True
+        canvas.delete("all")
+        canvas.create_text(w // 2, h // 2, text="Rendering map…",
+                           fill=self._colors()['muted_fg'], font=("Segoe UI", 12))
+        self._tiles = []
+        self._hover_tile = None
+        index = self._filter_index if self._has_active_filter() else None
+        children_getter = index.children if index is not None else lambda item: item.children
+        size_getter = index.size if index is not None else lambda item: item.size
+        count_getter = index.count if index is not None else (
+            lambda item: item.item_count
+            if (item.is_dir or getattr(item, "is_aggregate", False)) else 1)
         opts = treemap_render.RenderOptions(
             dark_mode=self.settings.dark_mode,
             show_thumbnails=self.settings.treemap_thumbnails,
@@ -2513,18 +2808,92 @@ class FolderLensApp(ctk.CTk):
             max_thumbnails=48 if self._is_network_root else 120,
             thumbnail_mtime=self._node_mtime,
         )
-        image = treemap_render.render_treemap(
-            self._tiles, w, h, opts,
-            thumb_provider=self._treemap_thumb if self.settings.treemap_thumbnails else None)
 
-        # one canvas image instead of thousands of items: far less work for Tk
-        self._treemap_image = image
-        self._treemap_photo = ImageTk.PhotoImage(image)
-        canvas.delete("all")
-        canvas.create_image(0, 0, anchor="nw", image=self._treemap_photo)
-        self._highlight_id = None
-        if highlight is not None:
-            self._draw_highlight(highlight)
+        def worker():
+            cancelled = lambda: generation != self._treemap_generation or self.active_view != "Treemap"
+            tiles = analysis.build_treemap(
+                node, 2, 2, w - 4, h - 4,
+                min_area=110, max_depth=7, padding=3,
+                header=treemap_render.RenderOptions.header,
+                size_getter=size_getter,
+                children_getter=children_getter,
+                count_getter=count_getter,
+                max_children=1200,
+                aggregate_category=(index.filter_key if index is not None else self.file_filter),
+                should_cancel=cancelled)
+            if cancelled():
+                return tiles, None
+            image = treemap_render.render_treemap(
+                tiles, w, h, opts,
+                thumb_provider=self._treemap_thumb if opts.show_thumbnails else None,
+                should_cancel=cancelled)
+            return tiles, image
+
+        future = self._treemap_executor.submit(worker)
+        self._treemap_future = future
+
+        def completed(done):
+            try:
+                tiles, image = done.result()
+                error = None
+            except CancelledError:
+                return
+            except Exception as exc:
+                tiles, image, error = [], None, str(exc)
+            self._treemap_results.put((generation, tiles, image, error))
+
+        future.add_done_callback(completed)
+        self._schedule_treemap_result_poll()
+
+    def _schedule_treemap_result_poll(self):
+        if self._treemap_poll_after is None:
+            self._treemap_poll_after = self.after(30, self._poll_treemap_results)
+
+    def _poll_treemap_results(self):
+        self._treemap_poll_after = None
+        while True:
+            try:
+                generation, tiles, image, error = self._treemap_results.get_nowait()
+            except queue.Empty:
+                break
+            if generation != self._treemap_generation:
+                continue
+            self._treemap_rendering = False
+            if self.active_view != "Treemap" or image is None:
+                if error and self.active_view == "Treemap":
+                    self.treemap_canvas.delete("all")
+                    self.treemap_canvas.create_text(
+                        self.treemap_canvas.winfo_width() // 2,
+                        self.treemap_canvas.winfo_height() // 2,
+                        text=f"Could not render map: {error}",
+                        fill=self._colors()['muted_fg'], font=("Segoe UI", 12))
+                continue
+            try:
+                if not self.treemap_canvas.winfo_exists():
+                    continue
+            except tk.TclError:
+                continue
+            self._tiles = tiles
+            self._treemap_image = image
+            self._treemap_focus_tile = None
+            self._treemap_photo = ImageTk.PhotoImage(image)
+            self.treemap_canvas.delete("all")
+            self.treemap_canvas.create_image(0, 0, anchor="nw", image=self._treemap_photo)
+            self._highlight_id = None
+            if self._treemap_focus_info is not None:
+                self._treemap_focus_info.configure(
+                    text="Map: arrows select · Enter opens · Backspace goes up")
+            if self.treemap_canvas.focus_get() is self.treemap_canvas:
+                self._treemap_focus_in()
+        if self._treemap_rendering:
+            self._schedule_treemap_result_poll()
+
+    def _invalidate_treemap_render(self):
+        self._treemap_generation += 1
+        self._treemap_rendering = False
+        if self._treemap_future is not None:
+            self._treemap_future.cancel()
+            self._treemap_future = None
 
     def _draw_highlight(self, tile):
         """Outline the hovered tile as a canvas item on top of the rendered
@@ -2539,6 +2908,77 @@ class FolderLensApp(ctk.CTk):
         self._highlight_id = canvas.create_rectangle(
             tile.x, tile.y, tile.x + tile.w - 1, tile.y + tile.h - 1,
             outline="#ffffff", width=2)
+
+    def _announce_treemap_tile(self, tile):
+        if self._treemap_focus_info is None or tile is None:
+            return
+        node = tile.node
+        if getattr(node, "is_aggregate", False):
+            kind = "Grouped items"
+        else:
+            kind = "Folder" if node.is_dir else get_file_category(node.name, is_dir=False)['label']
+        name = node.name if len(node.name) <= 40 else node.name[:37] + "…"
+        self._treemap_focus_info.configure(
+            text=f"{kind}: {name} · {format_size(self._node_size(node))}")
+
+    def _treemap_focus_in(self, _event=None):
+        if self._tiles and self._treemap_focus_tile is None:
+            tile = max(self._tiles, key=lambda item: (item.w * item.h, item.depth))
+            self._treemap_set_focus(tile)
+
+    def _treemap_set_focus(self, tile):
+        self._treemap_focus_tile = tile
+        self._hover_tile = tile
+        self._draw_highlight(tile)
+        self._announce_treemap_tile(tile)
+
+    def _treemap_move_focus(self, direction):
+        if not self._tiles:
+            return "break"
+        current = self._treemap_focus_tile
+        if current not in self._tiles:
+            self._treemap_focus_in()
+            return "break"
+        cx, cy = current.x + current.w / 2, current.y + current.h / 2
+        candidates = []
+        for tile in self._tiles:
+            if tile is current:
+                continue
+            tx, ty = tile.x + tile.w / 2, tile.y + tile.h / 2
+            dx, dy = tx - cx, ty - cy
+            if ((direction == "right" and dx > 0) or (direction == "left" and dx < 0)
+                    or (direction == "down" and dy > 0) or (direction == "up" and dy < 0)):
+                primary, secondary = ((abs(dx), abs(dy)) if direction in ("left", "right")
+                                      else (abs(dy), abs(dx)))
+                score = primary + secondary * 2 - tile.depth * 0.01
+                candidates.append((score, tile))
+        if not candidates:
+            if direction in ("left", "right"):
+                edge = min if direction == "right" else max
+                target = edge(self._tiles, key=lambda tile: tile.x + tile.w / 2)
+            else:
+                edge = min if direction == "down" else max
+                target = edge(self._tiles, key=lambda tile: tile.y + tile.h / 2)
+        else:
+            target = min(candidates, key=lambda item: item[0])[1]
+        self._treemap_set_focus(target)
+        return "break"
+
+    def _treemap_activate_focus(self, _event=None):
+        tile = self._treemap_focus_tile
+        if tile is None and self._tiles:
+            self._treemap_focus_in()
+            tile = self._treemap_focus_tile
+        if tile is None:
+            return "break"
+        if getattr(tile.node, "is_aggregate", False):
+            self._show_treemap_aggregate(tile.node)
+        elif tile.node.is_dir and self._node_count(tile.node) > 0:
+            self.treemap_stack.append(tile.node)
+            self._render_active_view()
+        elif is_image_file(tile.node.name):
+            self._open_image(tile.node.path)
+        return "break"
 
     def _treemap_thumb(self, path: str, size, mtime=None):
         return self.thumbnails.request(
@@ -2574,8 +3014,7 @@ class FolderLensApp(ctk.CTk):
             return
 
         if tile is not self._hover_tile:
-            self._hover_tile = tile
-            self._draw_highlight(tile)
+            self._treemap_set_focus(tile)
 
         n = tile.node
         if getattr(n, "is_aggregate", False):
@@ -2612,6 +3051,7 @@ class FolderLensApp(ctk.CTk):
         self.tooltip.show(text, px, py, self._colors(), image=peek)
 
     def _treemap_click(self, event):
+        self.treemap_canvas.focus_set()
         tile = treemap_render.hit_test(self._tiles, event.x, event.y)
         if tile and getattr(tile.node, "is_aggregate", False):
             self._show_treemap_aggregate(tile.node)
@@ -2722,6 +3162,10 @@ class FolderLensApp(ctk.CTk):
         if self.treemap_stack:
             self.treemap_stack.pop()
             self._render_active_view()
+
+    def _treemap_keyboard_back(self, _event=None):
+        self._treemap_back()
+        return "break"
 
     # --------------------------------------------------------------- search
 
@@ -2842,25 +3286,37 @@ class FolderLensApp(ctk.CTk):
             messagebox.showwarning("No data", "Scan a folder first.")
             return
         index = None
-        if self._has_active_filter():
+        search_query = ""
+        if self._has_active_filter() or self.search_query:
             if not self._filter_ready_for_view():
                 return
+            visible_scope = []
+            if self._has_active_filter():
+                visible_scope.append(self._filter_label())
+            if self.search_query:
+                visible_scope.append(f"name contains {self.search_query!r}")
+            description = " and ".join(visible_scope)
             choice = messagebox.askyesnocancel(
-                "CSV scope", f"Export only {self._filter_label()} files and their folders?\n\n"
-                "Yes: visible file type only. No: all scanned files. Cancel: stop export.", parent=self)
+                "CSV scope", f"Export the current visible results ({description}) or the full scan?\n\n"
+                "Yes: current visible results. No: all scanned files. Cancel: stop export.", parent=self)
             if choice is None:
                 return
             index = self._filter_index if choice else None
+            search_query = self.search_query if choice else ""
         save_path = filedialog.asksaveasfilename(defaultextension=".csv",
                                                  filetypes=[("CSV files", "*.csv")], title="Export report as")
         if not save_path:
             return
         root = self.root_node
+        partial = bool(self.scan_errors)
+        inaccessible_count = len(self.scan_errors)
         self._set_status("Exporting CSV…")
 
         def worker():
             try:
-                rows = analysis.export_tree_csv(root, save_path, filter_index=index)
+                rows = analysis.export_tree_csv(
+                    root, save_path, filter_index=index, search_query=search_query, partial=partial,
+                    inaccessible_count=inaccessible_count)
                 self.after(0, lambda: (self._set_status(f"Exported {rows:,} rows"),
                                        messagebox.showinfo("Export complete", f"Wrote {rows:,} rows to:\n{save_path}")))
             except Exception as exc:
@@ -2869,20 +3325,37 @@ class FolderLensApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _zip_selected(self):
+        if self._action_running:
+            self._set_status("Wait for the current file action to finish or stop.")
+            return
         selection = self._top_level_selection()
         if not selection:
             messagebox.showwarning("No selection", self._no_selection_hint())
             return
-        if not messagebox.askyesno("Confirm ZIP scope", self._action_scope_prompt(selection, "ZIP"),
-                                   parent=self):
+        selected_nodes = [node for _, node in selection]
+        has_folder = any(node.is_dir for node in selected_nodes)
+        has_view_filter = self._has_active_filter() or bool(self.search_query)
+        matching_only = False
+        prompt = self._action_scope_prompt(selection, "ZIP")
+        if has_folder and has_view_filter:
+            if self._has_active_filter() and not self._filter_ready_for_view():
+                return
+            choice = messagebox.askyesnocancel(
+                "Confirm ZIP scope",
+                prompt + "\n\nYes: include every file in the selected folders.\n"
+                "No: include only files matching the current view.\nCancel: do not create a ZIP.",
+                parent=self)
+            if choice is None:
+                return
+            matching_only = not choice
+        elif not messagebox.askyesno("Confirm ZIP scope", prompt, parent=self):
             return
         save_path = filedialog.asksaveasfilename(defaultextension=".zip",
                                                  filetypes=[("ZIP files", "*.zip")], title="Save ZIP as")
         if not save_path:
             return
-        paths = [node.path for _, node in selection]
         zip_path = os.path.normcase(os.path.abspath(save_path))
-        for _, node in selection:
+        for node in selected_nodes:
             selected_path = os.path.normcase(os.path.abspath(node.path))
             try:
                 inside = (selected_path == zip_path or node.is_dir and
@@ -2892,39 +3365,87 @@ class FolderLensApp(ctk.CTk):
             if inside:
                 messagebox.showerror("ZIP location", "Save the ZIP outside the selected files and folders.", parent=self)
                 return
-        self._set_status("Creating ZIP…")
+        overwrite = os.path.exists(save_path)
+        if overwrite and not messagebox.askyesno(
+                "Replace ZIP?", f"Replace the existing file?\n{save_path}", parent=self):
+            return
+        started = self._begin_file_action("Checking selected files before creating ZIP…")
+        if started is None:
+            return
+        generation, cancel_event = started
+        filter_index = self._filter_index if self._has_active_filter() else None
+        search_query = self.search_query
+
+        def post(callback):
+            try:
+                self.after(0, callback)
+            except tk.TclError:
+                pass
 
         def worker():
             try:
-                errors = []
-                with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for path in paths:
-                        if os.path.isfile(path):
-                            zf.write(path, os.path.basename(path))
-                        elif os.path.isdir(path):
-                            base = os.path.dirname(path)
-                            for r, _, files in os.walk(path, onerror=lambda err: errors.append(str(err))):
-                                for file in files:
-                                    fp = os.path.join(r, file)
-                                    try:
-                                        zf.write(fp, os.path.relpath(fp, base))
-                                    except OSError as exc:
-                                        errors.append(f"{fp}: {exc}")
-                        else:
-                            errors.append(f"Missing: {path}")
-                if errors:
-                    details = "\n".join(errors[:5])
-                    self.after(0, lambda: (self._set_status("ZIP incomplete"),
-                                           messagebox.showwarning("Incomplete ZIP",
-                                               f"Created: {save_path}\nSkipped {len(errors)} item(s):\n{details}")))
-                else:
-                    self.after(0, lambda: (self._set_status("ZIP created"),
-                                           messagebox.showinfo("Success", f"Created: {save_path}")))
+                zip_nodes = selected_nodes
+                if matching_only:
+                    check = file_actions.validate_selection(
+                        selected_nodes, cancel_event=cancel_event,
+                        on_progress=lambda done, total: post(lambda text=(
+                            f"Verifying selection… {done:,} entries checked"): self._action_progress(
+                                generation, text)))
+                    if not check.valid:
+                        raise ValueError("The selection changed since the scan. Rescan it before creating a ZIP.\n"
+                                         + "\n".join(check.issues[:5]))
+                    zip_nodes = []
+                    for selected_node in selected_nodes:
+                        stack = [selected_node]
+                        while stack:
+                            if cancel_event.is_set():
+                                raise file_actions.ActionCancelled()
+                            node = stack.pop()
+                            if node.is_dir:
+                                stack.extend(reversed(node.children))
+                            elif ((filter_index is None or filter_index.matches(node))
+                                  and analysis.match_query(node.name, search_query)):
+                                zip_nodes.append(node)
+                    if not zip_nodes:
+                        raise ValueError("No files match the current view inside the selected folders.")
+                result = file_actions.create_zip(
+                    zip_nodes, save_path, cancel_event=cancel_event,
+                    overwrite=overwrite,
+                    on_progress=lambda done, total: post(lambda text=(
+                        f"Creating ZIP… {done:,}/{total:,} files"): self._action_progress(
+                            generation, text)))
+                post(lambda: self._zip_action_done(generation, result, None))
+            except file_actions.ActionCancelled:
+                post(lambda: self._zip_action_done(
+                    generation, file_actions.ZipResult(save_path, 0, cancelled=True), None))
             except Exception as exc:
-                msg = str(exc)
-                self.after(0, lambda: (self._set_status("ZIP failed"),
-                                       messagebox.showerror("Error", f"Failed to create ZIP: {msg}")))
+                message = str(exc)
+                post(lambda: self._zip_action_done(generation, None, message))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _zip_action_done(self, generation, result, error):
+        if generation != self._action_generation:
+            return
+        if error:
+            self._finish_file_action(generation, "ZIP failed")
+            messagebox.showwarning("ZIP stopped", error, parent=self)
+        elif result.cancelled:
+            self._finish_file_action(generation, "ZIP cancelled")
+            messagebox.showinfo(
+                "ZIP cancelled",
+                f"Stopped after {result.files_written:,} file(s). The incomplete ZIP was discarded; "
+                "an existing destination was left unchanged.", parent=self)
+        elif result.errors:
+            self._finish_file_action(generation, "ZIP incomplete")
+            details = "\n".join(result.errors[:5])
+            messagebox.showwarning(
+                "Incomplete ZIP",
+                f"Created: {result.path}\nIncluded {result.files_written:,} file(s); "
+                f"{len(result.errors):,} item(s) were skipped.\n\n{details}", parent=self)
+        else:
+            self._finish_file_action(generation, "ZIP created")
+            messagebox.showinfo("ZIP created", f"Created: {result.path}\nIncluded {result.files_written:,} file(s).",
+                                parent=self)
 
     def _no_selection_hint(self) -> str:
         if self.active_view in ("Tree", "Largest Files", "Duplicates"):
@@ -2936,17 +3457,31 @@ class FolderLensApp(ctk.CTk):
         total = sum(node.size for _, node in selection)
         items = sum(1 + node.item_count for _, node in selection)
         folders = any(node.is_dir for _, node in selection)
-        scope = (f"{len(selection)} selected item(s); {items:,} scanned items; "
-                 f"{format_size(total)} total scanned size.")
+        if self.scan_errors:
+            scope = (f"{len(selection)} selected item(s); {items:,} known scanned items; "
+                     f"{format_size(total)} known scanned size (partial scan).")
+        else:
+            scope = (f"{len(selection)} selected item(s); {items:,} scanned items; "
+                     f"{format_size(total)} total scanned size.")
         if folders and self._has_active_filter():
             scope += (f"\n\nThe {self._filter_label()} filter only changes the view. "
                       f"{action} will include ALL file types inside selected folders, "
                       "including files hidden by this filter.")
+        if folders and self.search_query:
+            scope += (f"\n\nSearch for {self.search_query!r} only changes which rows are visible. "
+                      f"{action} applies to the entire selected folder unless you choose matching files.")
+        if self.scan_errors:
+            scope += ("\n\nThe scan reported inaccessible items. The selected files and folders "
+                      "will be checked again on disk; the action stops if the selection cannot be verified.")
+        scope += "\n\nThese are last-scan totals. The selection is rechecked before the action starts."
         if action == "ZIP":
             return f"Create a ZIP from the entire selected files and folders?\n{scope}"
         return scope
 
     def _delete_selected(self):
+        if self._action_running:
+            self._set_status("Wait for the current file action to finish or stop.")
+            return
         selection = self._top_level_selection()
         if not selection:
             messagebox.showwarning("No selection", self._no_selection_hint())
@@ -2959,36 +3494,82 @@ class FolderLensApp(ctk.CTk):
             prompt = f"Delete the selected files and folders?\n{scope}\nThis cannot be undone."
         if not messagebox.askyesno("Confirm delete", prompt):
             return
-        self._set_status("Recycling…" if recycle else "Deleting…")
+        started = self._begin_file_action("Verifying selected files before deleting…")
+        if started is None:
+            return
+        generation, cancel_event = started
 
         # remember which view started this so the async result never touches a
         # widget the user has since navigated away from
         tree, mapping = self._selection_context()
         action_root = self.root_node
 
+        def post(callback):
+            try:
+                self.after(0, callback)
+            except tk.TclError:
+                pass
+
         def worker():
             deleted, errors = [], []
-            for iid, node in selection:
+            cancelled = False
+            nodes = [node for _, node in selection]
+            try:
+                checked = file_actions.validate_selection(
+                    nodes, cancel_event=cancel_event, reject_reparse=True,
+                    on_progress=lambda done, total: post(lambda text=(
+                        f"Verifying selection… {done:,}/{total:,} entries"): self._action_progress(
+                            generation, text)))
+            except file_actions.ActionCancelled:
+                checked = None
+                cancelled = True
+            if checked is not None and not checked.valid:
+                errors.append("The selection changed or includes an unsafe reparse point. "
+                              "Rescan before deleting.\n" + "\n".join(checked.issues[:5]))
+            for position, (iid, node) in enumerate(selection, 1):
+                if cancelled or checked is None or not checked.valid:
+                    break
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
                 try:
-                    if recycle:
-                        moved, message = trash.send_to_trash(node.path)
-                        if not moved:
-                            errors.append(f"{node.name}: {message}")
-                            continue
-                    elif os.path.isdir(node.path):
-                        shutil.rmtree(node.path)
-                    else:
-                        os.remove(node.path)
+                    action_label = "Recycling" if recycle else "Deleting"
+                    progress_text = f"{action_label} {position:,}/{len(selection):,}: {node.name}"
+                    post(lambda text=progress_text: self._action_progress(generation, text))
+                    file_actions.remove_selected(
+                        node, recycle=recycle, cancel_event=cancel_event,
+                        prevalidated=True)
                     deleted.append((iid, node))
+                except file_actions.ActionCancelled:
+                    cancelled = True
+                    break
                 except Exception as e:
                     errors.append(f"{node.name}: {e}")
-            self.after(0, lambda: self._apply_deletions(
-                deleted, errors, tree, mapping, action_root))
+                if not cancel_event.is_set():
+                    progress_text = f"Processed {position:,}/{len(selection):,} selected items"
+                    post(lambda text=progress_text: self._action_progress(generation, text))
+            if cancel_event.is_set():
+                cancelled = True
+            post(lambda: self._delete_action_done(
+                generation, deleted, errors, tree, mapping, action_root,
+                cancelled, len(selection)))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _delete_action_done(self, generation, deleted, errors, tree, mapping,
+                            action_root, cancelled, requested):
+        if generation != self._action_generation:
+            return
+        self._apply_deletions(deleted, errors, tree, mapping, action_root)
+        status = None
+        if cancelled:
+            status = f"Delete stopped · removed {len(deleted):,} of {requested:,} selected item(s)"
+        self._finish_file_action(generation, status)
 
     def _apply_deletions(self, deleted, errors, tree=None, mapping=None, action_root=None):
         if action_root is not None and action_root is not self.root_node:
             return
+        if deleted:
+            self._invalidate_treemap_render()
         rows_alive = False
         if tree is not None:
             try:
@@ -3036,6 +3617,10 @@ class FolderLensApp(ctk.CTk):
         """Stop background work and release thumbnail workers on exit."""
         self.scanner.cancel()
         self._dup_cancel = True
+        if self._action_cancel_event is not None:
+            self._action_cancel_event.set()
+        self._invalidate_treemap_render()
+        self._treemap_executor.shutdown(wait=False, cancel_futures=True)
         self.thumbnails.close()
         self.destroy()
 

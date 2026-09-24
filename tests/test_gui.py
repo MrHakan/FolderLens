@@ -139,6 +139,22 @@ def show(win, view):
     win.update_idletasks()
 
 
+def wait_viewer(viewer, attribute="_loading", timeout=10):
+    deadline = time.monotonic() + timeout
+    while getattr(viewer, attribute) and time.monotonic() < deadline:
+        viewer.update()
+        time.sleep(0.01)
+    assert not getattr(viewer, attribute), f"viewer did not finish {attribute}"
+
+
+def wait_treemap(win, timeout=10):
+    deadline = time.monotonic() + timeout
+    while win._treemap_rendering and time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+    assert not win._treemap_rendering, "treemap did not finish rendering"
+
+
 def test_toolbar_actions_safe_in_view_without_selection(gui):
     """Regression: the app remembers the last view, so it can start in Treemap.
     The always-visible Zip/Delete buttons used to raise AttributeError there."""
@@ -289,14 +305,22 @@ def test_filtered_folder_action_uses_real_size_and_all_types(gui, monkeypatch):
     gui.tree.selection_set(iid)
     node = gui.iid_to_node[iid]
     assert gui._node_size(node) < node.size
-    prompts = []
-    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: (prompts.append(a[1]), False)[1])
+    delete_prompts = []
+    zip_prompts = []
+    monkeypatch.setattr(messagebox, "askyesno",
+                        lambda *a, **kw: (delete_prompts.append(a[1]), False)[1])
+    monkeypatch.setattr(messagebox, "askyesnocancel",
+                        lambda *a, **kw: (zip_prompts.append(a[1]), None)[1])
     gui._delete_selected()
     gui._zip_selected()
-    assert all("ALL file types" in prompt for prompt in prompts)
-    assert all(f"{node.item_count + 1:,} scanned items" in prompt for prompt in prompts)
+    assert "ALL file types" in delete_prompts[0]
+    assert "ALL file types" in zip_prompts[0]
+    assert "only files matching the current view" in zip_prompts[0]
+    assert f"{node.item_count + 1:,} scanned items" in delete_prompts[0]
+    assert f"{node.item_count + 1:,} scanned items" in zip_prompts[0]
     from file_utils import format_size
-    assert all(format_size(node.size) in prompt for prompt in prompts)
+    assert format_size(node.size) in delete_prompts[0]
+    assert format_size(node.size) in zip_prompts[0]
 
 
 def test_treemap_labels_are_hit_testable(gui):
@@ -307,6 +331,7 @@ def test_treemap_labels_are_hit_testable(gui):
     gui.treemap_canvas.configure(width=820, height=520)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
 
     labeled = [t for t in gui._tiles if t.w > 54 and t.h > 18]
     assert labeled, "expected at least one tile large enough to be labelled"
@@ -452,6 +477,7 @@ def test_treemap_renders_an_image_not_flat_rectangles(gui):
     gui.treemap_canvas.configure(width=640, height=440)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
 
     assert gui._tiles, "no tiles laid out"
     assert gui._treemap_photo is not None, "treemap image was not produced"
@@ -478,6 +504,7 @@ def test_image_filter_projects_all_views(gui):
     gui.treemap_canvas.configure(width=640, height=440)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
     leaves = [tile.node.name for tile in gui._tiles
               if not tile.node.is_dir and not getattr(tile.node, "is_aggregate", False)]
     assert leaves == ["pic.png"]
@@ -531,6 +558,7 @@ def test_treemap_hit_testing_uses_geometry(gui):
     gui.treemap_canvas.configure(width=640, height=440)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
 
     tile = gui._tiles[-1]
     hit = treemap_render.hit_test(gui._tiles, tile.x + tile.w / 2, tile.y + tile.h / 2)
@@ -543,6 +571,7 @@ def test_treemap_hover_populates_the_tooltip(gui):
     gui.treemap_canvas.configure(width=640, height=440)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
 
     tile = gui._tiles[0]
     event = type("E", (), {"x": int(tile.x + tile.w / 2), "y": int(tile.y + tile.h / 2)})()
@@ -551,27 +580,49 @@ def test_treemap_hover_populates_the_tooltip(gui):
     assert gui._hover_tile is not None
 
 
+def test_treemap_supports_keyboard_focus_and_item_announcement(gui):
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+    wait_treemap(gui)
+
+    gui.treemap_canvas.focus_set()
+    gui.update_idletasks()
+    assert gui._treemap_focus_tile in gui._tiles
+    assert ":" in gui._treemap_focus_info.cget("text")
+    assert "Map:" not in gui._treemap_focus_info.cget("text")
+    assert gui.treemap_canvas.bind("<Left>") and gui.treemap_canvas.bind("<Return>")
+    gui._treemap_move_focus("right")
+    assert gui._treemap_focus_tile in gui._tiles
+
+
 # -------------------------------------------------------------- image viewer
 
 def test_viewer_navigates_images_and_folders(gui, gallery):
     import app as appmod
     viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
     try:
-        viewer.update_idletasks()
+        wait_viewer(viewer)
         assert viewer.image is not None
         assert viewer.nav.count == 3
 
         first = viewer.nav.current
         viewer._go_next()
+        assert viewer.nav.current == first  # navigation commits only after decoding succeeds
+        wait_viewer(viewer)
         assert viewer.nav.current != first
         viewer._go_prev()
+        wait_viewer(viewer)
         assert viewer.nav.current == first
 
         # walk into the subfolder and back out
         assert viewer._subfolders
         viewer._open_subfolder(list(viewer._subfolders)[0])
+        wait_viewer(viewer)
         assert viewer.nav.folder.endswith("more")
         viewer._go_parent()
+        wait_viewer(viewer)
         assert viewer.nav.folder.endswith("gallery")
     finally:
         viewer.destroy()
@@ -581,6 +632,7 @@ def test_viewer_rejects_navigation_and_escape_when_annotations_are_dirty(gui, ga
     import app as appmod
     viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
     try:
+        wait_viewer(viewer)
         current = viewer.nav.current
         viewer._dirty = True
         monkeypatch.setattr(viewer, "_confirm_discard", lambda: False)
@@ -599,6 +651,7 @@ def test_viewer_modes_expose_different_tools(gui, gallery):
     import annotate
     viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
     try:
+        wait_viewer(viewer)
         viewer._on_mode_change("Basic")
         viewer.update_idletasks()
         assert set(viewer.tool_buttons) == set(annotate.BASIC_TOOLS)
@@ -620,6 +673,7 @@ def test_viewer_draws_and_undoes_a_stroke(gui, gallery):
     import app as appmod
     viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
     try:
+        wait_viewer(viewer)
         viewer.geometry("900x700")
         viewer.update_idletasks()
         viewer._on_mode_change("Basic")
@@ -650,6 +704,7 @@ def test_viewer_annotation_actions_stay_visible_when_narrow(gui, gallery):
     import app as appmod
     viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
     try:
+        wait_viewer(viewer)
         viewer.unbind("<Configure>")
         viewer._on_mode_change("Advanced")
 
@@ -668,6 +723,50 @@ def test_viewer_annotation_actions_stay_visible_when_narrow(gui, gallery):
         assert is_packed(viewer.tools_row_b), "actions row never appeared"
         assert packed_in(viewer.tools_right) == str(viewer.tools_row_b)
         assert packed_in(viewer.tools_left) == str(viewer.tools_row_a)
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_failed_decode_does_not_advance_navigation(gui, gallery, monkeypatch):
+    import app as appmod
+    viewer = appmod.ImageViewer(gui, str(gallery / "shot0.png"), gui.settings)
+    try:
+        wait_viewer(viewer)
+        current = viewer.nav.current
+        displayed = viewer.image
+        monkeypatch.setattr(viewer, "_decode_preview", lambda path: (_ for _ in ()).throw(OSError("offline")))
+        viewer._go_next()
+        wait_viewer(viewer)
+        assert viewer.nav.current == current
+        assert viewer.image is displayed
+        assert "offline" in viewer.status.cget("text")
+    finally:
+        viewer.destroy()
+
+
+def test_viewer_save_as_uses_full_resolution_and_atomic_target(gui, tmp_path, monkeypatch):
+    from PIL import Image
+    import annotate
+    import app as appmod
+
+    source = tmp_path / "large.png"
+    Image.new("RGB", (2600, 1000), (240, 240, 240)).save(source)
+    target = tmp_path / "large_annotated.png"
+    viewer = appmod.ImageViewer(gui, str(source), gui.settings)
+    try:
+        wait_viewer(viewer)
+        assert viewer.image.width <= viewer.MAX_PREVIEW_SIZE
+        viewer.doc.add(annotate.Shape(kind="line", points=[(0.1, 0.1), (0.9, 0.9)],
+                                      color="#ff0000", width=0.01))
+        viewer._mark_document_changed()
+        monkeypatch.setattr(appmod.filedialog, "asksaveasfilename", lambda **kwargs: str(target))
+        viewer._save_as()
+        wait_viewer(viewer, "_saving")
+        with Image.open(target) as saved:
+            assert saved.size == (2600, 1000)
+        assert not viewer._dirty
+        assert "Saved large_annotated.png" in viewer.status.cget("text")
+        assert not list(tmp_path.glob(".folderlens-annotated-*.tmp"))
     finally:
         viewer.destroy()
 
@@ -708,6 +807,7 @@ def test_treemap_keeps_an_exportable_image(gui):
     gui.treemap_canvas.configure(width=520, height=380)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
     assert gui._treemap_image is not None
     assert gui._treemap_image.size == (gui.treemap_canvas.winfo_width(),
                                        gui.treemap_canvas.winfo_height())
@@ -720,6 +820,7 @@ def test_hover_does_not_rerender_the_treemap(gui):
     gui.treemap_canvas.configure(width=640, height=440)
     gui.update_idletasks()
     gui._draw_treemap()
+    wait_treemap(gui)
 
     before = gui._treemap_photo
     assert gui._tiles

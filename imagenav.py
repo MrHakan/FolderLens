@@ -5,6 +5,7 @@ subfolders or back up to the parent without going back to the main window.
 Pure filesystem logic so it can be tested without a display.
 """
 import os
+import stat
 from typing import List, Optional
 
 from file_utils import is_image_file, natural_sort_key
@@ -26,7 +27,16 @@ def list_subfolders(folder: str) -> List[str]:
     """Immediate subdirectories, in natural name order."""
     try:
         with os.scandir(folder) as entries:
-            names = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
+            names = []
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                        and not getattr(info, "st_file_attributes", 0) & reparse_flag):
+                    names.append(entry.name)
     except (OSError, PermissionError):
         return []
     names.sort(key=natural_sort_key)
@@ -44,6 +54,25 @@ def folder_has_images(folder: str) -> bool:
 
 class ImageNavigator:
     """Cursor over the images in one folder, with folder switching."""
+
+    @classmethod
+    def deferred(cls, path: str):
+        """Create a cursor without probing a possibly slow image folder."""
+        result = cls.__new__(cls)
+        result.folder = os.path.dirname(os.path.abspath(path))
+        result.images = []
+        result.index = -1
+        return result
+
+    def set_images(self, folder: str, images: List[str], current: Optional[str] = None):
+        """Commit a folder listing after its asynchronous load succeeds."""
+        self.folder = os.path.abspath(folder)
+        self.images = list(images)
+        target = os.path.normcase(os.path.abspath(current)) if current else None
+        self.index = next((i for i, path in enumerate(self.images)
+                           if target and os.path.normcase(os.path.abspath(path)) == target), -1)
+        if self.index < 0 and self.images:
+            self.index = 0
 
     def __init__(self, path: str):
         if os.path.isdir(path):

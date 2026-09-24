@@ -2,9 +2,11 @@
 ; Requires Inno Setup 6.x: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "FolderLens"
-#define MyAppVersion "1.0.0"
+#ifndef MyAppVersion
+#define MyAppVersion "0.0.0"
+#endif
 #define MyAppPublisher "FolderLens"
-#define MyAppURL "https://github.com/folderlens"
+#define MyAppURL "https://github.com/MrHakan/FolderLens"
 #define MyAppExeName "FolderLens.exe"
 #define MyAppDescription "Folder Size Analyzer"
 
@@ -21,10 +23,11 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
+ArchitecturesInstallIn64BitMode=x64
 
 OutputDir=..\installer_output
 OutputBaseFilename=FolderLens_Setup_{#MyAppVersion}
-; SetupIconFile=..\assets\icon.ico
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 Compression=lzma2/ultra64
