@@ -81,6 +81,14 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
 
+      - name: Hash published assets
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem 'FolderLens-*-win64.zip')
+          if ($archives.Count -ne 1) { throw "Expected one archive, found $($archives.Count)" }
+          python release_manifest.py 'dist/FolderLens.exe' $archives[0].FullName --output SHA256SUMS
+          Get-Content SHA256SUMS
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -88,6 +96,7 @@ jobs:
           path: |
             dist/FolderLens.exe
             FolderLens-*-win64.zip
+            SHA256SUMS
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
@@ -97,4 +106,5 @@ jobs:
           files: |
             dist/FolderLens.exe
             FolderLens-*-win64.zip
+            SHA256SUMS
           generate_release_notes: true
