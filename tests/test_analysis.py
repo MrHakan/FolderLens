@@ -177,6 +177,19 @@ def test_search_csv_records_visible_scope_and_partial_status(tmp_path):
                for row in rows)
 
 
+def test_csv_does_not_repeat_search_already_in_query_projection(tmp_path):
+    from query import QueryEngine, QuerySpec
+    root = make_tree()
+    index = QueryEngine(root).project(QuerySpec(name_terms=("txt",)))
+    out = tmp_path / "query-search.csv"
+
+    assert analysis.export_tree_csv(root, str(out), filter_index=index,
+                                    search_query="TXT") == 2
+    content = out.read_text(encoding="utf-8")
+    assert "name_terms=('txt',)" in content
+    assert "name contains 'TXT'" not in content
+
+
 def test_match_query():
     assert analysis.match_query("Report.txt", "report")
     assert analysis.match_query("anything", "")

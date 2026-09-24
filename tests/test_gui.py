@@ -510,6 +510,63 @@ def test_image_filter_projects_all_views(gui):
     assert leaves == ["pic.png"]
 
 
+def test_global_search_projects_all_views(gui):
+    """One live search scope must drive the tree, ranking, map, and type totals."""
+    gui.search_var.set("pic")
+    if gui._search_after:
+        gui.after_cancel(gui._search_after)
+    gui._search_after = None
+    gui._apply_search()
+
+    deadline = time.monotonic() + 10
+    while gui._filter_building and time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.01)
+    assert not gui._filter_building, "search projection did not finish"
+    assert gui._filter_index is not None
+    assert gui._filter_index_key == gui._projection_key()
+    assert gui._filter_index.count(gui.root_node) == 1
+
+    show(gui, "Tree")
+    assert [node.name for node in gui.iid_to_node.values()] == ["pic.png"]
+
+    show(gui, "Largest Files")
+    assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
+
+    show(gui, "Treemap")
+    gui.treemap_canvas.configure(width=640, height=440)
+    gui.update_idletasks()
+    gui._draw_treemap()
+    wait_treemap(gui)
+    leaves = [tile.node.name for tile in gui._tiles
+              if not tile.node.is_dir and not getattr(tile.node, "is_aggregate", False)]
+    assert leaves == ["pic.png"]
+
+    show(gui, "File Types")
+    def label_texts(widget):
+        found = []
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Label):
+                found.append(child.cget("text"))
+            found.extend(label_texts(child))
+        return found
+
+    labels = label_texts(gui.body)
+    from file_utils import get_file_category
+    image_label = get_file_category("pic.png", is_dir=False)["label"]
+    video_label = get_file_category("big.mp4", is_dir=False)["label"]
+    document_label = get_file_category("notes.txt", is_dir=False)["label"]
+    assert image_label in labels
+    assert video_label not in labels
+    assert document_label not in labels
+
+    folder = next(node for node in gui.root_node.children if node.is_dir)
+    prompt = gui._action_scope_prompt([("row", folder)], "ZIP")
+    assert "Search 'pic'" in prompt
+    assert prompt.count("only changes which rows appear") == 1
+    assert "ALL file types" in prompt
+
+
 def test_advanced_filter_projection_and_action_scope(gui):
     from query import QueryEngine, QuerySpec
     gui._advanced_spec = QuerySpec(categories=("image", "document"),

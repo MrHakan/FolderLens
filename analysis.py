@@ -394,7 +394,11 @@ def export_tree_csv(root, path: str, filter_index=None, *,
     scope = filter_index.filter_key if filter_index is not None else "all"
     if scope == "query":
         scope = repr(filter_index.spec)
-    if search_query:
+    search_term = search_query.casefold().strip()
+    query_records_search = (filter_index is not None and search_term and
+                            (search_term == filter_index.spec.name or
+                             search_term in filter_index.spec.name_terms))
+    if search_query and not query_records_search:
         scope += f"; name contains {search_query!r}"
     metric = filter_index.spec.metric if filter_index is not None else "logical"
     scan_status = (f"partial · {inaccessible_count} inaccessible" if partial else "complete")

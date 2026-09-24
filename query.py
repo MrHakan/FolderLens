@@ -30,6 +30,7 @@ class QuerySpec:
     sort: str = "size"
     reverse: bool = True
     metric: str = "logical"
+    name_terms: tuple[str, ...] = ()
 
     def __post_init__(self):
         categories = tuple(sorted(set(self.categories)))
@@ -51,6 +52,8 @@ class QuerySpec:
         object.__setattr__(self, "categories", categories)
         object.__setattr__(self, "extensions", extensions)
         object.__setattr__(self, "name", self.name.casefold().strip())
+        object.__setattr__(self, "name_terms", tuple(dict.fromkeys(
+            term.casefold().strip() for term in self.name_terms if term.strip())))
         if self.root_scope is not None:
             object.__setattr__(self, "root_scope", os.path.normcase(os.path.normpath(self.root_scope)))
 
@@ -95,6 +98,7 @@ class QueryIndex:
         """Compatibility label for existing category-only exports."""
         if (len(self.spec.categories) == 1 and not self.spec.extensions
                 and not self.spec.name and self.spec.min_size is None
+                and not self.spec.name_terms
                 and self.spec.max_size is None and self.spec.modified_after_ns is None
                 and self.spec.modified_before_ns is None and self.spec.include_hidden
                 and self.spec.root_scope is None and self.spec.metric == "logical"):
@@ -118,7 +122,10 @@ class QueryIndex:
             return False
         if spec.extensions and node.ext not in spec.extensions:
             return False
-        if spec.name and spec.name not in node.name.casefold():
+        name = node.name.casefold()
+        if spec.name and spec.name not in name:
+            return False
+        if any(term not in name for term in spec.name_terms):
             return False
         if not spec.include_hidden:
             current = node

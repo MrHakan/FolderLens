@@ -110,6 +110,19 @@ def test_search_rank_breakdowns_and_csv_share_query_scope(tmp_path):
     assert all("extensions=('.png',)" in row["Scope"] for row in rows)
 
 
+def test_global_search_term_composes_with_advanced_filename_condition():
+    root, images, docs, image, hidden, video, note = tree()
+    spec = QuerySpec(categories=("image",), name="picture",
+                     name_terms=("PNG", "picture"))
+    index = QueryEngine(root).project(spec)
+
+    assert index.matches(image)
+    assert not index.matches(note)
+    assert index.count(root) == 1
+    assert index.filter_key == "query"
+    assert index.spec.name_terms == ("png", "picture")
+
+
 def test_query_can_rank_by_allocated_bytes_without_changing_logical_size():
     root, images, docs, image, hidden, video, note = tree()
     index = QueryEngine(root).project(QuerySpec(metric="allocated"))

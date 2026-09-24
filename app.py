@@ -4,6 +4,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from typing import Optional, List, Dict
 import copy
+from dataclasses import replace
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 import json
 import os
@@ -1537,15 +1538,41 @@ class FolderLensApp(ctk.CTk):
     # --------------------------------------------------------------- scan
 
     def _filter_label(self, key: Optional[str] = None) -> str:
-        if isinstance(key, QuerySpec) or (key is None and self._advanced_spec is not None):
+        key = self._projection_key() if key is None else key
+        if isinstance(key, QuerySpec):
+            has_search = bool(key.name_terms)
+            has_custom_filter = bool(
+                key.categories or key.extensions or key.name or key.min_size is not None
+                or key.max_size is not None or key.modified_after_ns is not None
+                or key.modified_before_ns is not None or not key.include_hidden
+                or key.root_scope is not None or key.metric != "logical")
+            if has_search and has_custom_filter:
+                return "Custom filter + search"
+            if has_search:
+                return f"Search {', '.join(key.name_terms)!r}"
             return "Custom filter"
         return FILE_TYPE_FILTER_LABELS.get(key or self.file_filter, "All file types")
 
-    def _has_active_filter(self) -> bool:
+    def _has_base_filter(self) -> bool:
         return self._advanced_spec is not None or self.file_filter != "all"
 
+    def _has_active_filter(self) -> bool:
+        return self._has_base_filter() or bool(self.search_query)
+
     def _projection_key(self):
-        return self._advanced_spec if self._advanced_spec is not None else self.file_filter
+        if self._advanced_spec is not None:
+            spec = self._advanced_spec
+        elif self.file_filter != "all":
+            spec = QuerySpec.category(self.file_filter)
+        elif self.search_query:
+            spec = QuerySpec()
+        else:
+            return "all"
+
+        if self.search_query:
+            spec = replace(spec, name_terms=(*spec.name_terms, self.search_query))
+            return spec
+        return spec if self._advanced_spec is not None else self.file_filter
 
     def _invalidate_filter_index(self):
         """Drop a projection whose underlying scanned tree has changed."""
@@ -2718,7 +2745,7 @@ class FolderLensApp(ctk.CTk):
 
         if self._advanced_spec is not None and self._advanced_spec.categories:
             shown = ("folder", *self._advanced_spec.categories)
-        elif not self._has_active_filter():
+        elif not self._has_base_filter():
             shown = tuple(FILE_CATEGORIES)
         else:
             shown = ("folder", self.file_filter) if self._advanced_spec is None else tuple(FILE_CATEGORIES)
@@ -3175,8 +3202,19 @@ class FolderLensApp(ctk.CTk):
         self._search_after = self.after(250, self._apply_search)
 
     def _apply_search(self):
-        self.search_query = self.search_var.get().strip()
-        if self.active_view in ("Tree", "Largest Files"):
+        self._search_after = None
+        query = self.search_var.get().strip()
+        if query == self.search_query:
+            return
+        self.search_query = query
+        self._invalidate_duplicate_scan()
+        self._invalidate_filter_index()
+        if self.root_node is None:
+            return
+        if self._has_active_filter():
+            self._start_filter_build()
+        else:
+            self._set_view_total()
             self._render_active_view()
 
     def _clear_search(self):
@@ -3293,7 +3331,10 @@ class FolderLensApp(ctk.CTk):
             visible_scope = []
             if self._has_active_filter():
                 visible_scope.append(self._filter_label())
-            if self.search_query:
+            indexed_search = (self._filter_index is not None and self.search_query and
+                              (self.search_query.casefold().strip() == self._filter_index.spec.name or
+                               self.search_query.casefold().strip() in self._filter_index.spec.name_terms))
+            if self.search_query and not indexed_search:
                 visible_scope.append(f"name contains {self.search_query!r}")
             description = " and ".join(visible_scope)
             choice = messagebox.askyesnocancel(
@@ -3464,12 +3505,9 @@ class FolderLensApp(ctk.CTk):
             scope = (f"{len(selection)} selected item(s); {items:,} scanned items; "
                      f"{format_size(total)} total scanned size.")
         if folders and self._has_active_filter():
-            scope += (f"\n\nThe {self._filter_label()} filter only changes the view. "
+            scope += (f"\n\nThe current {self._filter_label()} view only changes which rows appear. "
                       f"{action} will include ALL file types inside selected folders, "
-                      "including files hidden by this filter.")
-        if folders and self.search_query:
-            scope += (f"\n\nSearch for {self.search_query!r} only changes which rows are visible. "
-                      f"{action} applies to the entire selected folder unless you choose matching files.")
+                      "including files hidden by this view.")
         if self.scan_errors:
             scope += ("\n\nThe scan reported inaccessible items. The selected files and folders "
                       "will be checked again on disk; the action stops if the selection cannot be verified.")
