@@ -55,8 +55,9 @@ def validate_selection(nodes: Iterable, *, cancel_event=None,
     """Compare selected scanned subtrees with current names and metadata.
 
     The check never follows symlinks or Windows reparse points. It compares
-    file size and nanosecond mtime, directory mtime and exact child names, and
-    a captured file identity when the scan opted into extended metadata.
+    file size and nanosecond mtime, exact child names, and a captured file
+    identity when the scan opted into extended metadata. Directory mtimes are
+    omitted because they are not stable across filesystems after enumeration.
     """
     result = ValidationResult(valid=True)
     selected = list(nodes)
@@ -76,7 +77,8 @@ def validate_selection(nodes: Iterable, *, cancel_event=None,
         current_reparse = _is_reparse(current)
         if current_is_dir != bool(node.is_dir):
             problem(f"Type changed: {path}")
-        if bool(getattr(node, "modified_date", 0)) and _mtime_ns(current) != int(node.modified_date):
+        if (not current_is_dir and bool(getattr(node, "modified_date", 0))
+                and _mtime_ns(current) != int(node.modified_date)):
             problem(f"Modified since scan: {path}")
         if not current_is_dir and int(current.st_size) != int(node.size):
             problem(f"Size changed: {path}")
@@ -157,7 +159,8 @@ def _matches_snapshot(node, current) -> bool:
         return False
     if bool(getattr(node, "is_reparse_point", False)) != _is_reparse(current):
         return False
-    if bool(node.modified_date) and _mtime_ns(current) != int(node.modified_date):
+    if (not node.is_dir and bool(node.modified_date)
+            and _mtime_ns(current) != int(node.modified_date)):
         return False
     if not node.is_dir and int(node.size) != int(current.st_size):
         return False
