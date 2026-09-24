@@ -1,10 +1,11 @@
 import os
 import sys
 import json
+import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from updater import Updater
+from updater import UpdateInfo, Updater
 import updater as updater_module
 
 
@@ -42,26 +43,37 @@ def test_update_selects_exact_onefile_asset_and_never_source_archive(monkeypatch
         "assets": [
             {"name": "FolderLens-4.0.0-win64.zip", "browser_download_url": "https://example/dir.zip"},
             {"name": "FolderLens.exe", "browser_download_url": "https://example/FolderLens.exe"},
+            {"name": "SHA256SUMS", "browser_download_url": "https://example/SHA256SUMS"},
         ],
         "zipball_url": "https://example/source.zip",
     }
+    digest = hashlib.sha256(b"exe").hexdigest()
 
     class Response:
+        def __init__(self, data):
+            self.data = data
+
         def __enter__(self):
             return self
 
         def __exit__(self, *args):
             pass
 
-        def read(self):
-            return json.dumps(release).encode()
+        def read(self, size=None):
+            return self.data
 
-    monkeypatch.setattr(updater_module, "urlopen", lambda *a, **kw: Response())
+    def fake_urlopen(request, timeout):
+        if request.full_url.endswith("SHA256SUMS"):
+            return Response(f"{digest}  FolderLens.exe\n".encode())
+        return Response(json.dumps(release).encode())
+
+    monkeypatch.setattr(updater_module, "urlopen", fake_urlopen)
     service = Updater()
     monkeypatch.setattr(service, "installation_type", lambda: "onefile")
     available, info, error = service.check_for_updates()
     assert available and error is None
     assert info.download_url == "https://example/FolderLens.exe"
+    assert info.sha256 == digest
     assert info.release_url.endswith("/releases/tag/v4.0.0")
 
     monkeypatch.setattr(service, "installation_type", lambda: "onedir")
@@ -88,3 +100,42 @@ def test_installed_layout_detects_onedir_runtime_bundle(monkeypatch, tmp_path):
     assert Updater.installation_type() == "onefile"
     (tmp_path / "_internal").mkdir()
     assert Updater.installation_type() == "onedir"
+
+
+def test_update_download_checks_hash_and_removes_corrupt_file(monkeypatch, tmp_path):
+    payload = b"downloaded exe"
+
+    class Response:
+        headers = {"content-length": str(len(payload))}
+
+        def __init__(self):
+            self.reads = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, size):
+            self.reads += 1
+            return payload if self.reads == 1 else b""
+
+    monkeypatch.setattr(updater_module, "urlopen", lambda *a, **kw: Response())
+    directories = iter([tmp_path / "bad", tmp_path / "good"])
+
+    def temporary_dir(prefix):
+        folder = next(directories)
+        folder.mkdir()
+        return str(folder)
+
+    monkeypatch.setattr(updater_module.tempfile, "mkdtemp", temporary_dir)
+    info = UpdateInfo("4.0.0", "https://example/FolderLens.exe", "", "", sha256="0" * 64)
+    assert Updater().download_update(info)[0] is False
+    assert not (tmp_path / "bad").exists()
+
+    info.sha256 = hashlib.sha256(payload).hexdigest()
+    success, path, error = Updater().download_update(info)
+    assert success and error is None
+    assert path == str(tmp_path / "good" / "FolderLens.exe")
+    assert (tmp_path / "good" / "FolderLens.exe").read_bytes() == payload

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import hashlib
 import shutil
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from urllib.error import URLError, HTTPError
 from urllib.parse import quote
 
 from version import VERSION, GITHUB_OWNER, GITHUB_REPO
+from release_manifest import expected_sha256
 
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 APP_NAME = "FolderLens"
@@ -19,12 +21,13 @@ APP_NAME = "FolderLens"
 class UpdateInfo:
     """Information about an available update"""
     def __init__(self, version: str, download_url: Optional[str], release_notes: str,
-                 published_at: str, release_url: str = ""):
+                 published_at: str, release_url: str = "", sha256: Optional[str] = None):
         self.version = version
         self.download_url = download_url
         self.release_notes = release_notes
         self.published_at = published_at
         self.release_url = release_url
+        self.sha256 = sha256
 
 
 class Updater:
@@ -92,6 +95,7 @@ class Updater:
             
             if self.compare_versions(latest_version, self.current_version) > 0:
                 download_url = None
+                checksum = None
                 assets = data.get('assets', [])
                 
                 # The ZIP is a complete onedir installation. Replacing only
@@ -101,6 +105,22 @@ class Updater:
                     download_url = next(
                         (asset.get('browser_download_url') for asset in assets
                          if asset.get('name', '').lower() == 'folderlens.exe'), None)
+                    manifest_url = next(
+                        (asset.get('browser_download_url') for asset in assets
+                         if asset.get('name') == 'SHA256SUMS'), None)
+                    if download_url and manifest_url:
+                        try:
+                            manifest_request = Request(
+                                manifest_url, headers={'User-Agent': f'{APP_NAME}/{VERSION}'})
+                            with urlopen(manifest_request, timeout=10) as response:
+                                manifest = response.read(1024 * 1024 + 1)
+                            if len(manifest) > 1024 * 1024:
+                                raise ValueError("Checksum manifest is too large")
+                            checksum = expected_sha256(manifest, "FolderLens.exe")
+                        except (URLError, OSError, ValueError):
+                            download_url = None  # manual path when integrity cannot be checked
+                    else:
+                        download_url = None
 
                 release_url = (f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tag/"
                                f"{quote(data['tag_name'], safe='')}")
@@ -111,6 +131,7 @@ class Updater:
                     release_notes=data.get('body', 'No release notes available.'),
                     published_at=data.get('published_at', ''),
                     release_url=release_url,
+                    sha256=checksum,
                 )
                 
                 return True, update_info, None
@@ -148,18 +169,17 @@ class Updater:
         
         if not update_info.download_url:
             return False, None, "No download URL available"
+        if not update_info.sha256:
+            return False, None, "No verified checksum for this update; use the release page"
         
         self._downloading = True
         
+        temp_dir = None
+        success = False
         try:
             temp_dir = tempfile.mkdtemp(prefix='folderlens_update_')
             
-            url_path = update_info.download_url.split('/')[-1]
-            if '?' in url_path:
-                url_path = url_path.split('?')[0]
-            
-            filename = url_path if url_path else f'FolderLens_{update_info.version}.zip'
-            file_path = os.path.join(temp_dir, filename)
+            file_path = os.path.join(temp_dir, 'FolderLens.exe')
             
             request = Request(
                 update_info.download_url,
@@ -170,6 +190,7 @@ class Updater:
                 total_size = int(response.headers.get('content-length', 0))
                 downloaded = 0
                 chunk_size = 8192
+                digest = hashlib.sha256()
                 
                 with open(file_path, 'wb') as f:
                     while True:
@@ -177,17 +198,23 @@ class Updater:
                         if not chunk:
                             break
                         f.write(chunk)
+                        digest.update(chunk)
                         downloaded += len(chunk)
                         
                         if progress_callback and total_size > 0:
                             progress_callback(downloaded, total_size)
             
+            if digest.hexdigest() != update_info.sha256.lower():
+                return False, None, "Downloaded update did not match its published SHA-256 checksum"
+            success = True
             return True, file_path, None
             
         except Exception as e:
             return False, None, f"Download failed: {str(e)}"
         finally:
             self._downloading = False
+            if temp_dir and not success:
+                shutil.rmtree(temp_dir, ignore_errors=True)
     
     def download_update_async(
         self,

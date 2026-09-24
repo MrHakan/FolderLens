@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import os
+import re
 
 
 def sha256_file(path: str) -> str:
@@ -27,6 +28,22 @@ def write_manifest(paths, output_path: str) -> None:
     lines = [f"{sha256_file(assets[name])}  {name}\n" for name in sorted(assets)]
     with open(output_path, "w", encoding="ascii", newline="\n") as stream:
         stream.writelines(lines)
+
+
+def expected_sha256(manifest: bytes, asset_name: str) -> str:
+    """Read one unambiguous asset digest from a published SHA256SUMS file."""
+    if os.path.basename(asset_name) != asset_name or not asset_name:
+        raise ValueError("Invalid asset name")
+    matches = []
+    for line in manifest.decode("ascii").splitlines():
+        digest, separator, name = line.partition("  ")
+        if name == asset_name:
+            if separator != "  " or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ValueError("Malformed checksum for release asset")
+            matches.append(digest.lower())
+    if len(matches) != 1:
+        raise ValueError("Missing or ambiguous checksum for release asset")
+    return matches[0]
 
 
 if __name__ == "__main__":
