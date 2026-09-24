@@ -918,7 +918,8 @@ class UpdateDialog(ctk.CTkToplevel):
     def _apply(self):
         if not self.downloaded_file:
             return
-        success, error = self.updater.apply_update(self.downloaded_file)
+        success, error = self.updater.apply_update(
+            self.downloaded_file, self.update_info.sha256 if self.update_info else None)
         if success:
             self.status_label.configure(text="Installing update... The app will restart.")
             self.action_btn.configure(state="disabled")
