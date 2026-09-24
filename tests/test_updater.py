@@ -39,9 +39,9 @@ def test_compare_suffixed_parts():
 
 def test_update_selects_exact_onefile_asset_and_never_source_archive(monkeypatch):
     release = {
-        "tag_name": "v4.0.0",
+        "tag_name": "v4.1.0",
         "assets": [
-            {"name": "FolderLens-4.0.0-win64.zip", "browser_download_url": "https://example/dir.zip"},
+            {"name": "FolderLens-4.1.0-win64.zip", "browser_download_url": "https://example/dir.zip"},
             {"name": "FolderLens.exe", "browser_download_url": "https://example/FolderLens.exe"},
             {"name": "SHA256SUMS", "browser_download_url": "https://example/SHA256SUMS"},
         ],
@@ -74,7 +74,7 @@ def test_update_selects_exact_onefile_asset_and_never_source_archive(monkeypatch
     assert available and error is None
     assert info.download_url == "https://example/FolderLens.exe"
     assert info.sha256 == digest
-    assert info.release_url.endswith("/releases/tag/v4.0.0")
+    assert info.release_url.endswith("/releases/tag/v4.1.0")
 
     monkeypatch.setattr(service, "installation_type", lambda: "onedir")
     available, info, error = service.check_for_updates()

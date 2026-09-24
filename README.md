@@ -39,6 +39,10 @@ explored six different ways with zero rescanning:
 - 🧩 **File types** — size and count broken down by category (video, image, code, …) with proportional bars.
 - 🎛️ **Type and advanced filters** — apply categories, extensions, filename terms, size and modified-date ranges, and hidden-file rules across every view. Matching folders remain as context, and Windows hidden attributes are respected.
 - 👯 **Duplicates** — finds byte-identical copies and shows exactly how much space keeping one of each would free. Narrowed by size, then a head/tail sample, then a full hash, so almost nothing is read twice.
+- ⭐ **Filter presets** — one-click presets such as *Images only*, *Large videos*, and *Not modified for a year*, plus your own saved filters.
+- 🕰️ **File age** — the File Types view also groups the same files by last-modified age.
+- 💾 **On-disk size (opt-in)** — for local drives, measure allocated and unique on-disk bytes and hardlinks next to the logical size. Unknown values stay “unknown”; nothing is estimated.
+- ⏭️ **Skip a stuck folder** — when a network folder stops responding, skip it and let the scan finish; the result is clearly marked partial.
 
 ### Image viewer & annotation
 
@@ -88,7 +92,18 @@ python main.py --uninstall
 
 # print version
 python main.py --version
+
+# headless reports: same scanner, filters, and export format as the app
+python main.py "D:\Photos" --category image --json photos.json
+python main.py "D:\Work" --ext .log --modified-before 2025-01-01 --csv old-logs.csv
+python main.py "C:\Data" --on-disk --console
 ```
+
+Report mode never deletes, moves, or zips anything. It exits with `0` for a
+complete scan, `2` when some folders could not be read (partial totals), and
+`1` on failure. Any filter option (`--category`, `--ext`, `--name`,
+`--min-mib`, `--max-mib`, `--modified-after`, `--modified-before`,
+`--exclude-hidden`, `--on-disk`) runs headless.
 
 ### Keyboard shortcuts
 
@@ -199,7 +214,9 @@ latency separately, and repeat both warm-cache and cold-cache runs.
 
 ```
 FolderLens/
-├── main.py               # entry point, CLI
+├── main.py               # entry point and command-line options
+├── cli.py                # headless JSON/CSV reports and exit codes
+├── query.py              # shared QuerySpec projection engine and filter presets
 ├── app.py                # UI (customtkinter + ttk): views, image viewer, toolbars
 ├── scanner.py            # single-pass parallel tree scanner
 ├── analysis.py           # query projections, treemap layout, largest-files, CSV
@@ -215,19 +232,22 @@ FolderLens/
 ├── updater.py            # auto-update handler
 ├── version.py            # version info
 ├── registry_installer.py # Windows Explorer context menu
+├── release_manifest.py   # SHA-256 manifest for release assets
+├── benchmarks/           # dataset generator, scan harness, report comparison
 ├── FolderLens.spec       # antivirus-friendly PyInstaller build
 ├── app.manifest          # asInvoker + DPI + supported-OS manifest
 ├── make_version_info.py  # generates the embedded Windows version resource
 ├── installer/            # versioned Inno Setup installer and build script
 ├── assets/               # app icon (+ generator)
 ├── tests/                # pytest suite
-├── docs/ANTIVIRUS.md     # false-positive guidance
+├── docs/                 # antivirus notes and the 4.0 acceptance checklist
+├── CHANGELOG.md          # release notes
 └── .github/workflows/    # CI (tests) + Release (exe, folder zip, installer)
 ```
 
 ## Releasing
 
-Push a tag like `v3.0.0` (or run the **Release** workflow with a `tag` input).
+Push a tag like `v4.0.0` (or run the **Release** workflow with a `tag` input).
 It runs the tests, generates the version resource, builds the AV-friendly
 one-file exe, one-directory zip, and versioned installer on Windows, smoke-tests
 the executable and installer install/uninstall flow, and publishes a GitHub
