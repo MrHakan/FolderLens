@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import webbrowser
 import zipfile
 
 from PIL import Image, ImageOps, ImageTk
@@ -869,12 +870,22 @@ class UpdateDialog(ctk.CTkToplevel):
             self.action_btn.configure(text="Check Again", command=self._check, state="normal")
         elif available and info:
             self.update_info = info
-            self.status_label.configure(text=f"✅ New version available: {info.version}")
+            manual = not info.download_url
+            self.status_label.configure(text=f"✅ New version available: {info.version}" +
+                                        (" · manual installation" if manual else ""))
             self.status_label.pack(pady=(16, 8))
             self.notes_text.delete("1.0", "end")
-            self.notes_text.insert("1.0", info.release_notes[:500])
+            instructions = ("Download the full package from the release page. Close FolderLens "
+                            "before replacing its installation.\n\n") if manual else ""
+            self.notes_text.insert("1.0", instructions + info.release_notes[:500])
             self.notes_text.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-            self.action_btn.configure(text="Download & Install", command=self._download, state="normal")
+            if manual:
+                self.action_btn.configure(text="Open release page",
+                                          command=lambda: webbrowser.open(info.release_url),
+                                          state="normal")
+            else:
+                self.action_btn.configure(text="Download & Install", command=self._download,
+                                          state="normal")
         else:
             self.status_label.configure(text="✅ You're running the latest version!")
             self.action_btn.configure(text="Check Again", command=self._check, state="normal")
