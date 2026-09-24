@@ -1816,10 +1816,12 @@ class FolderLensApp(ctk.CTk):
             table_wrap = tk.Frame(wrap, bg=colors['tree_bg'])
             table_wrap.pack(fill="both", expand=True)
             tree = ttk.Treeview(
-                table_wrap, columns=("size", "location"), show="headings",
+                table_wrap, columns=("size", "location"), show="tree headings",
                 style="FolderLens.Treeview", selectmode="browse")
+            tree.heading("#0", text="File")
             tree.heading("size", text="Logical size")
             tree.heading("location", text="Folder")
+            tree.column("#0", width=240, minwidth=150, anchor="w")
             tree.column("size", width=125, minwidth=100, anchor="e", stretch=False)
             tree.column("location", width=720, minwidth=260, anchor="w")
             scrollbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)

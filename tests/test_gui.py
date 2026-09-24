@@ -114,6 +114,7 @@ def gui(app_window, sample_tree):
     win.filter_var.set("All file types")
     win._invalidate_filter_index()
     win.treemap_stack = []
+    win.treemap_forward_stack = []
     win.dup_groups = []
     win._hover_tile = None
     win._treemap_image = None
@@ -376,8 +377,9 @@ def test_partial_progress_is_labeled_observed_and_cannot_replace_completion(gui)
     assert "at least" in gui.status_left.cget("text")
     assert "inaccessible" in gui.status_right.cget("text")
     assert len(gui._scan_preview_tree.get_children("")) == 1
-    assert gui._scan_preview_tree.item(
-        gui._scan_preview_tree.get_children("")[0], "values")[0] == "4.00 KB"
+    row = gui._scan_preview_tree.get_children("")[0]
+    assert gui._scan_preview_tree.item(row, "text") == "large.bin"
+    assert gui._scan_preview_tree.item(row, "values")[0] == "4.00 KB"
     gui._scan_completed = True
     gui._set_status("finished")
     gui._scan_snapshot(generation, snapshot)
