@@ -20,6 +20,7 @@ from file_utils import (
 )
 from scanner import TreeScanner, Node, ScanSnapshot, is_network_path
 import analysis
+from query import QueryEngine, QueryIndex, QuerySpec
 import annotate
 import duplicates
 import imagenav
@@ -924,8 +925,9 @@ class FolderLensApp(ctk.CTk):
         self.search_query = ""
         self._search_after = None
         self.file_filter = self.settings.file_filter
-        self._filter_index: Optional[analysis.FilterIndex] = None
+        self._filter_index: Optional[QueryIndex] = None
         self._filter_index_key: Optional[str] = None
+        self._query_engine: Optional[QueryEngine] = None
         self._filter_generation = 0
         self._filter_building = False
         self._is_network_root = False
@@ -1257,6 +1259,10 @@ class FolderLensApp(ctk.CTk):
             self._filter_building = False
             return
 
+        if self._query_engine is None or self._query_engine.root is not root:
+            self._query_engine = QueryEngine(root)
+        engine = self._query_engine
+
         generation = self._filter_generation
         self._filter_building = True
         self._set_status(f"Preparing {self._filter_label(key)} view…")
@@ -1264,8 +1270,8 @@ class FolderLensApp(ctk.CTk):
 
         def worker():
             try:
-                index = analysis.build_filter_index(
-                    root, key,
+                index = engine.project(
+                    QuerySpec.category(key),
                     should_cancel=lambda: (
                         generation != self._filter_generation
                         or root is not self.root_node
@@ -1290,7 +1296,7 @@ class FolderLensApp(ctk.CTk):
         self._render_active_view()
 
     def _filter_build_done(self, root, key: str, generation: int,
-                           index: analysis.FilterIndex):
+                           index: QueryIndex):
         if (root is not self.root_node or key != self.file_filter
                 or generation != self._filter_generation):
             return
@@ -1353,6 +1359,7 @@ class FolderLensApp(ctk.CTk):
         self.settings.save()
         self._is_network_root = is_network_path(path)
         self._invalidate_filter_index()
+        self._query_engine = None
         self.treemap_stack = []
         self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
@@ -2653,6 +2660,9 @@ class FolderLensApp(ctk.CTk):
         if self.root_node:
             if deleted:
                 self._invalidate_filter_index()
+                # Delete mutates the completed tree in place. Projections
+                # cached for this root no longer describe its children.
+                self._query_engine = None
             self._set_view_total()
             status = f"{self._node_count(self.root_node):,} {self._count_label()}"
             if deleted:
