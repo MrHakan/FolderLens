@@ -5,6 +5,7 @@ display. They skip themselves cleanly when tkinter or a display is missing
 (e.g. a plain CI runner without xvfb), and never block on a mainloop.
 """
 import os
+import gc
 import sys
 import threading
 import time
@@ -97,6 +98,9 @@ def gui(app_window, sample_tree):
     """The shared window, reset and pointed at a freshly scanned tree."""
     win = app_window
 
+    # Tk font/widgets from the previous view can form cycles. Finalize them
+    # on the Tk thread before the scanner launches worker threads.
+    gc.collect()
     root = scan_sync(sample_tree)
     assert root is not None
     win.root_node = root
@@ -125,6 +129,7 @@ def gui(app_window, sample_tree):
         yield win
     finally:
         win._clear_body()
+        gc.collect()
 
 
 def show(win, view):
