@@ -582,6 +582,9 @@ def test_explore_shows_tree_map_details_and_syncs_selection(gui):
 
     tree = gui.tree
     folder = next(node for node in gui.root_node.children if node.name == "sub")
+    folder_tile = next(tile for tile in gui._tiles if tile.node is folder)
+    gui._treemap_set_focus(folder_tile, sync_tree=True)
+    assert gui._selected_nodes() == [folder]
     gui._treemap_drill_to(folder)
     assert gui.tree is tree, "map navigation should preserve the paired tree"
     wait_treemap(gui)

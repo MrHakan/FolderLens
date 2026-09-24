@@ -3294,7 +3294,13 @@ class FolderLensApp(ctk.CTk):
         self.treemap_canvas.pack(side="left", fill="both", expand=True)
         workspace.bind("<Configure>", lambda event: self._update_treemap_details_layout(
             event.width), add="+")
-        self.after_idle(lambda: self._update_treemap_details_layout(workspace.winfo_width()))
+        def update_details_layout():
+            try:
+                if workspace.winfo_exists():
+                    self._update_treemap_details_layout(workspace.winfo_width())
+            except tk.TclError:
+                pass
+        self.after_idle(update_details_layout)
         self._build_treemap_legend(wrap, colors)
         if self.tooltip is None:
             self.tooltip = Tooltip(self)
