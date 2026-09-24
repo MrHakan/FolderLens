@@ -89,7 +89,7 @@ def find_duplicates(root, min_size: int = 1,
     """
     from analysis import iter_file_nodes
 
-    if filter_key != "all":
+    if filter_index is not None or filter_key != "all":
         from file_utils import file_type_matches
         predicate = filter_index.matches if filter_index is not None else \
             (lambda node: file_type_matches(node.name, filter_key, is_dir=False))

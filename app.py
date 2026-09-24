@@ -20,7 +20,7 @@ from file_utils import (
 )
 from scanner import TreeScanner, Node, ScanSnapshot, is_network_path
 import analysis
-from query import QueryEngine, QueryIndex, QuerySpec
+from query import QueryEngine, QueryIndex, QuerySpec, query_from_form
 import annotate
 import duplicates
 import imagenav
@@ -925,8 +925,9 @@ class FolderLensApp(ctk.CTk):
         self.search_query = ""
         self._search_after = None
         self.file_filter = self.settings.file_filter
+        self._advanced_spec: Optional[QuerySpec] = None
         self._filter_index: Optional[QueryIndex] = None
-        self._filter_index_key: Optional[str] = None
+        self._filter_index_key: Optional[object] = None
         self._query_engine: Optional[QueryEngine] = None
         self._filter_generation = 0
         self._filter_building = False
@@ -1116,6 +1117,11 @@ class FolderLensApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
         )
         add_hint(self.filter_menu, "Limit every view to one file category; folders with matches stay visible")
+        self.advanced_btn = ctk.CTkButton(
+            self.toolbar, text="More filters", width=94, height=34,
+            fg_color="transparent", border_width=1,
+            text_color=("gray20", "gray80"), command=self._show_advanced_filter)
+        add_hint(self.advanced_btn, "Combine categories, extensions, dates and file sizes")
 
         self._toolbar_narrow = None
         self.bind("<Configure>", self._on_window_configure, add="+")
@@ -1146,17 +1152,20 @@ class FolderLensApp(ctk.CTk):
 
         self.search_entry.pack_forget()
         self.filter_menu.pack_forget()
+        self.advanced_btn.pack_forget()
         self.actions.pack_forget()
 
         if narrow:
             self.toolbar_row2.pack(fill="x")
             self.search_entry.pack(in_=self.toolbar_row2, side="left", padx=(12, 6), pady=7)
             self.filter_menu.pack(in_=self.toolbar_row2, side="left", padx=6, pady=7)
+            self.advanced_btn.pack(in_=self.toolbar_row2, side="left", padx=6, pady=7)
             self.actions.pack(in_=self.toolbar_row2, side="right", padx=(4, 8), pady=4)
         else:
             self.toolbar_row2.pack_forget()
             self.actions.pack(in_=self.toolbar_row1, side="right", padx=(4, 8), pady=6)
             self.filter_menu.pack(in_=self.toolbar_row1, side="right", padx=6, pady=9)
+            self.advanced_btn.pack(in_=self.toolbar_row1, side="right", padx=6, pady=9)
             self.search_entry.pack(in_=self.toolbar_row1, side="right", padx=6, pady=9)
 
     def _build_body(self):
@@ -1233,7 +1242,15 @@ class FolderLensApp(ctk.CTk):
     # --------------------------------------------------------------- scan
 
     def _filter_label(self, key: Optional[str] = None) -> str:
+        if isinstance(key, QuerySpec) or (key is None and self._advanced_spec is not None):
+            return "Custom filter"
         return FILE_TYPE_FILTER_LABELS.get(key or self.file_filter, "All file types")
+
+    def _has_active_filter(self) -> bool:
+        return self._advanced_spec is not None or self.file_filter != "all"
+
+    def _projection_key(self):
+        return self._advanced_spec if self._advanced_spec is not None else self.file_filter
 
     def _invalidate_filter_index(self):
         """Drop a projection whose underlying scanned tree has changed."""
@@ -1243,10 +1260,10 @@ class FolderLensApp(ctk.CTk):
         self._filter_building = False
 
     def _filter_ready_for_view(self) -> bool:
-        if self.file_filter == "all":
+        if not self._has_active_filter():
             return True
         if (self._filter_index is not None
-                and self._filter_index_key == self.file_filter
+                and self._filter_index_key == self._projection_key()
                 and self._filter_index.root is self.root_node):
             return True
         self._empty_hint(f"Applying {self._filter_label()} filter…")
@@ -1254,8 +1271,8 @@ class FolderLensApp(ctk.CTk):
 
     def _start_filter_build(self):
         root = self.root_node
-        key = self.file_filter
-        if root is None or key == "all":
+        key = self._projection_key()
+        if root is None or not self._has_active_filter():
             self._filter_building = False
             return
 
@@ -1271,11 +1288,11 @@ class FolderLensApp(ctk.CTk):
         def worker():
             try:
                 index = engine.project(
-                    QuerySpec.category(key),
+                    key if isinstance(key, QuerySpec) else QuerySpec.category(key),
                     should_cancel=lambda: (
                         generation != self._filter_generation
                         or root is not self.root_node
-                        or key != self.file_filter
+                        or key != self._projection_key()
                     ))
             except Exception as exc:
                 message = str(exc)
@@ -1287,17 +1304,17 @@ class FolderLensApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _filter_build_failed(self, root, key: str, generation: int, message: str):
-        if (root is not self.root_node or key != self.file_filter
+    def _filter_build_failed(self, root, key, generation: int, message: str):
+        if (root is not self.root_node or key != self._projection_key()
                 or generation != self._filter_generation):
             return
         self._filter_building = False
         self._set_status(f"Could not apply {self._filter_label(key)} filter: {message}")
         self._render_active_view()
 
-    def _filter_build_done(self, root, key: str, generation: int,
+    def _filter_build_done(self, root, key, generation: int,
                            index: QueryIndex):
-        if (root is not self.root_node or key != self.file_filter
+        if (root is not self.root_node or key != self._projection_key()
                 or generation != self._filter_generation):
             return
         self._filter_index = index
@@ -1312,7 +1329,7 @@ class FolderLensApp(ctk.CTk):
         if not self.root_node:
             return
         qualifier = "Known (partial scan)" if self.scan_errors else "Total"
-        if self.file_filter == "all" or self._filter_index is None:
+        if not self._has_active_filter() or self._filter_index is None:
             self.status_right.configure(text=f"{qualifier}: {format_size(self.root_node.size)}")
             return
         visible_size = self._filter_index.size(self.root_node)
@@ -1322,26 +1339,26 @@ class FolderLensApp(ctk.CTk):
                  f"{format_size(visible_size)}{(' · partial scan' if self.scan_errors else '')}")
 
     def _node_size(self, node: Node) -> int:
-        if self.file_filter != "all" and self._filter_index is not None:
+        if self._has_active_filter() and self._filter_index is not None:
             return self._filter_index.size(node)
         return node.size
 
     def _node_count(self, node: Node) -> int:
-        if self.file_filter != "all" and self._filter_index is not None:
+        if self._has_active_filter() and self._filter_index is not None:
             return self._filter_index.count(node)
         return node.item_count if node.is_dir else 1
 
     def _count_label(self) -> str:
         """Use precise wording for full-tree item counts vs filtered files."""
-        return "files" if self.file_filter != "all" else "items"
+        return "files" if self._has_active_filter() else "items"
 
     def _visible_children(self, node: Node) -> List[Node]:
-        if self.file_filter != "all" and self._filter_index is not None:
+        if self._has_active_filter() and self._filter_index is not None:
             return self._filter_index.children(node)
         return node.children
 
     def _sorted_children(self, node: Node) -> List[Node]:
-        if self.file_filter != "all" and self._filter_index is not None:
+        if self._has_active_filter() and self._filter_index is not None:
             return self._filter_index.sorted_children(node, self.sort_key, self.sort_reverse)
         return node.sorted_children(self.sort_key, self.sort_reverse)
 
@@ -1417,7 +1434,7 @@ class FolderLensApp(ctk.CTk):
         self._set_status(status)
         self._set_view_total()
         self._update_disk(root.path)
-        if self.file_filter == "all":
+        if not self._has_active_filter():
             self._render_active_view()
         else:
             self._start_filter_build()
@@ -1486,11 +1503,12 @@ class FolderLensApp(ctk.CTk):
         """Build a background projection for the selected file category."""
         reverse = {display: key for key, display in FILE_TYPE_FILTERS}
         key = reverse.get(label, "all")
-        if key == self.file_filter and (
+        if self._advanced_spec is None and key == self.file_filter and (
                 key == "all" or self._filter_index_key == key):
             return
 
         self.file_filter = key
+        self._advanced_spec = None
         self.settings.file_filter = key
         self.settings.save()
         self.treemap_stack = []
@@ -1505,6 +1523,81 @@ class FolderLensApp(ctk.CTk):
             return
 
         self._start_filter_build()
+
+    def _show_advanced_filter(self):
+        """Compose in-memory query conditions; the type menu remains a preset."""
+        spec = self._advanced_spec or QuerySpec.category(self.file_filter)
+        window = ctk.CTkToplevel(self)
+        window.title("Advanced filters")
+        window.geometry("510x650")
+        window.transient(self)
+        body = ctk.CTkScrollableFrame(window, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+        ctk.CTkLabel(body, text="Match files", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(body, text="Within a field, choices use OR. Between fields, conditions use AND.",
+                     text_color="gray", wraplength=450).pack(anchor="w", pady=(2, 10))
+        ctk.CTkLabel(body, text="File types (none selected means all)").pack(anchor="w")
+        categories_frame = ctk.CTkFrame(body, fg_color="transparent")
+        categories_frame.pack(fill="x")
+        category_vars = {}
+        for position, (key, label) in enumerate(FILE_TYPE_FILTERS[1:]):
+            selected = ctk.BooleanVar(value=key in spec.categories)
+            category_vars[key] = selected
+            ctk.CTkCheckBox(categories_frame, text=label, variable=selected, width=185).grid(
+                row=position // 2, column=position % 2, sticky="w", padx=3, pady=4)
+
+        def entry(label, value, hint=""):
+            ctk.CTkLabel(body, text=label).pack(anchor="w", pady=(10, 2))
+            field = ctk.CTkEntry(body, width=445, placeholder_text=hint)
+            field.insert(0, value)
+            field.pack(anchor="w")
+            return field
+
+        ext = entry("Extensions (comma separated)", ", ".join(spec.extensions), ".png, .jpg")
+        name = entry("Filename contains", spec.name, "optional")
+        lower = entry("Minimum size in MiB", "" if spec.min_size is None else
+                      str(spec.min_size / 1048576), "optional")
+        upper = entry("Maximum size in MiB", "" if spec.max_size is None else
+                      str(spec.max_size / 1048576), "optional")
+        from datetime import datetime
+        after = entry("Modified on or after (YYYY-MM-DD)", "" if spec.modified_after_ns is None else
+                      datetime.fromtimestamp(spec.modified_after_ns / 1e9).date().isoformat())
+        before = entry("Modified on or before (YYYY-MM-DD)", "" if spec.modified_before_ns is None else
+                       datetime.fromtimestamp(spec.modified_before_ns / 1e9).date().isoformat())
+        hidden = ctk.BooleanVar(value=spec.include_hidden)
+        ctk.CTkCheckBox(body, text="Include hidden files", variable=hidden).pack(anchor="w", pady=12)
+
+        def apply():
+            try:
+                chosen = query_from_form(
+                    categories=(key for key, variable in category_vars.items() if variable.get()),
+                    extensions=ext.get(), name=name.get(), min_mib=lower.get(), max_mib=upper.get(),
+                    modified_after=after.get(), modified_before=before.get(),
+                    include_hidden=hidden.get())
+            except (ValueError, ArithmeticError, OverflowError) as exc:
+                messagebox.showerror("Invalid filter", str(exc), parent=window)
+                return
+            self._advanced_spec = chosen if chosen != QuerySpec() else None
+            self.file_filter = "all"
+            self.filter_var.set(FILE_TYPE_FILTER_LABELS["all"])
+            self.settings.file_filter = "all"
+            self.settings.save()
+            self.treemap_stack = []
+            self._dup_cancel = True
+            self.dup_groups = []
+            self._invalidate_filter_index()
+            window.destroy()
+            if self.root_node is None or not self._has_active_filter():
+                self._set_view_total()
+                self._render_active_view()
+            else:
+                self._start_filter_build()
+
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill="x", pady=(8, 0))
+        ctk.CTkButton(buttons, text="Apply", command=apply).pack(side="left")
+        ctk.CTkButton(buttons, text="Cancel", fg_color="transparent", border_width=1,
+                      text_color=("gray20", "gray80"), command=window.destroy).pack(side="right")
 
     def _clear_body(self):
         if self.tooltip:
@@ -2129,7 +2222,7 @@ class FolderLensApp(ctk.CTk):
         summary.pack(fill="x")
         summary.pack_propagate(False)
         title = "Treemap  ·  " + node.name
-        if self.file_filter != "all":
+        if self._has_active_filter():
             title += f"  ·  {self._filter_label()} only"
         tk.Label(summary, text=title, bg=colors['head_bg'], fg=colors['tree_fg'],
                  font=("Segoe UI", 11, "bold")).pack(side="left", padx=(14, 4), pady=11)
@@ -2167,10 +2260,12 @@ class FolderLensApp(ctk.CTk):
         inner = tk.Frame(legend, bg=colors['head_bg'])
         inner.pack(side="left", padx=10)
 
-        if self.file_filter == "all":
+        if self._advanced_spec is not None and self._advanced_spec.categories:
+            shown = ("folder", *self._advanced_spec.categories)
+        elif not self._has_active_filter():
             shown = tuple(FILE_CATEGORIES)
         else:
-            shown = ("folder", self.file_filter)
+            shown = ("folder", self.file_filter) if self._advanced_spec is None else tuple(FILE_CATEGORIES)
         for key in shown:
             category = FILE_CATEGORIES.get(key)
             if not category:
@@ -2484,7 +2579,7 @@ class FolderLensApp(ctk.CTk):
             messagebox.showwarning("No data", "Scan a folder first.")
             return
         index = None
-        if self.file_filter != "all":
+        if self._has_active_filter():
             if not self._filter_ready_for_view():
                 return
             choice = messagebox.askyesnocancel(
@@ -2580,7 +2675,7 @@ class FolderLensApp(ctk.CTk):
         folders = any(node.is_dir for _, node in selection)
         scope = (f"{len(selection)} selected item(s); {items:,} scanned items; "
                  f"{format_size(total)} total scanned size.")
-        if folders and self.file_filter != "all":
+        if folders and self._has_active_filter():
             scope += (f"\n\nThe {self._filter_label()} filter only changes the view. "
                       f"{action} will include ALL file types inside selected folders, "
                       "including files hidden by this filter.")
@@ -2668,7 +2763,7 @@ class FolderLensApp(ctk.CTk):
             if deleted:
                 status = f"Deleted {len(deleted)} item(s) · " + status
             self._set_status(status)
-            if deleted and self.file_filter != "all":
+            if deleted and self._has_active_filter():
                 self._start_filter_build()
         if errors:
             messagebox.showerror("Errors", "\n".join(errors[:5]))
