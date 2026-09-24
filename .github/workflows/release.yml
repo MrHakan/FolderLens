@@ -127,9 +127,25 @@ jobs:
           $uninstaller = Get-ChildItem $installDir -Filter 'unins*.exe' | Select-Object -First 1
           if (-not $uninstaller) { throw 'Uninstaller executable is missing' }
           $uninstallerPath = $uninstaller.FullName
-          & $uninstallerPath /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'FolderLens-uninstall.log'
+          & $uninstallerPath /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/LOG=$uninstallLog"
           if ($LASTEXITCODE -ne 0) { throw "Uninstaller exited with $LASTEXITCODE" }
-          if (Test-Path $installedExe) { throw 'Uninstall left FolderLens.exe behind' }
+          $deleteDeadline = (Get-Date).AddSeconds(10)
+          while ((Test-Path $installedExe) -and (Get-Date) -lt $deleteDeadline) {
+            Start-Sleep -Milliseconds 250
+          }
+          if (Test-Path $installedExe) {
+            Write-Host "Uninstaller log ($uninstallLog):"
+            if (Test-Path $uninstallLog) { Get-Content $uninstallLog -Tail 100 }
+            $appProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'FolderLens.exe'" |
+              Where-Object { $_.ExecutablePath -eq $installedExe })
+            if ($appProcesses.Count -gt 0) {
+              Write-Host 'FolderLens processes still using the installed executable:'
+              $appProcesses | Format-Table ProcessId, ExecutablePath
+            }
+            Get-Item $installedExe | Format-List FullName, Length, Attributes, LastWriteTimeUtc
+            throw 'Uninstall left FolderLens.exe behind'
+          }
           if ((Test-Path $backgroundCommandPath) -or (Test-Path $folderCommandPath)) {
             throw 'Uninstall left Explorer context-menu entries behind'
           }
