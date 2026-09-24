@@ -659,23 +659,31 @@ def test_start_screen_offers_places_before_any_scan(gui):
     gui.root_node = None
     show(gui, "Tree")
 
-    texts = []
-
     def collect(widget):
-        for child in widget.winfo_children():
-            try:
-                text = child.cget("text")
-            except tk.TclError:
-                text = ""
-            if text:
-                texts.append(str(text))
-            collect(child)
+        texts = []
+        def visit(widget):
+            for child in widget.winfo_children():
+                try:
+                    text = child.cget("text")
+                except tk.TclError:
+                    text = ""
+                if text:
+                    texts.append(str(text))
+                visit(child)
+        visit(widget)
+        return " ".join(texts)
 
-    collect(gui.body)
-    joined = " ".join(texts)
+    joined = collect(gui.body)
     assert "Where should we look" in joined
     assert "Browse" in joined
-    assert any(place.label in joined for place in locations.start_places())
+    # Cards arrive after filesystem checks on a worker; Browse stays usable.
+    expected = {place.label for place in locations.start_places()}
+    deadline = time.monotonic() + 15
+    while not any(label in joined for label in expected) and time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.02)
+        joined = collect(gui.body)
+    assert any(label in joined for label in expected)
 
 
 def test_breadcrumbs_are_clickable_prefixes(gui, tmp_path):

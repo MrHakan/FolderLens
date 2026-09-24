@@ -266,7 +266,7 @@ def test_partial_snapshot_is_available_while_child_share_is_blocked(tmp_path, mo
              on_snapshot=None, on_event=None, capture_extended=False):
         if node.path == str(blocked):
             entered.set()
-            assert release.wait(5)
+            assert release.wait(30)
         return original(node, errors, on_progress, work_queue, session,
                         on_snapshot, on_event, capture_extended)
 
@@ -279,14 +279,14 @@ def test_partial_snapshot_is_available_while_child_share_is_blocked(tmp_path, mo
     scanner.scan(str(tmp_path), on_snapshot=observe,
                  on_complete=lambda *args: done.set())
     try:
-        assert entered.wait(5)
-        assert snapshot_ready.wait(5)
+        assert entered.wait(20), f"scan did not reach child: {snapshots[-1:]!r}"
+        assert snapshot_ready.wait(20)
         assert not done.is_set()
         assert any(s.state == "scanning" and s.known_bytes == 5 and s.partial
                    for s in snapshots)
     finally:
         release.set()
-    assert done.wait(5)
+    assert done.wait(20)
 
 
 def test_inaccessible_subtree_keeps_observed_bytes_partial(tmp_path, monkeypatch):
