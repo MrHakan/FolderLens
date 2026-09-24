@@ -28,5 +28,8 @@ def test_installer_build_uses_the_application_version_and_script(tmp_path):
 def test_installer_build_fails_clearly_when_iscc_is_unavailable(tmp_path, monkeypatch):
     monkeypatch.setenv("ISCC_PATH", str(tmp_path / "missing.exe"))
     monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "missing-x86"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "missing-programfiles"))
+    monkeypatch.setattr(build_installer.shutil, "which", lambda *_args: None)
     with pytest.raises(FileNotFoundError, match="Inno Setup 6 compiler"):
         build_installer.find_compiler()

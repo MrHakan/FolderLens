@@ -587,8 +587,11 @@ def test_treemap_supports_keyboard_focus_and_item_announcement(gui):
     gui._draw_treemap()
     wait_treemap(gui)
 
-    gui.treemap_canvas.focus_set()
-    gui.update_idletasks()
+    # focus_set() is ignored for withdrawn/headless roots on some window
+    # managers. Exercise the same FocusIn handler directly after asserting
+    # that the canvas is wired to receive the event.
+    assert gui.treemap_canvas.bind("<FocusIn>")
+    gui._treemap_focus_in()
     assert gui._treemap_focus_tile in gui._tiles
     assert ":" in gui._treemap_focus_info.cget("text")
     assert "Map:" not in gui._treemap_focus_info.cget("text")

@@ -69,7 +69,9 @@ def test_create_zip_preserves_archive_paths_and_checks_freshness(tmp_path):
     assert result.files_written == 2
     assert result.errors == []
     with zipfile.ZipFile(destination) as archive:
-        assert archive.namelist() == ["picked/one.txt", "picked/sub/two.txt"]
+        # scandir ordering differs by filesystem; ZIP members need not be in
+        # one specific order as long as the captured paths are preserved.
+        assert set(archive.namelist()) == {"picked/one.txt", "picked/sub/two.txt"}
         assert archive.read("picked/one.txt") == b"hello"
 
     destination.unlink()
