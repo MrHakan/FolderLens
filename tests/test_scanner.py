@@ -329,6 +329,10 @@ def test_partial_snapshot_is_available_while_child_share_is_blocked(tmp_path, mo
         assert not done.is_set()
         assert any(s.state == "scanning" and s.known_bytes == 5 and s.partial
                    for s in snapshots)
+        assert any(s.state == "scanning" and
+                   any(sample.name == "known.txt" and sample.size == 5
+                       for sample in s.observed_files)
+                   for s in snapshots)
     finally:
         release.set()
     assert done.wait(20)
@@ -358,6 +362,25 @@ def test_inaccessible_subtree_keeps_observed_bytes_partial(tmp_path, monkeypatch
     assert snapshots[-1].state == "complete"
     assert snapshots[-1].partial is True
     assert snapshots[-1].known_bytes == 5
+
+
+def test_scan_snapshot_keeps_only_the_largest_fifty_observed_files(tmp_path):
+    for number in range(80):
+        (tmp_path / f"file-{number:03}.bin").write_bytes(b"x" * (number + 1))
+
+    scanner = TreeScanner()
+    scanner.SNAPSHOT_INTERVAL = 0
+    done = threading.Event()
+    snapshots = []
+    scanner.scan(str(tmp_path), on_snapshot=snapshots.append,
+                 on_complete=lambda *args: done.set())
+    assert done.wait(10)
+    scanner._current_thread.join(timeout=5)
+
+    final = snapshots[-1]
+    assert len(final.observed_files) == 50
+    assert [sample.size for sample in final.observed_files] == list(range(80, 30, -1))
+    assert final.observed_files[0].name == "file-079.bin"
 
 
 def test_closed_progress_consumer_does_not_break_scan(tmp_path):

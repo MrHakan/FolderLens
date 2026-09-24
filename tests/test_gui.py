@@ -23,7 +23,7 @@ if sys.platform != "win32" and not os.environ.get("DISPLAY"):
 import locations
 import analysis
 import treemap_render
-from scanner import TreeScanner, ScanSnapshot, Node
+from scanner import TreeScanner, ScanSnapshot, ObservedFile, Node
 
 
 def scan_sync(path):
@@ -362,19 +362,28 @@ def test_stale_scan_callback_cannot_replace_current_tree(gui):
 
 
 def test_partial_progress_is_labeled_observed_and_cannot_replace_completion(gui):
+    previous_root = gui.root_node
+    gui.root_node = None
     gui._scan_generation += 1
     gui._scan_completed = False
     gui._scan_observed_count = 0
+    gui._latest_scan_snapshot = None
     generation = gui._scan_generation
-    snapshot = ScanSnapshot(generation, gui.root_node.path, "scanning", 4096, 2, 3,
-                            1, 4, 1, 2, 0, 0.5, True)
+    snapshot = ScanSnapshot(generation, previous_root.path, "scanning", 4096, 2, 3,
+                            1, 4, 1, 2, 0, 0.5, True,
+                            (ObservedFile(previous_root.path + "/large.bin", "large.bin", 4096),))
     gui._scan_snapshot(generation, snapshot)
     assert "at least" in gui.status_left.cget("text")
     assert "inaccessible" in gui.status_right.cget("text")
+    assert len(gui._scan_preview_tree.get_children("")) == 1
+    assert gui._scan_preview_tree.item(
+        gui._scan_preview_tree.get_children("")[0], "values")[0] == "4.00 KB"
     gui._scan_completed = True
     gui._set_status("finished")
     gui._scan_snapshot(generation, snapshot)
     assert gui.status_left.cget("text") == "finished"
+    gui.root_node = previous_root
+    gui._render_active_view()
 
 
 def test_filtered_folder_action_uses_real_size_and_all_types(gui, monkeypatch):

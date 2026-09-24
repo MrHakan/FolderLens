@@ -1,3 +1,4 @@
+import heapq
 import os
 import queue
 import stat as stat_module
@@ -151,6 +152,15 @@ class ScanResult:
 
 
 @dataclass(frozen=True)
+class ObservedFile:
+    """A bounded, immutable sample of large files encountered so far."""
+
+    path: str
+    name: str
+    size: int
+
+
+@dataclass(frozen=True)
 class ScanSnapshot:
     """Immutable progress values; the live Node tree is never shared mid-scan.
 
@@ -171,6 +181,7 @@ class ScanSnapshot:
     deferred_high_water: int
     elapsed_seconds: float
     partial: bool
+    observed_files: tuple = ()
 
 
 @dataclass
@@ -189,7 +200,10 @@ class ScanSession:
     error_count: int = 0
     queue_high_water: int = 0
     deferred_high_water: int = 0
+    observed_file_heap: list = field(default_factory=list)
     last_snapshot: float = 0.0
+
+    MAX_OBSERVED_FILES = 50
 
     def snapshot(self) -> ScanSnapshot:
         with self.lock:
@@ -200,6 +214,10 @@ class ScanSession:
                 self.error_count, self.queue_high_water, self.deferred_high_water,
                 round(time.monotonic() - self.started, 3),
                 self.state != "complete" or self.error_count > 0,
+                tuple(
+                    ObservedFile(path, os.path.basename(path) or path, size)
+                    for size, path in sorted(self.observed_file_heap, reverse=True)
+                ),
             )
 
 
@@ -251,6 +269,7 @@ class TreeScanner:
     MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
     NETWORK_WORKERS = 6
     PROGRESS_EVERY = 500
+    SNAPSHOT_ITEMS_EVERY = 128
     SNAPSHOT_INTERVAL = 0.15
     QUEUE_PER_WORKER = 32
 
@@ -322,12 +341,19 @@ class TreeScanner:
 
     def _tick_progress(self, on_progress: Optional[Callable[[int], None]],
                        session: ScanSession, n: int = 1, bytes_seen: int = 0,
-                       files_seen: int = 0, on_snapshot=None):
+                       files_seen: int = 0, on_snapshot=None,
+                       observed_files: Optional[List[tuple]] = None):
         with session.lock:
             before = session.progress_count
             session.progress_count += n
             session.known_bytes += bytes_seen
             session.known_files += files_seen
+            for path, size in observed_files or ():
+                candidate = (int(size), path)
+                if len(session.observed_file_heap) < session.MAX_OBSERVED_FILES:
+                    heapq.heappush(session.observed_file_heap, candidate)
+                elif candidate > session.observed_file_heap[0]:
+                    heapq.heapreplace(session.observed_file_heap, candidate)
             after = session.progress_count
         if (on_progress is not None and not session.cancel.is_set()
                 and before // self.PROGRESS_EVERY != after // self.PROGRESS_EVERY):
@@ -375,6 +401,8 @@ class TreeScanner:
                 batch = 0
                 batch_bytes = 0
                 batch_files = 0
+                batch_observed = []
+                next_snapshot_check = time.monotonic() + self.SNAPSHOT_INTERVAL
                 for entry in entries:
                     if session is not None and session.cancel.is_set():
                         break
@@ -406,19 +434,26 @@ class TreeScanner:
                         if not is_dir:
                             batch_bytes += child.size
                             batch_files += 1
-                        if batch >= self.PROGRESS_EVERY:
+                            if session is not None:
+                                batch_observed.append((entry.path, child.size))
+                        if (batch >= self.SNAPSHOT_ITEMS_EVERY
+                                or time.monotonic() >= next_snapshot_check):
                             self._tick_progress(on_progress, session, batch, batch_bytes,
-                                                batch_files, on_snapshot)
+                                                batch_files, on_snapshot,
+                                                observed_files=batch_observed)
                             self._event(session, on_event, "batch-of-entries", node.path, batch)
                             batch = 0
                             batch_bytes = batch_files = 0
+                            batch_observed = []
+                            next_snapshot_check = time.monotonic() + self.SNAPSHOT_INTERVAL
                     except PermissionError:
                         report_error(f"Access denied: {entry.path}", entry.path)
                     except OSError as e:
                         report_error(f"Error: {entry.path} - {str(e)}", entry.path)
                 if batch:
                     self._tick_progress(on_progress, session, batch, batch_bytes,
-                                        batch_files, on_snapshot)
+                                        batch_files, on_snapshot,
+                                        observed_files=batch_observed)
                     self._event(session, on_event, "batch-of-entries", node.path, batch)
             return None
         except PermissionError:

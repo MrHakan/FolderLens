@@ -148,21 +148,30 @@ python installer/build_installer.py
 Run the same harness against the same unchanged folder or share for each
 version, and keep the report files outside the scanned folder:
 
-```bash
-python benchmarks/scan_baseline.py "C:\test-data\million-files" --runs 5 \
-  --dataset-label local-1m --storage-label NVMe-SSD \
-  --cache-state warm --defender enabled \
-  --output C:\bench\candidate.json
-python benchmarks/compare_scans.py C:\bench\3.4.1.json C:\bench\candidate.json \
-  --output C:\bench\comparison.json
+```powershell
+$harness = 'C:/work/FolderLens/benchmarks/scan_baseline.py'
+$env:FOLDERLENS_SCANNER_SOURCE = 'C:/work/FolderLens-v3.4.0'
+python $harness C:/test-data/million-files --runs 5 --version-label v3.4.0 `
+  --dataset-label local-1m --storage-label NVMe-SSD --cache-state warm `
+  --defender enabled --output C:/bench/3.4.0.json
+Remove-Item Env:FOLDERLENS_SCANNER_SOURCE
+python $harness C:/test-data/million-files --runs 5 --version-label 4.0-candidate `
+  --dataset-label local-1m --storage-label NVMe-SSD --cache-state warm `
+  --defender enabled --output C:/bench/candidate.json
+python C:/work/FolderLens/benchmarks/compare_scans.py C:/bench/3.4.0.json `
+  C:/bench/candidate.json --output C:/bench/comparison.json
 ```
 
-For a 3.4.x baseline, run the current harness from a 3.4.x source worktree so
-the scanner and version both come from that checkout. Use matching dataset
-labels, cache state, Defender state, host, and path. The report includes first
-progress, first 500 entries, first partial result, scan duration, process RSS,
-Python allocation peak, queue high-water marks, item count, and inaccessible
-paths. For SMB runs, pass the measured `--network-rtt-ms` and
+For the shipped v3.4.0 baseline, point `FOLDERLENS_SCANNER_SOURCE` at a clean
+v3.4.0 checkout. The current harness adapts to its older scanner callback API;
+`--version-label` records the tag while `application_version` preserves the
+version embedded in that source. Use matching dataset labels, cache state,
+Defender state, host, and path. The report includes first
+progress, time to the first visible file sample, first 500 entries, first
+partial result, scan duration, process RSS, Python allocation peak, queue
+high-water marks, item count, and inaccessible paths. During a scan the app
+shows a provisional list of up to 25 largest files seen so far; it is clearly
+labeled until the final ranking is available. For SMB runs, pass the measured `--network-rtt-ms` and
 `--network-bandwidth-mbps`. Timeout runs cancel and are marked incomplete. The
 comparison reports ratios and checks whether both versions scanned the same
 item and inaccessible counts; it does not treat a single run as a release

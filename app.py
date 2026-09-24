@@ -1164,6 +1164,10 @@ class FolderLensApp(ctk.CTk):
         self._scan_generation = 0
         self._scan_completed = True
         self._scan_observed_count = 0
+        self._latest_scan_snapshot: Optional[ScanSnapshot] = None
+        self._scan_preview_tree = None
+        self._scan_preview_status = None
+        self._scan_preview_signature = None
         self.root_node: Optional[Node] = None
         self.scan_errors: List[str] = []
         self.scan_time = 0.0
@@ -1730,6 +1734,7 @@ class FolderLensApp(ctk.CTk):
         generation = self._scan_generation
         self._scan_completed = False
         self._scan_observed_count = 0
+        self._latest_scan_snapshot = None
         self.settings.last_folder = path
         self.settings.save()
         self._is_network_root = is_network_path(path)
@@ -1761,15 +1766,81 @@ class FolderLensApp(ctk.CTk):
     def _scan_snapshot(self, generation: int, snapshot: ScanSnapshot):
         if (generation != self._scan_generation or self._scan_completed
                 or snapshot.state != "scanning"
-                or snapshot.observed_items < self._scan_observed_count):
+                or snapshot.observed_items < self._scan_observed_count
+                or (self._latest_scan_snapshot is not None
+                    and snapshot.elapsed_seconds < self._latest_scan_snapshot.elapsed_seconds)):
             return
         self._scan_observed_count = snapshot.observed_items
+        self._latest_scan_snapshot = snapshot
         self._set_status(f"Scanning… {snapshot.observed_items:,} items seen · "
                          f"at least {format_size(snapshot.known_bytes)}")
         suffix = f" · {snapshot.errors} inaccessible" if snapshot.errors else ""
         self.status_right.configure(
             text=f"Observed: {snapshot.known_files:,} files · "
                  f"at least {format_size(snapshot.known_bytes)}{suffix}")
+
+        if self.root_node is None and snapshot.observed_files:
+            self._render_scan_preview(snapshot)
+
+    def _render_scan_preview(self, snapshot: ScanSnapshot):
+        """Show a bounded provisional top-files list while the scan is running."""
+        samples = snapshot.observed_files[:25]
+        if not samples:
+            return
+
+        tree = self._scan_preview_tree
+        try:
+            ready = tree is not None and bool(tree.winfo_exists())
+        except tk.TclError:
+            ready = False
+        if not ready:
+            self._clear_body()
+            colors = self._colors()
+            wrap = tk.Frame(self.body, bg=colors['tree_bg'])
+            wrap.pack(fill="both", expand=True, padx=18, pady=18)
+            tk.Label(wrap, text="Largest files observed so far",
+                     bg=colors['tree_bg'], fg=colors['tree_fg'],
+                     font=("Segoe UI", 16, "bold")).pack(anchor="w")
+            tk.Label(wrap,
+                     text="Provisional ranking · unscanned folders may contain larger files; folder totals settle when the scan completes.",
+                     bg=colors['tree_bg'], fg=colors['muted_fg'],
+                     font=("Segoe UI", 10), wraplength=900,
+                     justify="left").pack(anchor="w", pady=(5, 10))
+            self._scan_preview_status = tk.Label(
+                wrap, text="", bg=colors['tree_bg'], fg=colors['muted_fg'],
+                font=("Segoe UI", 10), anchor="w")
+            self._scan_preview_status.pack(fill="x", pady=(0, 8))
+            table_wrap = tk.Frame(wrap, bg=colors['tree_bg'])
+            table_wrap.pack(fill="both", expand=True)
+            tree = ttk.Treeview(
+                table_wrap, columns=("size", "location"), show="headings",
+                style="FolderLens.Treeview", selectmode="browse")
+            tree.heading("size", text="Logical size")
+            tree.heading("location", text="Folder")
+            tree.column("size", width=125, minwidth=100, anchor="e", stretch=False)
+            tree.column("location", width=720, minwidth=260, anchor="w")
+            scrollbar = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=scrollbar.set)
+            tree.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            self._scan_preview_tree = tree
+            self._scan_preview_signature = None
+
+        self._scan_preview_status.configure(
+            text=(f"{snapshot.known_files:,} files observed · "
+                  f"at least {format_size(snapshot.known_bytes)} · "
+                  f"{snapshot.directories_completed:,} folders completed · "
+                  f"{snapshot.errors:,} inaccessible"))
+        signature = tuple((sample.path, sample.size) for sample in samples)
+        if signature != self._scan_preview_signature:
+            children = self._scan_preview_tree.get_children("")
+            if children:
+                self._scan_preview_tree.delete(*children)
+            for sample in samples:
+                self._scan_preview_tree.insert(
+                    "", "end", text=sample.name,
+                    values=(format_size(sample.size), os.path.dirname(sample.path)))
+            self._scan_preview_signature = signature
 
     def _scan_done_if_current(self, generation: int, root: Node,
                               errors: List[str], scan_time: float):
@@ -2044,6 +2115,9 @@ class FolderLensApp(ctk.CTk):
         self._treemap_detail_location = None
         self._treemap_detail_action = None
         self._treemap_details_toggle = None
+        self._scan_preview_tree = None
+        self._scan_preview_status = None
+        self._scan_preview_signature = None
         # every row that was pointing at a thumbnail is gone with them; the
         # map would otherwise grow for the lifetime of the session
         self._row_by_path.clear()
@@ -2052,6 +2126,13 @@ class FolderLensApp(ctk.CTk):
 
     def _render_active_view(self):
         self._clear_body()
+        if self.root_node is None and not self._scan_completed:
+            snapshot = self._latest_scan_snapshot
+            if snapshot is not None and snapshot.observed_files:
+                self._render_scan_preview(snapshot)
+            else:
+                self._empty_hint("Scanning folder…")
+            return
         if self.active_view == "Tree":
             self._render_tree()
         elif self.active_view == "Treemap":

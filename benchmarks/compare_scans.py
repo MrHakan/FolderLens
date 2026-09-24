@@ -13,6 +13,7 @@ METRICS = (
     "p95_scan_seconds",
     "median_first_500_items_seconds",
     "median_first_partial_seconds",
+    "median_first_useful_result_seconds",
     "median_peak_rss_bytes",
     "median_peak_rss_delta_bytes",
     "median_python_alloc_peak_bytes",

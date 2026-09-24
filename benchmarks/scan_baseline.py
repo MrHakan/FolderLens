@@ -1,11 +1,13 @@
 """Repeatable metadata scan baseline for local folders and mounted/UNC shares.
 
-Run the same command on the same folder for each version.  Report Python
-allocation peak, sampled process RSS, time to first progress, and completion
-time. Avoid altering the target while a run is in progress.
+Run the same command on the same folder for each version. A current harness
+can load an older FolderLens scanner from ``FOLDERLENS_SCANNER_SOURCE``. Report
+Python allocation peak, sampled process RSS, time to the first visible file
+sample, and completion time. Avoid altering the target during a run.
 """
 
 import argparse
+import inspect
 import json
 import os
 import platform
@@ -15,7 +17,14 @@ import threading
 import time
 import tracemalloc
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_scanner_source = os.environ.get("FOLDERLENS_SCANNER_SOURCE")
+if _scanner_source:
+    _scanner_source = os.path.abspath(_scanner_source)
+    if not os.path.isfile(os.path.join(_scanner_source, "scanner.py")):
+        raise SystemExit("FOLDERLENS_SCANNER_SOURCE must point to a FolderLens checkout")
+    sys.path.insert(0, _scanner_source)
+else:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scanner import TreeScanner, is_network_path
 from version import VERSION
@@ -103,6 +112,9 @@ def measure(path: str, timeout_seconds: float = 14_400) -> dict:
         outcome["deferred_high_water"] = value.deferred_high_water
         if value.state == "scanning" and (value.known_files or value.directories_completed):
             outcome.setdefault("first_partial_seconds", round(time.perf_counter() - start, 3))
+        if value.state == "scanning" and getattr(value, "observed_files", ()):
+            outcome.setdefault("first_useful_result_seconds",
+                               round(time.perf_counter() - start, 3))
 
     def complete(root, errors, duration):
         outcome.update(scan_state="complete", items=root.item_count,
@@ -125,8 +137,20 @@ def measure(path: str, timeout_seconds: float = 14_400) -> dict:
     sampler = threading.Thread(target=sample_rss, daemon=True, name="folderlens-rss-sampler")
     sampler.start()
     try:
-        scanner.scan(path, on_progress=progress, on_snapshot=snapshot,
-                     on_complete=complete, on_error=failed)
+        callbacks = {
+            "on_progress": progress,
+            "on_snapshot": snapshot,
+            "on_complete": complete,
+            "on_error": failed,
+        }
+        parameters = inspect.signature(scanner.scan).parameters.values()
+        accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                             for parameter in parameters)
+        supported = {parameter.name for parameter in parameters}
+        scanner.scan(path, **{
+            name: callback for name, callback in callbacks.items()
+            if accepts_kwargs or name in supported
+        })
         timed_out = not done.wait(timeout_seconds)
         if timed_out:
             scanner.cancel()
@@ -162,6 +186,8 @@ def main():
                         help="Maximum time per run before cancellation (default: 4 hours)")
     parser.add_argument("--output", help="Optional JSON report path")
     parser.add_argument("--dataset-label", help="Short label for the controlled test dataset")
+    parser.add_argument("--version-label",
+                        help="Release/tag label when measuring a source checkout with version drift")
     parser.add_argument("--cache-state", choices=("unknown", "cold", "warm"), default="unknown")
     parser.add_argument("--defender", choices=("unknown", "enabled", "disabled"), default="unknown",
                         help="Windows Defender state during the run")
@@ -188,7 +214,8 @@ def main():
         return round(value, 3) if key.endswith("_seconds") else value
 
     report = {
-        "version": VERSION,
+        "version": args.version_label or VERSION,
+        "application_version": VERSION,
         "path": path,
         "dataset_label": args.dataset_label,
         "network_path": is_network_path(path),
@@ -218,6 +245,7 @@ def main():
             "median_first_progress_seconds": median("first_progress_seconds"),
             "median_first_500_items_seconds": median("first_500_items_seconds"),
             "median_first_partial_seconds": median("first_partial_seconds"),
+            "median_first_useful_result_seconds": median("first_useful_result_seconds"),
             "median_peak_rss_bytes": median("peak_rss_bytes"),
             "median_peak_rss_delta_bytes": median("peak_rss_delta_bytes"),
             "median_python_alloc_peak_bytes": median("python_alloc_peak_bytes"),
