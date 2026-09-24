@@ -1207,6 +1207,7 @@ class FolderLensApp(ctk.CTk):
         self._pending_tree_expansion_pages = {}
         self._pending_explore_select_node: Optional[Node] = None
         self._cross_selection_path: Optional[str] = None
+        self._cross_selection_node: Optional[Node] = None
         self._selection_sync_in_progress = False
         self._explore_tree_host = None
         self._explore_map_host = None
@@ -1753,6 +1754,8 @@ class FolderLensApp(ctk.CTk):
         self._invalidate_duplicate_scan()
         self.treemap_stack = []
         self.treemap_forward_stack = []
+        self._cross_selection_path = None
+        self._cross_selection_node = None
         self._set_breadcrumbs(path)
         self._set_status(f"Scanning {path} …")
         self._show_progress(True)
@@ -2780,12 +2783,19 @@ class FolderLensApp(ctk.CTk):
             if len(nodes) == 1:
                 node = nodes[0]
                 self._cross_selection_path = node.path
+                self._cross_selection_node = node
                 if self.active_view == "Explore":
                     tile = self._find_treemap_tile_for_node(node)
-                    if tile is not None:
+                    if (tile is not None and
+                            (tile.node is node or
+                             (getattr(tile.node, "is_aggregate", False)
+                              and tile.node.parent is node.parent))):
                         self._treemap_set_focus(tile)
+                    else:
+                        self._show_explore_node_in_map(node)
             else:
                 self._cross_selection_path = None
+                self._cross_selection_node = None
 
     def _on_tree_double(self, event):
         iid = self.tree.identify_row(event.y)
@@ -3497,11 +3507,16 @@ class FolderLensApp(ctk.CTk):
                 self._treemap_focus_info.configure(
                     text="Map: arrows select · Enter opens · Backspace goes up")
             if self.active_view == "Explore" and self._cross_selection_path:
-                tile = next((item for item in self._tiles
-                             if getattr(item.node, "path", None) == self._cross_selection_path), None)
+                node = self._cross_selection_node
+                tile = (self._find_treemap_tile_for_node(node) if node is not None else
+                        next((item for item in self._tiles
+                              if getattr(item.node, "path", None) == self._cross_selection_path), None))
                 if tile is not None:
                     self._treemap_set_focus(tile)
-                    self._sync_explore_tree_selection(tile.node)
+                    if node is not None:
+                        self._sync_explore_tree_selection(node)
+                    elif not getattr(tile.node, "is_aggregate", False):
+                        self._sync_explore_tree_selection(tile.node)
                 elif self.active_view == "Explore" and self._tiles:
                     self._treemap_set_focus(max(self._tiles,
                                                 key=lambda item: (item.w * item.h, item.depth)))
@@ -3626,13 +3641,49 @@ class FolderLensApp(ctk.CTk):
             node = tile.node.parent if getattr(tile.node, "is_aggregate", False) else tile.node
             if node is not None:
                 self._cross_selection_path = node.path
+                self._cross_selection_node = node
                 self._sync_explore_tree_selection(node)
 
     def _find_treemap_tile_for_node(self, node):
+        if node is None:
+            return None
         for tile in self._tiles:
             if tile.node is node:
                 return tile
+
+        # A tree row can be deeper than the currently visible treemap detail.
+        # Prefer an aggregate for its immediate parent, then the nearest
+        # visible ancestor; tree selection can zoom the map when neither is
+        # the selected item itself.
+        parent = node.parent
+        while parent is not None:
+            for tile in self._tiles:
+                if (getattr(tile.node, "is_aggregate", False)
+                        and tile.node.parent is parent):
+                    return tile
+            for tile in self._tiles:
+                if tile.node is parent:
+                    return tile
+            parent = parent.parent
         return None
+
+    def _show_explore_node_in_map(self, node):
+        """Zoom the paired map to the selected row's containing folder."""
+        if self.active_view != "Explore" or self.root_node is None or node is None:
+            return
+        ancestors = []
+        parent = node.parent
+        while parent is not None and parent is not self.root_node:
+            ancestors.append(parent)
+            parent = parent.parent
+        if parent is not self.root_node:
+            return
+        target_stack = list(reversed(ancestors))
+        if target_stack == self.treemap_stack:
+            return
+        self.treemap_stack = target_stack
+        self.treemap_forward_stack.clear()
+        self._refresh_explore_map()
 
     def _sync_explore_tree_selection(self, node):
         """Reveal a map selection in the tree when the scanned row can be loaded."""

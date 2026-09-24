@@ -115,6 +115,8 @@ def gui(app_window, sample_tree):
     win._invalidate_filter_index()
     win.treemap_stack = []
     win.treemap_forward_stack = []
+    win._cross_selection_path = None
+    win._cross_selection_node = None
     win.dup_groups = []
     win._hover_tile = None
     win._treemap_image = None
@@ -584,6 +586,27 @@ def test_explore_shows_tree_map_details_and_syncs_selection(gui):
     assert gui.tree is tree, "map navigation should preserve the paired tree"
     wait_treemap(gui)
     assert gui.treemap_node is folder
+
+
+def test_explore_tree_selection_returns_zoomed_map_to_selected_row(gui):
+    show(gui, "Explore")
+    wait_treemap(gui)
+
+    folder = next(node for node in gui.root_node.children if node.name == "sub")
+    note = next(node for node in gui.root_node.children if node.name == "notes.txt")
+    note_iid = gui._tree_iid_for_node(note)
+    assert note_iid is not None
+
+    gui._treemap_drill_to(folder)
+    wait_treemap(gui)
+    assert gui.treemap_node is folder
+
+    gui.tree.selection_set(note_iid)
+    gui._on_tree_select(None)
+    assert gui.treemap_stack == [], "selecting a row outside the zoomed folder should return to the root map"
+    wait_treemap(gui)
+    assert gui._treemap_focus_tile.node is note
+    assert gui._selected_nodes() == [note]
 
 
 @pytest.mark.parametrize("scale", [1.25, 1.5, 2.0])
