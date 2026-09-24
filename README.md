@@ -145,17 +145,34 @@ python installer/build_installer.py
 
 ### Scan baseline for 4.0 development
 
-Run `python benchmarks/scan_baseline.py PATH --runs 3 --output scan-results.json`
-against the same unchanged local folder or network share on each version.
-The report includes scan duration, first partial result, first 500-entry
-progress event, queue high-water marks, Python allocation peak, scanned item
-count, and inaccessible path count. Snapshot bytes are observed values until
-the scan finishes; inaccessible paths keep a completed result partial.
-Logical size counts each hardlink path separately. Extended allocated size
-uses optional filesystem block metadata and is unavailable on some shares;
-reparse points and symlinks are listed but never traversed by default.
-Python allocation peak is not process RSS; use an external process monitor to
-compare total memory and record share latency and cache state separately.
+Run the same harness against the same unchanged folder or share for each
+version, and keep the report files outside the scanned folder:
+
+```bash
+python benchmarks/scan_baseline.py "C:\test-data\million-files" --runs 5 \
+  --dataset-label local-1m --storage-label NVMe-SSD \
+  --cache-state warm --defender enabled \
+  --output C:\bench\candidate.json
+python benchmarks/compare_scans.py C:\bench\3.4.1.json C:\bench\candidate.json \
+  --output C:\bench\comparison.json
+```
+
+For a 3.4.x baseline, run the current harness from a 3.4.x source worktree so
+the scanner and version both come from that checkout. Use matching dataset
+labels, cache state, Defender state, host, and path. The report includes first
+progress, first 500 entries, first partial result, scan duration, process RSS,
+Python allocation peak, queue high-water marks, item count, and inaccessible
+paths. For SMB runs, pass the measured `--network-rtt-ms` and
+`--network-bandwidth-mbps`. Timeout runs cancel and are marked incomplete. The
+comparison reports ratios and checks whether both versions scanned the same
+item and inaccessible counts; it does not treat a single run as a release
+verdict.
+
+Snapshot bytes are observed values until the scan finishes; inaccessible
+paths keep a completed result partial. Logical size counts each hardlink path
+separately. Reparse points and symlinks are listed but never traversed by
+default. This harness measures scanning; record SMB RTT/bandwidth and UI input
+latency separately, and repeat both warm-cache and cold-cache runs.
 
 ### Project structure
 
