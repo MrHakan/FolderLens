@@ -8,6 +8,7 @@ import subprocess
 from typing import Optional, Tuple, Callable
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+from urllib.parse import quote
 
 from version import VERSION, GITHUB_OWNER, GITHUB_REPO
 
@@ -17,11 +18,13 @@ APP_NAME = "FolderLens"
 
 class UpdateInfo:
     """Information about an available update"""
-    def __init__(self, version: str, download_url: str, release_notes: str, published_at: str):
+    def __init__(self, version: str, download_url: Optional[str], release_notes: str,
+                 published_at: str, release_url: str = ""):
         self.version = version
         self.download_url = download_url
         self.release_notes = release_notes
         self.published_at = published_at
+        self.release_url = release_url
 
 
 class Updater:
@@ -31,6 +34,14 @@ class Updater:
         self.current_version = VERSION
         self._checking = False
         self._downloading = False
+
+    @staticmethod
+    def installation_type() -> str:
+        if not getattr(sys, 'frozen', False):
+            return "source"
+        if os.path.isdir(os.path.join(os.path.dirname(sys.executable), "_internal")):
+            return "onedir"
+        return "onefile"
     
     @staticmethod
     def compare_versions(v1: str, v2: str) -> int:
@@ -83,20 +94,23 @@ class Updater:
                 download_url = None
                 assets = data.get('assets', [])
                 
-                for asset in assets:
-                    name = asset.get('name', '').lower()
-                    if name.endswith('.exe') or name.endswith('.zip'):
-                        download_url = asset.get('browser_download_url')
-                        break
-                
-                if not download_url:
-                    download_url = data.get('zipball_url')
+                # The ZIP is a complete onedir installation. Replacing only
+                # its EXE would leave an incompatible _internal directory.
+                # Source runs likewise cannot install a Windows EXE in place.
+                if self.installation_type() == "onefile":
+                    download_url = next(
+                        (asset.get('browser_download_url') for asset in assets
+                         if asset.get('name', '').lower() == 'folderlens.exe'), None)
+
+                release_url = (f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tag/"
+                               f"{quote(data['tag_name'], safe='')}")
                 
                 update_info = UpdateInfo(
                     version=latest_version,
                     download_url=download_url,
                     release_notes=data.get('body', 'No release notes available.'),
-                    published_at=data.get('published_at', '')
+                    published_at=data.get('published_at', ''),
+                    release_url=release_url,
                 )
                 
                 return True, update_info, None
@@ -192,11 +206,16 @@ class Updater:
     
     def apply_update(self, downloaded_file: str) -> Tuple[bool, Optional[str]]:
         try:
+            if self.installation_type() != "onefile":
+                return False, ("Automatic installation is available only for the one-file EXE. "
+                               "Download the full package from the release page and update manually.")
+            if not downloaded_file.lower().endswith('.exe'):
+                return False, "The one-file updater requires a FolderLens EXE, not an archive."
             if getattr(sys, 'frozen', False):
                 current_exe = sys.executable
                 backup_exe = current_exe + '.backup'
                 
-                if downloaded_file.endswith('.exe'):
+                if downloaded_file.lower().endswith('.exe'):
                     batch_content = f'''@echo off
 timeout /t 2 /nobreak > nul
 move /y "{current_exe}" "{backup_exe}"
@@ -212,39 +231,6 @@ del "%~f0"
                                    creationflags=subprocess.CREATE_NO_WINDOW)
                     return True, None
                     
-                elif downloaded_file.endswith('.zip'):
-                    import zipfile
-                    
-                    extract_dir = tempfile.mkdtemp(prefix='folderlens_extract_')
-                    
-                    with zipfile.ZipFile(downloaded_file, 'r') as zf:
-                        zf.extractall(extract_dir)
-                    
-                    new_exe = None
-                    for root, dirs, files in os.walk(extract_dir):
-                        for file in files:
-                            if file.lower() == 'folderlens.exe':
-                                new_exe = os.path.join(root, file)
-                                break
-                    
-                    if new_exe:
-                        batch_content = f'''@echo off
-timeout /t 2 /nobreak > nul
-move /y "{current_exe}" "{backup_exe}"
-move /y "{new_exe}" "{current_exe}"
-start "" "{current_exe}"
-rmdir /s /q "{extract_dir}"
-del "%~f0"
-'''
-                        batch_path = os.path.join(tempfile.gettempdir(), 'folderlens_update.bat')
-                        with open(batch_path, 'w') as f:
-                            f.write(batch_content)
-                        
-                        subprocess.Popen(['cmd', '/c', batch_path],
-                                       creationflags=subprocess.CREATE_NO_WINDOW)
-                        return True, None
-                    else:
-                        return False, "Could not find executable in update package"
             else:
                 return False, "Auto-update not supported for Python scripts. Please download manually."
                 

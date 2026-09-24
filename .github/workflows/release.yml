@@ -11,6 +11,7 @@ on:
       - "release_manifest.py"
       - "version.py"
       - "make_version_info.py"
+      - "updater.py"
   workflow_dispatch:
     inputs:
       tag:
