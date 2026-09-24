@@ -10,6 +10,20 @@ else:
 
 sys.path.insert(0, BASE_DIR)
 
+import cli
+
+
+def _attach_parent_console():
+    """Let the windowed executable print to the console that started it."""
+    if os.name != "nt" or not getattr(sys, "frozen", False) or sys.stdout is not None:
+        return
+    try:
+        if ctypes.windll.kernel32.AttachConsole(-1):   # ATTACH_PARENT_PROCESS
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stderr = sys.stdout
+    except (AttributeError, OSError):
+        pass
+
 
 def require_admin():
     """Restart with admin privileges if needed"""
@@ -45,6 +59,9 @@ Examples:
   python main.py --install               Install context menu (admin required)
   python main.py --uninstall             Remove context menu
   python main.py --generate-reg          Generate .reg file for manual install
+  python main.py --console D:\\Photos     Print a size summary without a window
+  python main.py D:\\Photos --category image --json photos.json
+                                         Write a filtered JSON report (exit 2 = partial)
         """
     )
     
@@ -84,6 +101,8 @@ Examples:
         action="store_true",
         help="Print version and exit"
     )
+
+    cli.add_arguments(parser)
 
     args = parser.parse_args()
 
@@ -132,58 +151,10 @@ Examples:
         print("\nDouble-click these files to install/uninstall context menu.")
         return
     
-    if args.console:
-        from scanner import FolderScanner
-        from file_utils import format_size
-        
-        folder = args.folder or os.getcwd()
-        
-        if not os.path.isdir(folder):
-            print(f"[ERROR] Folder not found: {folder}")
-            return
-        
-        print(f"Scanning: {folder}")
-        print("-" * 60)
-        
-        import threading
+    if cli.wants_report(args):
+        _attach_parent_console()
+        sys.exit(cli.run(args))
 
-        scanner = FolderScanner()
-        result_holder = [None]
-        done = threading.Event()
-
-        def on_complete(result):
-            result_holder[0] = result
-            done.set()
-
-        def on_error(error):
-            print(f"[ERROR] {error}")
-            done.set()
-
-        scanner.scan(folder, on_complete=on_complete, on_error=on_error)
-        done.wait()
-        
-        result = result_holder[0]
-        if result:
-            result.items.sort(key=lambda x: x.size, reverse=True)
-            
-            print(f"{'Name':<40} {'Size':>15} {'Type':<15}")
-            print("-" * 70)
-            
-            for item in result.items:
-                name = item.name[:38] + ".." if len(item.name) > 40 else item.name
-                size = format_size(item.size)
-                item_type = "Folder" if item.is_directory else "File"
-                print(f"{name:<40} {size:>15} {item_type:<15}")
-            
-            print("-" * 70)
-            print(f"Total: {result.total_items} items, {format_size(result.total_size)}")
-            print(f"Scan time: {result.scan_time:.2f}s")
-            
-            if result.errors:
-                print(f"\n{len(result.errors)} errors occurred")
-        
-        return
-    
     folder = args.folder
     
     if folder:
