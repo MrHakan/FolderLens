@@ -211,9 +211,11 @@ def test_sort_preserves_expanded_folders(gui):
 
 
 def test_wide_tree_loads_rows_in_pages_and_keeps_page_on_sort(gui, tmp_path):
+    wide = tmp_path / "wide"
+    wide.mkdir()
     for number in range(205):
-        (tmp_path / f"item{number:03}.txt").write_text("x")
-    gui.root_node = scan_sync(tmp_path)
+        (wide / f"item{number:03}.txt").write_text("x")
+    gui.root_node = scan_sync(wide)
     show(gui, "Tree")
 
     rows = gui.tree.get_children("")
