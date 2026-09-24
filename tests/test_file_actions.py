@@ -88,14 +88,14 @@ def test_create_zip_clamps_unrepresentable_pre_1980_timestamp(tmp_path):
     source.write_text("old file", encoding="utf-8")
     old_timestamp = 1  # DOS/ZIP timestamps start at 1980.
     os.utime(source, (old_timestamp, old_timestamp))
-    node = scan(tmp_path).children[0]
+    node = scan(tmp_path).children[0].children[0]
     destination = tmp_path / "old.zip"
 
     result = create_zip([node], str(destination))
 
     assert result.files_written == 1
     with zipfile.ZipFile(destination) as archive:
-        assert archive.getinfo("picked/old.txt").date_time == (1980, 1, 1, 0, 0, 0)
+        assert archive.getinfo("old.txt").date_time == (1980, 1, 1, 0, 0, 0)
 
 
 def test_cancelled_zip_leaves_existing_destination_untouched(tmp_path):
