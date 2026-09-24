@@ -512,16 +512,31 @@ def test_image_filter_projects_all_views(gui):
 
 def test_global_search_projects_all_views(gui):
     """One live search scope must drive the tree, ranking, map, and type totals."""
-    gui.search_var.set("pic")
-    if gui._search_after:
-        gui.after_cancel(gui._search_after)
-    gui._search_after = None
-    gui._apply_search()
-
+    result = {"ready": False}
     deadline = time.monotonic() + 10
-    while gui._filter_building and time.monotonic() < deadline:
-        gui.update()
-        time.sleep(0.01)
+
+    def poll_projection():
+        if not gui._filter_building and gui._filter_index_key == gui._projection_key():
+            result["ready"] = True
+            gui.quit()
+        elif time.monotonic() >= deadline:
+            gui.quit()
+        else:
+            gui.after(10, poll_projection)
+
+    def start_search():
+        gui.search_var.set("pic")
+        if gui._search_after:
+            gui.after_cancel(gui._search_after)
+        gui._search_after = None
+        gui._apply_search()
+        poll_projection()
+
+    gui.after(0, start_search)
+    gui.mainloop()
+    gui.update_idletasks()
+
+    assert result["ready"], "search projection did not finish"
     assert not gui._filter_building, "search projection did not finish"
     assert gui._filter_index is not None
     assert gui._filter_index_key == gui._projection_key()
