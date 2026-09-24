@@ -1878,6 +1878,7 @@ class FolderLensApp(ctk.CTk):
         self.iid_to_node = {}
         page_counts = getattr(self, "_tree_sort_pages", {})
         self._tree_pages = {}
+        self._tree_page_data = {}
 
         self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
@@ -1956,7 +1957,10 @@ class FolderLensApp(ctk.CTk):
 
     def _insert_tree_children(self, parent_iid: str, parent_node: Node,
                               start: int = 0, limit: Optional[int] = None):
-        children = self._sorted_children(parent_node)
+        children = self._tree_page_data.get(parent_node.path)
+        if children is None:
+            children = self._sorted_children(parent_node)
+            self._tree_page_data[parent_node.path] = children
         end = min(len(children), start + (limit or self.TREE_PAGE_SIZE))
         for child in children[start:end]:
             icon = ICONS['folder'] if child.is_dir else get_file_icon(child.name, is_dir=False)

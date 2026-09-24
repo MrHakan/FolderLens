@@ -210,12 +210,20 @@ def test_sort_preserves_expanded_folders(gui):
     assert any(n.name == "pic.png" for n in gui.iid_to_node.values())
 
 
-def test_wide_tree_loads_rows_in_pages_and_keeps_page_on_sort(gui, tmp_path):
+def test_wide_tree_loads_rows_in_pages_and_keeps_page_on_sort(gui, tmp_path, monkeypatch):
     wide = tmp_path / "wide"
     wide.mkdir()
     for number in range(205):
         (wide / f"item{number:03}.txt").write_text("x")
     gui.root_node = scan_sync(wide)
+    sort_calls = []
+    original = gui._sorted_children
+
+    def counted_sort(node):
+        sort_calls.append(node)
+        return original(node)
+
+    monkeypatch.setattr(gui, "_sorted_children", counted_sort)
     show(gui, "Tree")
 
     rows = gui.tree.get_children("")
@@ -227,6 +235,7 @@ def test_wide_tree_loads_rows_in_pages_and_keeps_page_on_sort(gui, tmp_path):
     gui._on_tree_page_key(None)
     assert len(gui.tree.get_children("")) == 205
     assert len(gui.iid_to_node) == 205
+    assert sort_calls == [gui.root_node]
 
     gui._sort_tree("name")
     assert len(gui.tree.get_children("")) == 205
