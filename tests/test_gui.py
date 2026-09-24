@@ -586,6 +586,24 @@ def test_explore_shows_tree_map_details_and_syncs_selection(gui):
     assert gui.treemap_node is folder
 
 
+@pytest.mark.parametrize("scale", [1.25, 1.5, 2.0])
+def test_explore_layout_survives_large_tk_scaling(gui, scale):
+    previous_scale = float(gui.tk.call("tk", "scaling"))
+    try:
+        gui.tk.call("tk", "scaling", scale)
+        show(gui, "Explore")
+        wait_treemap(gui)
+        gui.update_idletasks()
+
+        assert gui.tree.winfo_width() > 0
+        assert gui.treemap_canvas.winfo_width() > 0
+        assert gui.treemap_canvas.winfo_height() > 0
+        assert gui._treemap_detail_panel.winfo_manager() == "pack"
+    finally:
+        gui.tk.call("tk", "scaling", previous_scale)
+        show(gui, "Tree")
+
+
 def test_deletion_updates_model_without_the_original_widget(gui, sample_tree):
     """Deleting is async; the user may switch views before it lands. The model
     must still update and nothing may touch the destroyed widget."""
