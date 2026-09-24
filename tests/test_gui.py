@@ -171,6 +171,14 @@ def wait_types(win, timeout=10):
     assert not win._types_loading, "file-type totals did not finish"
 
 
+def wait_tree_search(win, timeout=10):
+    deadline = time.monotonic() + timeout
+    while win._tree_search_loading and time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+    assert not win._tree_search_loading, "tree search did not finish"
+
+
 def test_toolbar_actions_safe_in_view_without_selection(gui):
     """Regression: the app remembers the last view, so it can start in Treemap.
     The always-visible Zip/Delete buttons used to raise AttributeError there."""
@@ -581,6 +589,7 @@ def test_global_search_projects_all_views(gui):
     assert gui._filter_index.count(gui.root_node) == 1
 
     show(gui, "Tree")
+    wait_tree_search(gui)
     assert [node.name for node in gui.iid_to_node.values()] == ["pic.png"]
 
     show(gui, "Largest Files")
@@ -696,6 +705,40 @@ def test_stale_file_type_totals_are_ignored_after_view_switch(gui, monkeypatch):
         time.sleep(0.01)
     assert gui.active_view == "Tree"
     assert gui._types_host is None
+
+
+def test_stale_tree_search_is_ignored_after_view_switch(gui, monkeypatch):
+    from query import QueryEngine, QuerySpec
+    gui.search_query = "pic"
+    gui._filter_index = QueryEngine(gui.root_node).project(QuerySpec(name_terms=("pic",)))
+    gui._filter_index_key = gui._projection_key()
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = analysis.find_matches
+
+    def slow_search(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(analysis, "find_matches", slow_search)
+    show(gui, "Tree")
+    assert entered.wait(timeout=2)
+    show(gui, "Largest Files")
+    wait_largest(gui)
+    release.set()
+    assert finished.wait(timeout=2)
+
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.01)
+    assert gui.active_view == "Largest Files"
+    assert gui.tree is None
 
 
 def test_slow_disk_usage_cannot_overwrite_new_scan_status(gui):

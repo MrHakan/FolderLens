@@ -1190,6 +1190,11 @@ class FolderLensApp(ctk.CTk):
         # tree-view state
         self.tree: Optional[ttk.Treeview] = None
         self.iid_to_node: Dict[str, Node] = {}
+        self._tree_generation = 0
+        self._tree_search_loading = False
+        self._tree_search_matches: List[Node] = []
+        self._tree_search_offset = 0
+        self._tree_search_has_more = False
         self.sort_key = "size"
         self.sort_reverse = True
 
@@ -1291,6 +1296,8 @@ class FolderLensApp(ctk.CTk):
                 self._largest_results_ready(*payload)
             elif kind == "types":
                 self._types_results_ready(*payload)
+            elif kind == "tree-search":
+                self._tree_search_results_ready(*payload)
         self.after(100, self._poll_io_results)
 
     # -------------------------------------------------------------- chrome
@@ -1987,6 +1994,11 @@ class FolderLensApp(ctk.CTk):
                       text_color=("gray20", "gray80"), command=window.destroy).pack(side="right")
 
     def _clear_body(self):
+        self._tree_generation += 1
+        self._tree_search_loading = False
+        self._tree_search_matches = []
+        self._tree_search_offset = 0
+        self._tree_search_has_more = False
         self._largest_generation += 1
         self._largest_loading = False
         self._types_generation += 1
@@ -2312,17 +2324,91 @@ class FolderLensApp(ctk.CTk):
                              tags=("page",))
 
     def _fill_tree_search(self):
-        matches = analysis.find_matches(
-            self.root_node, self.search_query, limit=1000,
-            filter_key=self.file_filter, filter_index=self._filter_index)
-        if not matches:
+        root = self.root_node
+        generation = self._tree_generation
+        scan_generation = self._scan_generation
+        filter_generation = self._filter_generation
+        projection_key = self._projection_key()
+        query = self.search_query
+        filter_index = self._filter_index if self._has_active_filter() else None
+        filter_key = self.file_filter
+        self._tree_search_loading = True
+        self._set_status(f"Searching for {query!r}…")
+
+        def cancelled():
+            return (generation != self._tree_generation
+                    or scan_generation != self._scan_generation
+                    or root is not self.root_node
+                    or filter_generation != self._filter_generation
+                    or projection_key != self._projection_key())
+
+        def worker():
+            try:
+                # One extra item tells the UI whether the visible result set
+                # was capped; names are still ranked before the cap is applied.
+                matches = analysis.find_matches(
+                    root, query, limit=1001, filter_key=filter_key,
+                    filter_index=filter_index, should_cancel=cancelled)
+                if cancelled():
+                    return
+                has_more = len(matches) > 1000
+                matches = matches[:1000]
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, matches, has_more, None)
+            except Exception as exc:
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, [], False, str(exc))
+            self._io_results.put(("tree-search", payload))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-tree-search-{generation}").start()
+
+    def _tree_search_results_ready(self, generation, scan_generation, filter_generation,
+                                   projection_key, root, matches, has_more, error):
+        if (generation != self._tree_generation
+                or scan_generation != self._scan_generation
+                or filter_generation != self._filter_generation
+                or projection_key != self._projection_key()
+                or root is not self.root_node
+                or self.active_view != "Tree"
+                or self.tree is None):
             return
-        for node in matches:
+        self._tree_search_loading = False
+        if error:
+            self._set_status(f"Search failed: {error}")
+            return
+        self._tree_search_matches = matches
+        self._tree_search_has_more = has_more
+        self._tree_search_offset = 0
+        self._insert_tree_search_page()
+        suffix = " · showing the 1,000 largest matches" if has_more else ""
+        self._set_status(f"{len(matches):,} search results{suffix}")
+
+    def _insert_tree_search_page(self, page_iid: Optional[str] = None):
+        if page_iid and self.tree.exists(page_iid):
+            self.tree.delete(page_iid)
+        start = self._tree_search_offset
+        end = min(len(self._tree_search_matches), start + self.TREE_PAGE_SIZE)
+        for node in self._tree_search_matches[start:end]:
             icon = ICONS['folder'] if node.is_dir else get_file_icon(node.name, is_dir=False)
             tags = ["folder"] if node.is_dir else []
             iid = self.tree.insert("", "end", text=f"{icon} {node.name}",
                                    values=self._tree_values(node, self.root_node), tags=tuple(tags))
             self.iid_to_node[iid] = node
+            self._register_row_thumbnail(self.tree, iid, node)
+        self._tree_search_offset = end
+        if end < len(self._tree_search_matches):
+            remaining = len(self._tree_search_matches) - end
+            self.tree.insert("", "end",
+                             text=f"Show next {min(self.TREE_PAGE_SIZE, remaining):,} of "
+                                  f"{remaining:,} remaining search results…",
+                             tags=("page",))
+        elif self._tree_search_has_more:
+            self.tree.insert("", "end",
+                             text="Showing the 1,000 largest search matches. Refine the search to see others…",
+                             tags=("info",))
 
     def _is_dummy(self, iid: str) -> bool:
         return "dummy" in self.tree.item(iid, "tags")
@@ -2330,6 +2416,9 @@ class FolderLensApp(ctk.CTk):
     def _load_tree_page(self, iid: str) -> bool:
         if not iid or "page" not in self.tree.item(iid, "tags"):
             return False
+        if self.search_query:
+            self._insert_tree_search_page(iid)
+            return True
         parent_iid = self.tree.parent(iid)
         parent_node = self.iid_to_node.get(parent_iid) if parent_iid else self.root_node
         if parent_node is None:

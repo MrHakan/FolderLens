@@ -48,14 +48,22 @@ def iter_file_nodes(root, predicate: Optional[Callable] = None,
             yield node
 
 
-def iter_all_nodes(root) -> Iterator:
+def iter_all_nodes(root, should_cancel: Optional[Callable[[], bool]] = None) -> Iterator:
     """Yield every Node in the subtree including directories (excluding root)."""
-    stack = list(root.children)
+    stack = [reversed(root.children)]
+    visited = 0
     while stack:
-        node = stack.pop()
+        if should_cancel is not None and visited % 256 == 0 and should_cancel():
+            return
+        try:
+            node = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        visited += 1
         yield node
         if node.is_dir:
-            stack.extend(node.children)
+            stack.append(reversed(node.children))
 
 
 # ------------------------------------------------------------- largest files
@@ -448,24 +456,30 @@ def match_query(name: str, query: str) -> bool:
 
 
 def find_matches(root, query: str, limit: int = 500, filter_key: str = "all",
-                 filter_index=None) -> List:
+                 filter_index=None,
+                 should_cancel: Optional[Callable[[], bool]] = None) -> List:
     """Return matching nodes, respecting an optional type projection."""
     if not query:
         return []
-    matches = []
-    for node in iter_all_nodes(root):
-        if not match_query(node.name, query):
-            continue
-        if filter_index is not None or filter_key != "all":
-            visible = (filter_index.count(node) if filter_index is not None
-                       else (1 if file_type_matches(node.name, filter_key, is_dir=node.is_dir) else 0))
-            if filter_index is not None and not node.is_dir:
-                visible = filter_index.matches(node)
-            if not visible:
+    if limit <= 0:
+        return []
+
+    def candidates():
+        for node in iter_all_nodes(root, should_cancel):
+            if not match_query(node.name, query):
                 continue
-        matches.append(node)
-    if filter_index is None:
-        matches.sort(key=lambda n: n.size, reverse=True)
-    else:
-        matches.sort(key=filter_index.size, reverse=True)
-    return matches[:limit]
+            if filter_index is not None or filter_key != "all":
+                visible = (filter_index.count(node) if filter_index is not None
+                           else (1 if file_type_matches(node.name, filter_key, is_dir=node.is_dir) else 0))
+                if filter_index is not None and not node.is_dir:
+                    visible = filter_index.matches(node)
+                if not visible:
+                    continue
+            yield node
+
+    # Keep the UI-facing search result bounded even when millions of names
+    # match. A heap preserves largest-first ranking without retaining and
+    # sorting every result.
+    from heapq import nlargest
+    key = filter_index.size if filter_index is not None else lambda n: n.size
+    return nlargest(limit, candidates(), key=key)

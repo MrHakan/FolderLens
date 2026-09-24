@@ -208,6 +208,8 @@ def test_find_matches():
     assert set(names) == {"a.txt", "d.txt"}
     # sorted largest first
     assert names[0] == "a.txt"
+    assert [node.name for node in analysis.find_matches(root, "txt", limit=1)] == ["a.txt"]
+    assert analysis.find_matches(root, "txt", should_cancel=lambda: True) == []
     assert analysis.find_matches(root, "") == []
 
 
