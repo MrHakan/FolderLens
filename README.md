@@ -147,7 +147,17 @@ python installer/build_installer.py
 
 ### Scan baseline for 4.0 development
 
-Run the same harness against the same unchanged folder or share for each
+Create each corpus once. The generator writes deterministic, nested `.bin`
+files and refuses to populate a nonempty directory:
+
+```powershell
+python benchmarks/create_dataset.py C:/test-data/files-10k --files 10000
+python benchmarks/create_dataset.py C:/test-data/files-100k --files 100000
+python benchmarks/create_dataset.py C:/test-data/files-1m --files 1000000
+```
+
+For a share run, copy the corpus to the share first and scan that unchanged
+copy. Run the same harness against the same unchanged folder or share for each
 version, and keep the report files outside the scanned folder:
 
 ```powershell
