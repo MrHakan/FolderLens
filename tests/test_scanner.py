@@ -2,6 +2,7 @@ import gc
 import os
 import sys
 import threading
+import time
 import traceback
 
 import pytest
@@ -381,6 +382,74 @@ def test_scan_snapshot_keeps_only_the_largest_fifty_observed_files(tmp_path):
     assert len(final.observed_files) == 50
     assert [sample.size for sample in final.observed_files] == list(range(80, 30, -1))
     assert final.observed_files[0].name == "file-079.bin"
+
+
+def test_slow_metadata_call_flushes_first_file_sample_before_next_entry(tmp_path, monkeypatch):
+    (tmp_path / "first.txt").write_bytes(b"first")
+    (tmp_path / "second.txt").write_bytes(b"second")
+    entered_second, release_second, sample_seen, done = (
+        threading.Event(), threading.Event(), threading.Event(), threading.Event())
+    snapshots, events, result = [], [], {}
+    original_scandir = os.scandir
+
+    class DelayedEntry:
+        def __init__(self, entry, position):
+            self._entry = entry
+            self._position = position
+
+        def __getattr__(self, name):
+            return getattr(self._entry, name)
+
+        def stat(self, *args, **kwargs):
+            if self._position == 0:
+                time.sleep(0.2)
+            elif self._position == 1:
+                entered_second.set()
+                assert release_second.wait(10)
+            return self._entry.stat(*args, **kwargs)
+
+    class DelayedScandir:
+        def __enter__(self):
+            self._iterator = original_scandir(tmp_path)
+            self._entries = sorted(list(self._iterator), key=lambda entry: entry.name)
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._iterator.close()
+            return False
+
+        def __iter__(self):
+            return (DelayedEntry(entry, position)
+                    for position, entry in enumerate(self._entries))
+
+    def slow_scandir(path):
+        if os.path.abspath(path) == os.path.abspath(tmp_path):
+            return DelayedScandir()
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", slow_scandir)
+    scanner = TreeScanner()
+
+    def observe(snapshot):
+        snapshots.append(snapshot)
+        if (snapshot.state == "scanning"
+                and any(sample.name == "first.txt" for sample in snapshot.observed_files)):
+            sample_seen.set()
+
+    scanner.scan(str(tmp_path), on_snapshot=observe, on_event=events.append,
+                 on_error=lambda message: (result.update(error=message), done.set()),
+                 on_complete=lambda root, errors, elapsed: (result.update(root=root), done.set()))
+    try:
+        assert entered_second.wait(5), f"scan={result!r}, snapshots={snapshots!r}, events={events!r}"
+        assert sample_seen.is_set()
+        assert any(sample.name == "first.txt" and sample.size == 5
+                   for snapshot in snapshots if snapshot.state == "scanning"
+                   for sample in snapshot.observed_files)
+    finally:
+        release_second.set()
+    assert done.wait(10)
+    scanner._current_thread.join(timeout=5)
+    assert result["root"].size == 11
 
 
 def test_closed_progress_consumer_does_not_break_scan(tmp_path):
