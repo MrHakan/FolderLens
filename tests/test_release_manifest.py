@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 
-from release_manifest import write_manifest
+from release_manifest import expected_sha256, write_manifest
 
 
 def test_manifest_hashes_all_release_assets_and_rejects_missing_input(tmp_path):
@@ -34,3 +34,15 @@ def test_manifest_rejects_ambiguous_duplicate_asset_names(tmp_path):
     with pytest.raises(ValueError, match="Duplicate"):
         write_manifest([str(first / "same.exe"), str(second / "same.exe")],
                        str(tmp_path / "SHA256SUMS"))
+
+
+def test_manifest_lookup_rejects_missing_duplicated_or_malformed_checksum():
+    digest = hashlib.sha256(b"exe").hexdigest()
+    line = f"{digest}  FolderLens.exe\n".encode("ascii")
+    assert expected_sha256(line, "FolderLens.exe") == digest
+    with pytest.raises(ValueError, match="Missing or ambiguous"):
+        expected_sha256(line + line, "FolderLens.exe")
+    with pytest.raises(ValueError, match="Malformed"):
+        expected_sha256(b"bad  FolderLens.exe\n", "FolderLens.exe")
+    with pytest.raises(ValueError, match="Missing or ambiguous"):
+        expected_sha256(line, "different.exe")
