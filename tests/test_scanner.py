@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import traceback
 
 import pytest
 
@@ -217,10 +218,19 @@ def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatc
     scanner.scan(str(second), on_complete=lambda *args: (results.append("new"), done.set()),
                  on_error=lambda message: (failures.append(message), done.set()),
                  on_snapshot=observations.append)
+    def scan_stacks():
+        frames = sys._current_frames()
+        return "\n".join(
+            f"{thread.name}:\n{''.join(traceback.format_stack(frames[thread.ident]))}"
+            for thread in threading.enumerate()
+            if thread.name.startswith("folderlens-scan-") and thread.ident in frames
+        )
+
     try:
         assert done.wait(timeout=15), ("a blocked old scan delayed the new one; "
                                        f"observations={observations[-2:]!r}; "
-                                       f"threads={[t.name for t in threading.enumerate()]!r}")
+                                       f"threads={[t.name for t in threading.enumerate()]!r}; "
+                                       f"scan stacks={scan_stacks()}")
         assert not failures, failures
     finally:
         release.set()
