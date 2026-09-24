@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import threading
@@ -189,6 +190,9 @@ def test_network_paths_use_a_smaller_worker_pool(tmp_path):
 
 def test_stalled_old_scan_cannot_complete_or_block_new_scan(tmp_path, monkeypatch):
     """A stuck share call may outlive cancellation; its event remains private."""
+    # Earlier GUI tests can leave cyclic Tk Font objects behind.  Collect on
+    # the Tk/main thread so their Tcl destructors cannot run in a scan worker.
+    gc.collect()
     first = tmp_path / "first"
     second = tmp_path / "second"
     first.mkdir()
