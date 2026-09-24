@@ -304,6 +304,8 @@ def test_very_wide_tree_sorts_children_off_the_ui_thread(gui):
     root.item_count = len(root.children)
     root.size = sum(child.size for child in root.children)
     gui.root_node = root
+    gui.sort_key = "size"
+    gui.sort_reverse = True
 
     show(gui, "Tree")
     assert gui._tree_sort_loading_paths == {root.path}
@@ -331,6 +333,8 @@ def test_wide_root_sort_restores_expanded_folders_after_async_load(gui):
     root.item_count = len(root.children) + 1
     root.size = sum(node.size for node in root.children)
     gui.root_node = root
+    gui.sort_key = "size"
+    gui.sort_reverse = True
 
     show(gui, "Tree")
     wait_tree_sorts(gui)
