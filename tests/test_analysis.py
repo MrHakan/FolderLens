@@ -60,6 +60,11 @@ def test_largest_search_before_top_k():
         root, limit=1, filter_key="document", name_query="d")] == ["d.txt"]
 
 
+def test_largest_files_stops_walking_when_cancelled():
+    root = make_tree()
+    assert analysis.largest_files(root, should_cancel=lambda: True) == []
+
+
 def test_category_breakdown():
     root = make_tree()
     stats = {s.label: s for s in analysis.category_breakdown(root)}

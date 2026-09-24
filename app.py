@@ -1196,6 +1196,8 @@ class FolderLensApp(ctk.CTk):
         # largest-files view state
         self.largest_tree: Optional[ttk.Treeview] = None
         self.largest_map: Dict[str, Node] = {}
+        self._largest_generation = 0
+        self._largest_loading = False
 
         # duplicates view state
         self.dup_tree: Optional[ttk.Treeview] = None
@@ -1281,6 +1283,8 @@ class FolderLensApp(ctk.CTk):
                 self._disk_usage_ready(*payload)
             elif kind == "places":
                 self._places_ready(payload)
+            elif kind == "largest":
+                self._largest_results_ready(*payload)
         self.after(100, self._poll_io_results)
 
     # -------------------------------------------------------------- chrome
@@ -1977,6 +1981,8 @@ class FolderLensApp(ctk.CTk):
                       text_color=("gray20", "gray80"), command=window.destroy).pack(side="right")
 
     def _clear_body(self):
+        self._largest_generation += 1
+        self._largest_loading = False
         if self.tooltip:
             self.tooltip.hide()
         self._invalidate_treemap_render()
@@ -2428,10 +2434,59 @@ class FolderLensApp(ctk.CTk):
         self.largest_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.largest_tree.bind("<Delete>", lambda e: self._delete_selected())
 
-        files = analysis.largest_files(
-            self.root_node, 100, filter_key=self.file_filter,
-            filter_index=self._filter_index, name_query=self.search_query)
+        root = self.root_node
+        scan_generation = self._scan_generation
+        filter_generation = self._filter_generation
+        generation = self._largest_generation
+        projection_key = self._projection_key()
+        filter_index = self._filter_index if self._has_active_filter() else None
+        filter_key = self.file_filter
+        name_query = self.search_query
+        self._largest_loading = True
+        self._set_status("Preparing largest files…")
+
+        def cancelled():
+            return (generation != self._largest_generation
+                    or scan_generation != self._scan_generation
+                    or root is not self.root_node
+                    or filter_generation != self._filter_generation
+                    or projection_key != self._projection_key())
+
+        def worker():
+            try:
+                files = analysis.largest_files(
+                    root, 100, filter_key=filter_key, filter_index=filter_index,
+                    name_query=name_query, should_cancel=cancelled)
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, files, None)
+            except Exception as exc:
+                if cancelled():
+                    return
+                payload = (generation, scan_generation, filter_generation,
+                           projection_key, root, [], str(exc))
+            self._io_results.put(("largest", payload))
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"folderlens-largest-{generation}").start()
+
+    def _largest_results_ready(self, generation, scan_generation, filter_generation,
+                               projection_key, root, files, error):
+        if (generation != self._largest_generation
+                or scan_generation != self._scan_generation
+                or filter_generation != self._filter_generation
+                or projection_key != self._projection_key()
+                or root is not self.root_node
+                or self.active_view != "Largest Files"
+                or self.largest_tree is None):
+            return
+        self._largest_loading = False
+        if error:
+            self._set_status(f"Could not list largest files: {error}")
+            return
         if not files:
+            self._set_status("No matching files")
             return
         for node in files:
             iid = self.largest_tree.insert(

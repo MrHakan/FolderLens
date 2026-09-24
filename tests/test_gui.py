@@ -155,6 +155,14 @@ def wait_treemap(win, timeout=10):
     assert not win._treemap_rendering, "treemap did not finish rendering"
 
 
+def wait_largest(win, timeout=10):
+    deadline = time.monotonic() + timeout
+    while win._largest_loading and time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+    assert not win._largest_loading, "largest-files query did not finish"
+
+
 def test_toolbar_actions_safe_in_view_without_selection(gui):
     """Regression: the app remembers the last view, so it can start in Treemap.
     The always-visible Zip/Delete buttons used to raise AttributeError there."""
@@ -187,6 +195,7 @@ def test_selection_works_in_largest_files_view(gui):
     """Largest Files is where you find space hogs, so Zip/Delete must work
     against that view's selection too."""
     show(gui, "Largest Files")
+    wait_largest(gui)
     assert gui.largest_tree is not None
 
     rows = gui.largest_tree.get_children()
@@ -498,6 +507,7 @@ def test_image_filter_projects_all_views(gui):
     assert {node.name for node in gui.iid_to_node.values()} == {"sub", "pic.png"}
 
     show(gui, "Largest Files")
+    wait_largest(gui)
     assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
 
     show(gui, "Treemap")
@@ -546,6 +556,7 @@ def test_global_search_projects_all_views(gui):
     assert [node.name for node in gui.iid_to_node.values()] == ["pic.png"]
 
     show(gui, "Largest Files")
+    wait_largest(gui)
     assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
 
     show(gui, "Treemap")
@@ -596,7 +607,37 @@ def test_advanced_filter_projection_and_action_scope(gui):
     prompt = gui._action_scope_prompt([("row", folder)], "Delete")
     assert "ALL file types" in prompt
     show(gui, "Largest Files")
+    wait_largest(gui)
     assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
+
+
+def test_stale_largest_files_result_is_ignored_after_view_switch(gui, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = analysis.largest_files
+
+    def slow_query(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(analysis, "largest_files", slow_query)
+    show(gui, "Largest Files")
+    assert entered.wait(timeout=2)
+    show(gui, "Tree")
+    release.set()
+    assert finished.wait(timeout=2)
+
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.01)
+    assert gui.active_view == "Tree"
+    assert gui.largest_tree is None
 
 
 def test_slow_disk_usage_cannot_overwrite_new_scan_status(gui):

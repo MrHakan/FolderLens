@@ -21,17 +21,29 @@ from query import QueryEngine, QueryIndex, QuerySpec
 
 # --------------------------------------------------------------------- walking
 
-def iter_file_nodes(root, predicate: Optional[Callable] = None) -> Iterator:
+def iter_file_nodes(root, predicate: Optional[Callable] = None,
+                    should_cancel: Optional[Callable[[], bool]] = None) -> Iterator:
     """Yield non-directory Nodes in the subtree (iterative).
 
     ``predicate`` is deliberately applied to the in-memory node, so filtered
     views never need to touch the filesystem again.
     """
-    stack = [root]
+    # Keep one iterator per depth instead of copying every sibling reference
+    # into a second list. A flat million-entry directory otherwise doubles
+    # pointer storage just to rank a bounded top-K result.
+    stack = [iter((root,))]
+    visited = 0
     while stack:
-        node = stack.pop()
+        if should_cancel is not None and visited % 256 == 0 and should_cancel():
+            return
+        try:
+            node = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        visited += 1
         if node.is_dir:
-            stack.extend(node.children)
+            stack.append(reversed(node.children))
         elif predicate is None or predicate(node):
             yield node
 
@@ -49,7 +61,8 @@ def iter_all_nodes(root) -> Iterator:
 # ------------------------------------------------------------- largest files
 
 def largest_files(root, limit: int = 100, filter_key: str = "all",
-                  filter_index=None, name_query: str = "") -> List:
+                  filter_index=None, name_query: str = "",
+                  should_cancel: Optional[Callable[[], bool]] = None) -> List:
     """Return the `limit` largest matching files, biggest first."""
     if limit <= 0:
         return []
@@ -63,7 +76,7 @@ def largest_files(root, limit: int = 100, filter_key: str = "all",
     # A bounded heap avoids retaining every file in memory just to find the
     # top 100 on a large drive.  nlargest still returns largest-first.
     from heapq import nlargest
-    return nlargest(limit, iter_file_nodes(root, predicate),
+    return nlargest(limit, iter_file_nodes(root, predicate, should_cancel),
                     key=filter_index.size if filter_index is not None else lambda n: n.size)
 
 
