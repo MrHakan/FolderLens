@@ -3295,6 +3295,12 @@ class FolderLensApp(ctk.CTk):
         self.treemap_canvas.bind("<Return>", self._treemap_activate_focus)
         self.treemap_canvas.bind("<Shift-BackSpace>", self._treemap_keyboard_forward)
         self.treemap_canvas.bind("<BackSpace>", self._treemap_keyboard_back)
+        self._treemap_redraw_after = self.after_idle(self._schedule_initial_treemap_draw)
+
+    def _schedule_initial_treemap_draw(self):
+        self._treemap_redraw_after = None
+        if self.active_view in ("Treemap", "Explore") and self.treemap_canvas is not None:
+            self._schedule_treemap_redraw()
 
     def _build_treemap_legend(self, parent, colors):
         """Render a compact colour key for the current map projection."""

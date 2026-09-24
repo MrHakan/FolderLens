@@ -557,8 +557,11 @@ def test_treemap_details_follow_focus_and_offer_file_actions(gui, monkeypatch):
 
 def test_explore_shows_tree_map_details_and_syncs_selection(gui):
     show(gui, "Explore")
-    wait_treemap(gui)
-    gui.update_idletasks()
+    deadline = time.monotonic() + 10
+    while not gui._tiles and time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.01)
+    assert gui._tiles, "Explore treemap did not finish its initial layout"
 
     assert gui.tree is not None
     assert gui.treemap_canvas is not None
