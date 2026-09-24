@@ -146,6 +146,7 @@ class TreemapAggregate:
     error: Optional[str] = None
     is_aggregate: bool = True
     category_key: str = "other"
+    omitted_start: int = 0
 
     @property
     def path(self) -> str:
@@ -346,6 +347,7 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
                 item_count=omitted_count,
                 parent=node,
                 category_key=aggregate_category or "other",
+                omitted_start=keep_count,
             )
             children = kept + ([aggregate] if omitted_size > 0 else [])
 
@@ -365,6 +367,16 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
                 stack.append((child, rx + padding, ry + padding + head,
                               inner_w, inner_h, depth + 1))
     return tiles
+
+
+def aggregate_members(aggregate: TreemapAggregate, children_getter=None,
+                      size_getter=None) -> List:
+    """Recover the exact ranked siblings represented by an aggregate tile."""
+    get_children = children_getter or (lambda node: node.children)
+    get_size = size_getter or (lambda node: node.size)
+    ranked = sorted((child for child in get_children(aggregate.parent)
+                     if get_size(child) > 0), key=get_size, reverse=True)
+    return ranked[aggregate.omitted_start:]
 
 
 # --------------------------------------------------------------- csv export

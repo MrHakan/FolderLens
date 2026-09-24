@@ -311,6 +311,32 @@ def test_treemap_labels_are_hit_testable(gui):
         assert hit is not None, "lost the hit over a tile label"
 
 
+def test_treemap_aggregate_lists_omitted_siblings_in_pages(gui):
+    from tkinter import ttk
+    from scanner import Node
+    root = Node(path="/virtual", name="virtual", is_dir=True)
+    root.children = [Node(path=f"/virtual/f{i}.txt", name=f"f{i}.txt",
+                          is_dir=False, size=i + 1, parent=root) for i in range(207)]
+    root.size = sum(child.size for child in root.children)
+    root.item_count = len(root.children)
+    tiles = analysis.build_treemap(root, 0, 0, 400, 300, max_depth=1, max_children=3)
+    aggregate = next(tile.node for tile in tiles if getattr(tile.node, "is_aggregate", False))
+    window = gui._show_treemap_aggregate(aggregate)
+    try:
+        frame = next(child for child in window.winfo_children() if isinstance(child, tk.Frame))
+        rows = next(child for child in frame.winfo_children() if isinstance(child, ttk.Treeview))
+        button = next(child for child in window.winfo_children() if isinstance(child, ttk.Button))
+        deadline = time.time() + 5
+        while len(rows.get_children()) < 200 and time.time() < deadline:
+            gui.update()
+        assert len(rows.get_children()) == 200
+        assert rows.item(rows.get_children()[0], "text") == "f204.txt"
+        button.invoke()
+        assert len(rows.get_children()) == 205
+    finally:
+        window.destroy()
+
+
 def test_treemap_redraw_is_wired_to_resize(gui):
     """The canvas must actually ask for a redraw when it is resized."""
     show(gui, "Treemap")
