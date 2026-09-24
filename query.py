@@ -13,7 +13,8 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Callable, Optional
 
-from file_utils import FILE_TYPE_FILTER_LABELS, get_file_category, get_file_category_key, natural_sort_key
+from file_utils import (FILE_TYPE_FILTER_LABELS, cancellable_sorted,
+                        get_file_category, get_file_category_key, natural_sort_key)
 
 
 @dataclass(frozen=True)
@@ -189,7 +190,8 @@ class QueryIndex:
                                get_file_category(n.name, is_dir=False)["label"], n.name.casefold())
         else:
             value = self.size
-        return sorted(children, key=value, reverse=reverse)
+        return cancellable_sorted(children, key=value, reverse=reverse,
+                                  should_cancel=should_cancel)
 
 
 class QueryEngine:

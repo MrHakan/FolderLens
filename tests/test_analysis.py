@@ -142,6 +142,25 @@ def test_build_treemap_stops_for_a_stale_render_generation():
                                   should_cancel=lambda: True) == []
 
 
+def test_build_treemap_cancels_while_collecting_a_wide_directory():
+    from scanner import Node
+
+    root = Node("/wide", "wide", True)
+    root.children = [Node(None, f"f{index}.bin", False,
+                          size=index + 1, parent=root)
+                     for index in range(10_000)]
+    checks = 0
+
+    def cancel_after_some_children():
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    assert analysis.build_treemap(
+        root, 0, 0, 400, 300, should_cancel=cancel_after_some_children) == []
+    assert checks == 4
+
+
 def test_export_tree_csv(tmp_path):
     root = make_tree()
     out = tmp_path / "report.csv"

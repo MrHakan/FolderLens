@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import List, Callable, Optional
 import time
 
+from file_utils import cancellable_sorted
+
 
 _NO_CHILDREN: tuple = ()
 _REPARSE_FLAG = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -105,20 +107,27 @@ class Node:
         kind = "dir" if self.is_dir else "file"
         return f"<Node {kind} {self.name!r} size={self.size}>"
 
-    def sorted_children(self, key: str = "size", reverse: bool = True) -> List["Node"]:
+    def sorted_children(self, key: str = "size", reverse: bool = True,
+                        should_cancel: Optional[Callable[[], bool]] = None) -> List["Node"]:
         if key == "name":
             from file_utils import natural_sort_key
-            return sorted(self.children, key=lambda n: natural_sort_key(n.name), reverse=reverse)
+            return cancellable_sorted(
+                self.children, key=lambda n: natural_sort_key(n.name),
+                reverse=reverse, should_cancel=should_cancel)
         if key == "date":
-            return sorted(self.children, key=lambda n: n.creation_date, reverse=reverse)
+            return cancellable_sorted(
+                self.children, key=lambda n: n.creation_date,
+                reverse=reverse, should_cancel=should_cancel)
         if key == "type":
             from file_utils import get_file_category
-            return sorted(
+            return cancellable_sorted(
                 self.children,
                 key=lambda n: (not n.is_dir, "" if n.is_dir else get_file_category(n.name, is_dir=False)['label'], n.name.lower()),
-                reverse=reverse
+                reverse=reverse, should_cancel=should_cancel,
             )
-        return sorted(self.children, key=lambda n: n.size, reverse=reverse)
+        return cancellable_sorted(
+            self.children, key=lambda n: n.size, reverse=reverse,
+            should_cancel=should_cancel)
 
 
 @dataclass

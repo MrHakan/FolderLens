@@ -316,6 +316,39 @@ def test_very_wide_tree_sorts_children_off_the_ui_thread(gui):
     assert any("page" in gui.tree.item(iid, "tags") for iid in rows)
 
 
+def test_wide_root_sort_restores_expanded_folders_after_async_load(gui):
+    root = Node("/synthetic-wide", "synthetic-wide", True)
+    folder = Node("/synthetic-wide/0-folder", "0-folder", True,
+                  size=100_000, item_count=1, parent=root)
+    child = Node("/synthetic-wide/0-folder/inside.txt", "inside.txt", False,
+                 size=50, parent=folder)
+    folder.children = [child]
+    root.children = [folder]
+    root.children.extend(
+        Node(None, f"item{number:05}.txt", False, size=number + 1, parent=root)
+        for number in range(gui.TREE_ASYNC_SORT_THRESHOLD)
+    )
+    root.item_count = len(root.children) + 1
+    root.size = sum(node.size for node in root.children)
+    gui.root_node = root
+
+    show(gui, "Tree")
+    wait_tree_sorts(gui)
+    folder_iid = next(iid for iid, node in gui.iid_to_node.items() if node is folder)
+    gui.tree.focus(folder_iid)
+    gui.tree.item(folder_iid, open=True)
+    gui._on_tree_open(None)
+    assert any(node is child for node in gui.iid_to_node.values())
+
+    gui._sort_tree("name")
+    wait_tree_sorts(gui)
+
+    restored_iid = next(iid for iid, node in gui.iid_to_node.items() if node is folder)
+    assert gui.tree.item(restored_iid, "open")
+    assert any(node is child for node in gui.iid_to_node.values())
+    assert not gui._pending_tree_expansions
+
+
 def test_stale_scan_callback_cannot_replace_current_tree(gui):
     old_root = gui.root_node
     gui._scan_generation += 1

@@ -11,6 +11,7 @@ from typing import Callable, Iterator, List, Dict, Tuple, Optional
 
 from file_utils import (
     FILE_TYPE_FILTER_LABELS,
+    cancellable_sorted,
     file_type_matches,
     get_file_category,
     get_file_extension,
@@ -350,7 +351,12 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
         if should_cancel is not None and should_cancel():
             return []
         node, nx, ny, nw, nh, depth = stack.pop()
-        children = [c for c in get_children(node) if get_size(c) > 0]
+        children = []
+        for position, child in enumerate(get_children(node)):
+            if should_cancel is not None and position % 256 == 0 and should_cancel():
+                return []
+            if get_size(child) > 0:
+                children.append(child)
         if not children:
             continue
 
@@ -361,11 +367,18 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
         # complete tree shown in the Tree view.
         if max_children and len(children) > max_children:
             keep_count = max(0, max_children - 1)
-            ranked = sorted(children, key=get_size, reverse=True)
+            ranked = cancellable_sorted(
+                children, key=get_size, reverse=True, should_cancel=should_cancel)
+            if should_cancel is not None and should_cancel():
+                return []
             kept = ranked[:keep_count]
             omitted = ranked[keep_count:]
-            omitted_size = sum(get_size(child) for child in omitted)
-            omitted_count = sum(get_count(child) for child in omitted)
+            omitted_size = omitted_count = 0
+            for position, child in enumerate(omitted):
+                if should_cancel is not None and position % 256 == 0 and should_cancel():
+                    return []
+                omitted_size += get_size(child)
+                omitted_count += get_count(child)
             aggregate = TreemapAggregate(
                 name=f"{omitted_count:,} smaller items",
                 size=omitted_size,
@@ -397,12 +410,21 @@ def build_treemap(root, x: float, y: float, width: float, height: float,
 
 
 def aggregate_members(aggregate: TreemapAggregate, children_getter=None,
-                      size_getter=None) -> List:
+                      size_getter=None,
+                      should_cancel: Optional[Callable[[], bool]] = None) -> List:
     """Recover the exact ranked siblings represented by an aggregate tile."""
     get_children = children_getter or (lambda node: node.children)
     get_size = size_getter or (lambda node: node.size)
-    ranked = sorted((child for child in get_children(aggregate.parent)
-                     if get_size(child) > 0), key=get_size, reverse=True)
+    children = []
+    for position, child in enumerate(get_children(aggregate.parent)):
+        if should_cancel is not None and position % 256 == 0 and should_cancel():
+            return []
+        if get_size(child) > 0:
+            children.append(child)
+    ranked = cancellable_sorted(
+        children, key=get_size, reverse=True, should_cancel=should_cancel)
+    if should_cancel is not None and should_cancel():
+        return []
     return ranked[aggregate.omitted_start:]
 
 

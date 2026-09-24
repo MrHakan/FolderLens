@@ -104,6 +104,28 @@ def test_tree_scan_sorted_children(sample_tree):
     assert [c.name for c in by_name] == ["file_a.txt", "file_b.bin", "subdir"]
 
 
+def test_wide_child_sort_is_correct_and_cancellable():
+    root = Node("/synthetic", "synthetic", True)
+    root.children = [Node(None, f"item{number:05}.txt", False,
+                          size=number, parent=root)
+                     for number in reversed(range(20_000))]
+
+    ordered = root.sorted_children("size", reverse=False,
+                                   should_cancel=lambda: False)
+    assert len(ordered) == 20_000
+    assert [ordered[0].size, ordered[-1].size] == [0, 19_999]
+
+    checks = 0
+
+    def cancel_during_merge():
+        nonlocal checks
+        checks += 1
+        return checks >= 7
+
+    assert root.sorted_children("size", should_cancel=cancel_during_merge) == []
+    assert checks == 7
+
+
 def test_tree_scan_missing_folder(tmp_path):
     holder = run_tree_scan(tmp_path / "does_not_exist")
     assert holder["root"] is None

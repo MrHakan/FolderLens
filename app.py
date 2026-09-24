@@ -1197,6 +1197,8 @@ class FolderLensApp(ctk.CTk):
         self._tree_search_has_more = False
         self._tree_sort_loading_paths = set()
         self._tree_sort_rows = {}
+        self._pending_tree_expansions = set()
+        self._pending_tree_expansion_pages = {}
         self.sort_key = "size"
         self.sort_reverse = True
 
@@ -2005,6 +2007,8 @@ class FolderLensApp(ctk.CTk):
         self._tree_search_has_more = False
         self._tree_sort_loading_paths.clear()
         self._tree_sort_rows.clear()
+        self._pending_tree_expansions.clear()
+        self._pending_tree_expansion_pages.clear()
         self._largest_generation += 1
         self._largest_loading = False
         self._types_generation += 1
@@ -2308,6 +2312,7 @@ class FolderLensApp(ctk.CTk):
         children = self._tree_page_data.get(parent_node.path)
         if children is None:
             if len(parent_node.children) >= self.TREE_ASYNC_SORT_THRESHOLD:
+                self._tree_pages[parent_node.path] = start + (limit or self.TREE_PAGE_SIZE)
                 self._start_tree_child_sort(parent_iid, parent_node, start, limit)
                 return
             children = self._sorted_children(parent_node)
@@ -2361,7 +2366,8 @@ class FolderLensApp(ctk.CTk):
                 children = (filter_index.sorted_children(
                     parent_node, sort_key, sort_reverse, should_cancel=cancelled)
                     if filter_index is not None else
-                    parent_node.sorted_children(sort_key, sort_reverse))
+                    parent_node.sorted_children(
+                        sort_key, sort_reverse, should_cancel=cancelled))
                 if cancelled():
                     return
                 payload = (generation, scan_generation, filter_generation,
@@ -2396,9 +2402,11 @@ class FolderLensApp(ctk.CTk):
         if error:
             self.tree.insert(parent_iid, "end", text=f"Could not sort directory: {error}",
                              tags=("info",))
+            self._restore_pending_tree_expansions()
             return
         self._tree_page_data[parent_node.path] = children
         self._insert_tree_children(parent_iid, parent_node, start=start, limit=limit)
+        self._restore_pending_tree_expansions()
 
     def _fill_tree_search(self):
         root = self.root_node
@@ -2536,23 +2544,43 @@ class FolderLensApp(ctk.CTk):
             if node and self.tree.item(iid, "open"):
                 expanded.add(node.path)
                 pending.extend(self.tree.get_children(iid))
+        expanded.update(self._pending_tree_expansions)
         self._tree_sort_pages = page_counts
         try:
             self._render_active_view()      # rebuild headers and rows in new order
         finally:
             self._tree_sort_pages = {}
 
-        pending = list(self.tree.get_children())
-        while pending:
-            iid = pending.pop()
+        self._pending_tree_expansions = expanded
+        self._pending_tree_expansion_pages = page_counts
+        self._restore_pending_tree_expansions()
+
+    def _restore_pending_tree_expansions(self):
+        """Restore open folders as their asynchronous sorted pages arrive."""
+        if not self._pending_tree_expansions or self.tree is None:
+            return
+        pending_paths = self._pending_tree_expansions
+        unresolved = set(pending_paths)
+        stack = list(self.tree.get_children(""))
+        while stack:
+            iid = stack.pop()
             node = self.iid_to_node.get(iid)
-            if node and node.path in expanded:
-                dummies = self.tree.get_children(iid)
-                if len(dummies) == 1 and self._is_dummy(dummies[0]):
-                    self.tree.delete(dummies[0])
-                    self._insert_tree_children(iid, node, limit=page_counts.get(node.path))
-                self.tree.item(iid, open=True)
-                pending.extend(self.tree.get_children(iid))
+            if node is None or node.path not in pending_paths:
+                continue
+            children = self.tree.get_children(iid)
+            if len(children) == 1 and self._is_dummy(children[0]):
+                self.tree.delete(children[0])
+                self._insert_tree_children(
+                    iid, node, limit=self._pending_tree_expansion_pages.get(node.path))
+            self.tree.item(iid, open=True)
+            if node.path in self._tree_sort_loading_paths:
+                continue
+            unresolved.discard(node.path)
+            stack.extend(child_iid for child_iid in self.tree.get_children(iid)
+                          if child_iid in self.iid_to_node)
+        self._pending_tree_expansions = unresolved
+        if not unresolved:
+            self._pending_tree_expansion_pages.clear()
 
     def _on_tree_select(self, event):
         nodes = self._selected_nodes()
@@ -3126,12 +3154,17 @@ class FolderLensApp(ctk.CTk):
 
         def worker():
             cancelled = lambda: generation != self._treemap_generation or self.active_view != "Treemap"
+            if index is not None:
+                layout_children_getter = lambda item: index.children(
+                    item, should_cancel=cancelled)
+            else:
+                layout_children_getter = children_getter
             tiles = analysis.build_treemap(
                 node, 2, 2, w - 4, h - 4,
                 min_area=110, max_depth=7, padding=3,
                 header=treemap_render.RenderOptions.header,
                 size_getter=size_getter,
-                children_getter=children_getter,
+                children_getter=layout_children_getter,
                 count_getter=count_getter,
                 max_children=1200,
                 aggregate_category=(index.filter_key if index is not None else self.file_filter),
@@ -3385,8 +3418,22 @@ class FolderLensApp(ctk.CTk):
         window.configure(bg=colors['tree_bg'])
         generation = self._scan_generation
         index = self._filter_index if self._has_active_filter() else None
-        get_children = index.children if index else lambda node: node.children
+        filter_generation = self._filter_generation
+        projection_key = self._projection_key()
         get_size = index.size if index else lambda node: node.size
+        cancelled_event = threading.Event()
+
+        def cancelled():
+            return (cancelled_event.is_set()
+                    or generation != self._scan_generation
+                    or filter_generation != self._filter_generation
+                    or projection_key != self._projection_key())
+
+        def on_destroy(event):
+            if event.widget is window:
+                cancelled_event.set()
+
+        window.bind("<Destroy>", on_destroy, add="+")
         status = tk.Label(window, text="Preparing grouped items…", anchor="w",
                           bg=colors['tree_bg'], fg=colors['tree_fg'])
         status.pack(fill="x", padx=12, pady=(12, 4))
@@ -3409,8 +3456,8 @@ class FolderLensApp(ctk.CTk):
         state = {"members": [], "offset": 0, "row_nodes": {}}
 
         def load_page():
-            if generation != self._scan_generation:
-                status.configure(text="The scan changed. Reopen this list from the current map.")
+            if cancelled():
+                status.configure(text="The scan or view changed. Reopen this list from the current map.")
                 button.configure(state="disabled")
                 return
             members = state["members"]
@@ -3426,7 +3473,7 @@ class FolderLensApp(ctk.CTk):
             button.configure(state="normal" if end < len(members) else "disabled")
 
         def open_folder(event):
-            if generation != self._scan_generation:
+            if cancelled():
                 return
             node = state["row_nodes"].get(rows.focus())
             if node is not None and node.is_dir:
@@ -3441,6 +3488,10 @@ class FolderLensApp(ctk.CTk):
 
         def present():
             if not window.winfo_exists():
+                return
+            if cancelled():
+                status.configure(text="The scan or view changed. Reopen this list from the current map.")
+                button.configure(state="disabled")
                 return
             try:
                 members, error = results.get_nowait()
@@ -3457,10 +3508,18 @@ class FolderLensApp(ctk.CTk):
 
         def worker():
             try:
-                members = analysis.aggregate_members(aggregate, get_children, get_size)
+                if index is not None:
+                    get_children = lambda parent: index.children(
+                        parent, should_cancel=cancelled)
+                else:
+                    get_children = lambda parent: parent.children
+                members = analysis.aggregate_members(
+                    aggregate, get_children, get_size, should_cancel=cancelled)
                 error = None
             except Exception as exc:
                 members, error = [], str(exc)
+            if cancelled():
+                return
             results.put((members, error))
 
         threading.Thread(target=worker, daemon=True).start()

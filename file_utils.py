@@ -1,4 +1,5 @@
 import os
+import heapq
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -40,6 +41,39 @@ ICONS = {
     'eye': '👁️',
     'eye_off': '👁️‍🗨️',
 }
+
+
+def cancellable_sorted(items, key, reverse=False, should_cancel=None,
+                      chunk_size=8192):
+    """Sort a large sequence while periodically yielding to cancellation.
+
+    Python's built-in sort is efficient but cannot be interrupted once it
+    starts. Sorting bounded runs and merging them lets background UI work stop
+    promptly when the view, query, or scan changes.
+    """
+    if should_cancel is None:
+        return sorted(items, key=key, reverse=reverse)
+    if should_cancel():
+        return []
+
+    if len(items) <= chunk_size:
+        result = sorted(items, key=key, reverse=reverse)
+        return [] if should_cancel() else result
+
+    runs = []
+    for start in range(0, len(items), chunk_size):
+        if should_cancel():
+            return []
+        runs.append(sorted(items[start:start + chunk_size],
+                           key=key, reverse=reverse))
+
+    merged = heapq.merge(*runs, key=key, reverse=reverse)
+    result = []
+    for index, item in enumerate(merged):
+        if index % 256 == 0 and should_cancel():
+            return []
+        result.append(item)
+    return result
 
 FILE_CATEGORIES = {
     'folder': {
