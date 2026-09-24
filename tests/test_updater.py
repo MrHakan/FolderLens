@@ -139,3 +139,14 @@ def test_update_download_checks_hash_and_removes_corrupt_file(monkeypatch, tmp_p
     assert success and error is None
     assert path == str(tmp_path / "good" / "FolderLens.exe")
     assert (tmp_path / "good" / "FolderLens.exe").read_bytes() == payload
+
+
+def test_apply_refuses_executable_changed_after_download(monkeypatch, tmp_path):
+    downloaded = tmp_path / "FolderLens.exe"
+    downloaded.write_bytes(b"modified after download")
+    service = Updater()
+    monkeypatch.setattr(service, "installation_type", lambda: "onefile")
+    monkeypatch.setattr(updater_module.sys, "frozen", True, raising=False)
+    success, error = service.apply_update(str(downloaded), "0" * 64)
+    assert success is False
+    assert "changed" in error

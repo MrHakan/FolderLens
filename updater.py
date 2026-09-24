@@ -2,20 +2,63 @@ import os
 import sys
 import json
 import hashlib
+import re
 import shutil
 import tempfile
 import threading
 import subprocess
+import uuid
 from typing import Optional, Tuple, Callable
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from urllib.parse import quote
 
 from version import VERSION, GITHUB_OWNER, GITHUB_REPO
-from release_manifest import expected_sha256
+from release_manifest import expected_sha256, sha256_file
 
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 APP_NAME = "FolderLens"
+
+
+def create_swap_script() -> str:
+    """Create a unique external updater with a rollback path after app exit."""
+    script = r'''@echo off
+setlocal DisableDelayedExpansion
+if "%FL_UPDATE_TEST_DELAY%"=="0" goto ready
+timeout /t 2 /nobreak >nul
+:ready
+if not exist "%FL_UPDATE_NEW%" goto failed
+for /l %%I in (1,1,30) do (
+    move /y "%FL_UPDATE_CURRENT%" "%FL_UPDATE_BACKUP%" >nul 2>&1
+    if not errorlevel 1 goto backed_up
+    timeout /t 1 /nobreak >nul
+)
+goto failed
+:backed_up
+move /y "%FL_UPDATE_NEW%" "%FL_UPDATE_CURRENT%" >nul 2>&1
+if errorlevel 1 goto restore
+"%FL_UPDATE_CURRENT%" --version >nul 2>&1
+if errorlevel 1 goto remove_new
+if "%FL_UPDATE_NO_RESTART%"=="1" goto success
+start "" "%FL_UPDATE_CURRENT%"
+if errorlevel 1 goto remove_new
+:success
+del "%~f0"
+exit /b 0
+:remove_new
+del /f /q "%FL_UPDATE_CURRENT%" >nul 2>&1
+:restore
+move /y "%FL_UPDATE_BACKUP%" "%FL_UPDATE_CURRENT%" >nul 2>&1
+if errorlevel 1 echo Rollback failed. Restore "%FL_UPDATE_BACKUP%" manually. > "%FL_UPDATE_LOG%"
+:failed
+del /f /q "%FL_UPDATE_NEW%" >nul 2>&1
+del "%~f0"
+exit /b 1
+'''
+    fd, path = tempfile.mkstemp(prefix='folderlens_update_', suffix='.cmd')
+    with os.fdopen(fd, 'w', encoding='ascii', newline='\r\n') as stream:
+        stream.write(script)
+    return path
 
 
 class UpdateInfo:
@@ -231,38 +274,58 @@ class Updater:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
     
-    def apply_update(self, downloaded_file: str) -> Tuple[bool, Optional[str]]:
+    def apply_update(self, downloaded_file: str,
+                     expected_digest: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        staged = None
+        script_path = None
+        launched = False
         try:
             if self.installation_type() != "onefile":
                 return False, ("Automatic installation is available only for the one-file EXE. "
                                "Download the full package from the release page and update manually.")
             if not downloaded_file.lower().endswith('.exe'):
                 return False, "The one-file updater requires a FolderLens EXE, not an archive."
-            if getattr(sys, 'frozen', False):
-                current_exe = sys.executable
-                backup_exe = current_exe + '.backup'
-                
-                if downloaded_file.lower().endswith('.exe'):
-                    batch_content = f'''@echo off
-timeout /t 2 /nobreak > nul
-move /y "{current_exe}" "{backup_exe}"
-move /y "{downloaded_file}" "{current_exe}"
-start "" "{current_exe}"
-del "%~f0"
-'''
-                    batch_path = os.path.join(tempfile.gettempdir(), 'folderlens_update.bat')
-                    with open(batch_path, 'w') as f:
-                        f.write(batch_content)
-                    
-                    subprocess.Popen(['cmd', '/c', batch_path], 
-                                   creationflags=subprocess.CREATE_NO_WINDOW)
-                    return True, None
-                    
-            else:
+            if not getattr(sys, 'frozen', False):
                 return False, "Auto-update not supported for Python scripts. Please download manually."
-                
+            if not expected_digest or not re.fullmatch(r'[0-9a-fA-F]{64}', expected_digest):
+                return False, "A verified SHA-256 checksum is required before installation."
+            if sha256_file(downloaded_file) != expected_digest.lower():
+                return False, "The downloaded executable changed after verification."
+
+            current_exe = sys.executable
+            token = uuid.uuid4().hex
+            staged = f"{current_exe}.new-{token}.exe"
+            backup_exe = f"{current_exe}.backup-{token}"
+            # Stage next to the installed EXE, so the later moves stay on
+            # one filesystem. Failure here leaves the running app untouched.
+            shutil.copy2(downloaded_file, staged)
+            if sha256_file(staged) != expected_digest.lower():
+                return False, "The staged executable failed checksum verification."
+
+            script_path = create_swap_script()
+            env = os.environ.copy()
+            env.update({
+                'FL_UPDATE_CURRENT': current_exe,
+                'FL_UPDATE_NEW': staged,
+                'FL_UPDATE_BACKUP': backup_exe,
+                'FL_UPDATE_LOG': script_path + '.log',
+            })
+            subprocess.Popen(['cmd', '/c', script_path], env=env,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+            launched = True
+            return True, None
         except Exception as e:
             return False, f"Failed to apply update: {str(e)}"
+        finally:
+            if not launched:
+                for path in (staged, script_path):
+                    if path:
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            pass
     
     def get_current_version(self) -> str:
         return self.current_version
