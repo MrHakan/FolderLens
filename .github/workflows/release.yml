@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "FolderLens.spec"
+      - "release_manifest.py"
+      - "version.py"
+      - "make_version_info.py"
   workflow_dispatch:
     inputs:
       tag:
@@ -67,6 +74,14 @@ jobs:
           FL_ONEDIR: "1"
         run: pyinstaller --noconfirm --distpath dist_onedir FolderLens.spec
 
+      - name: Smoke test one-directory executable
+        shell: pwsh
+        run: |
+          $exe = 'dist_onedir\FolderLens\FolderLens.exe'
+          if (-not (Test-Path $exe)) { throw 'One-directory executable is missing' }
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "One-directory smoke test failed: $($p.ExitCode)" }
+
       - name: Package one-directory variant as zip
         shell: pwsh
         run: |
@@ -86,7 +101,8 @@ jobs:
         run: |
           $archives = @(Get-ChildItem 'FolderLens-*-win64.zip')
           if ($archives.Count -ne 1) { throw "Expected one archive, found $($archives.Count)" }
-          python release_manifest.py 'dist/FolderLens.exe' $archives[0].FullName --output SHA256SUMS
+          $zipPath = $archives[0].FullName
+          python release_manifest.py 'dist/FolderLens.exe' $zipPath --output SHA256SUMS
           Get-Content SHA256SUMS
 
       - name: Upload build artifacts
