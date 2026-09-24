@@ -76,6 +76,16 @@ jobs:
       - name: Verify staged update and rollback
         run: python tests/windows_update_swap_smoke.py dist/FolderLens.exe
 
+      - name: Verify update from the published v3.4.0 executable
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $legacy = Join-Path $env:RUNNER_TEMP 'FolderLens-v3.4.0.exe'
+          Invoke-WebRequest -Uri 'https://github.com/MrHakan/FolderLens/releases/download/v3.4.0/FolderLens.exe' -OutFile $legacy
+          if (-not (Test-Path $legacy)) { throw 'Could not fetch the published v3.4.0 executable' }
+          python tests/windows_update_swap_smoke.py dist/FolderLens.exe $legacy
+          if ($LASTEXITCODE -ne 0) { throw "Legacy update smoke test failed: $LASTEXITCODE" }
+
       - name: Build versioned Inno Setup installer
         run: python installer/build_installer.py
 

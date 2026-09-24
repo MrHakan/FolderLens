@@ -31,7 +31,32 @@ def run_swap(current: Path, replacement: Path, backup: Path, log: Path):
         os.unlink(script)
 
 
-def main(exe: str):
+def smoke_version(exe: Path):
+    result = subprocess.run([str(exe), "--version"], timeout=60)
+    assert result.returncode == 0, f"{exe} --version exited with {result.returncode}"
+
+
+def verify_legacy_upgrade(exe: str, legacy_exe: str):
+    expected_hash = sha256_file(exe)
+    with tempfile.TemporaryDirectory(prefix="folderlens-legacy-upgrade-") as folder:
+        root = Path(folder)
+        current = root / "FolderLens.exe"
+        replacement = root / "staged.exe"
+        backup = root / "backup.exe"
+        log = root / "swap.log"
+        shutil.copy2(legacy_exe, current)
+        legacy_hash = sha256_file(current)
+        smoke_version(current)
+        shutil.copy2(exe, replacement)
+
+        result = run_swap(current, replacement, backup, log)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert sha256_file(current) == expected_hash
+        assert sha256_file(backup) == legacy_hash
+        smoke_version(current)
+
+
+def main(exe: str, legacy_exe: str = None):
     expected_hash = sha256_file(exe)
     with tempfile.TemporaryDirectory(prefix="folderlens-swap-smoke-") as folder:
         root = Path(folder)
@@ -53,6 +78,9 @@ def main(exe: str):
         assert current.read_bytes() == b"previous installation again", result.stdout + result.stderr
         assert not backup.exists(), "old executable was not restored"
 
+    if legacy_exe:
+        verify_legacy_upgrade(exe, legacy_exe)
+
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
