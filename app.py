@@ -290,7 +290,7 @@ class ImageViewer(ctk.CTkToplevel):
         self.bind("<Left>", lambda e: self._go_prev())
         self.bind("<Control-z>", lambda e: self._undo())
         self.bind("<Control-y>", lambda e: self._redo())
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self._on_close())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ ui
@@ -461,16 +461,19 @@ class ImageViewer(ctk.CTkToplevel):
 
     def _load(self, path: str):
         if self._dirty and not self._confirm_discard():
-            return
+            return False
         try:
             with Image.open(path) as src:
-                self.image = ImageOps.exif_transpose(src).convert("RGB")
+                image = ImageOps.exif_transpose(src).convert("RGB")
         except Exception as exc:
-            self.image = None
             self.status.configure(text=f"Cannot load image: {exc}")
+            return False
 
+        self.image = image
         self.doc = annotate.AnnotationDocument()
         self._dirty = False
+        if os.path.normcase(self.nav.folder) != os.path.normcase(os.path.dirname(os.path.abspath(path))):
+            self.nav.open_folder(os.path.dirname(path))
         self.nav.go_to(path)
         self.title(os.path.basename(path))
         self.name_label.configure(text=os.path.basename(path))
@@ -487,6 +490,7 @@ class ImageViewer(ctk.CTkToplevel):
                 text=f"{self.image.width} × {self.image.height}  ·  {format_size(os.path.getsize(path))}"
                 if os.path.exists(path) else "")
         self._redraw()
+        return True
 
     def _confirm_discard(self) -> bool:
         return messagebox.askyesno("Discard annotations?",
@@ -494,12 +498,12 @@ class ImageViewer(ctk.CTkToplevel):
                                    parent=self)
 
     def _go_next(self):
-        nxt = self.nav.next()
+        nxt = self.nav.images[(self.nav.index + 1) % self.nav.count] if self.nav.count else None
         if nxt:
             self._load(nxt)
 
     def _go_prev(self):
-        prev = self.nav.previous()
+        prev = self.nav.images[(self.nav.index - 1) % self.nav.count] if self.nav.count else None
         if prev:
             self._load(prev)
 
@@ -507,18 +511,19 @@ class ImageViewer(ctk.CTkToplevel):
         parent = self.nav.parent()
         if not parent:
             return
-        first = self.nav.open_folder(parent)
+        images = imagenav.list_images(parent)
+        first = images[0] if images else None
         if first:
             self._load(first)
         else:
             self.status.configure(text="No images in that folder")
-            self.counter.configure(text=self.nav.position)
 
     def _open_subfolder(self, name: str):
         folder = getattr(self, "_subfolders", {}).get(name)
         if not folder:
             return
-        first = self.nav.open_folder(folder)
+        images = imagenav.list_images(folder)
+        first = images[0] if images else None
         if first:
             self._load(first)
         else:
@@ -909,6 +914,7 @@ class FolderLensApp(ctk.CTk):
         ctk.set_appearance_mode("dark" if self.settings.dark_mode else "light")
 
         self.scanner = TreeScanner()
+        self._scan_generation = 0
         self.root_node: Optional[Node] = None
         self.scan_errors: List[str] = []
         self.scan_time = 0.0
@@ -1335,6 +1341,8 @@ class FolderLensApp(ctk.CTk):
         return value if value else None
 
     def scan_folder(self, path: str):
+        self._scan_generation += 1
+        generation = self._scan_generation
         self.settings.last_folder = path
         self.settings.save()
         self._is_network_root = is_network_path(path)
@@ -1344,13 +1352,32 @@ class FolderLensApp(ctk.CTk):
         self._set_status(f"Scanning {path} …")
         self._show_progress(True)
         self.cancel_btn.pack(side="left", padx=3, pady=9)
+        self.root_node = None
+        self.status_right.configure(text="")
+        self.status_disk.configure(text="")
+        self._clear_body()
+        self._empty_hint("Scanning folder…")
 
         self.scanner.scan(
             path,
-            on_progress=lambda n: self.after(0, lambda: self._set_status(f"Scanning… {n:,} items")),
-            on_complete=lambda root, errors, t: self.after(0, lambda: self._scan_done(root, errors, t)),
-            on_error=lambda msg: self.after(0, lambda: self._scan_failed(msg)),
+            on_progress=lambda n: self.after(0, lambda: self._scan_progress(generation, n)),
+            on_complete=lambda root, errors, t: self.after(
+                0, lambda: self._scan_done_if_current(generation, root, errors, t)),
+            on_error=lambda msg: self.after(0, lambda: self._scan_failed_if_current(generation, msg)),
         )
+
+    def _scan_progress(self, generation: int, count: int):
+        if generation == self._scan_generation:
+            self._set_status(f"Scanning… {count:,} items")
+
+    def _scan_done_if_current(self, generation: int, root: Node,
+                              errors: List[str], scan_time: float):
+        if generation == self._scan_generation:
+            self._scan_done(root, errors, scan_time)
+
+    def _scan_failed_if_current(self, generation: int, message: str):
+        if generation == self._scan_generation:
+            self._scan_failed(message)
 
     def _scan_done(self, root: Node, errors: List[str], scan_time: float):
         self.root_node = root
@@ -1375,13 +1402,18 @@ class FolderLensApp(ctk.CTk):
         self._show_progress(False)
         self.cancel_btn.pack_forget()
         self._set_status("Scan failed")
+        self._clear_body()
+        self._empty_hint("Scan failed")
         messagebox.showerror("Error", message)
 
     def _cancel_scan(self):
+        self._scan_generation += 1
         self.scanner.cancel()
         self._set_status("Scan cancelled")
         self._show_progress(False)
         self.cancel_btn.pack_forget()
+        self._clear_body()
+        self._empty_hint("Scan cancelled")
 
     def _refresh(self):
         if self.root_node:
@@ -1491,7 +1523,7 @@ class FolderLensApp(ctk.CTk):
         wrap = tk.Frame(self.body, bg=colors['tree_bg'])
         wrap.pack(fill="both", expand=True)
 
-        if self.root_node is not None:
+        if self.root_node is not None or text != "Select a folder to analyze":
             tk.Label(wrap, text=text, fg=colors['muted_fg'], bg=colors['tree_bg'],
                      font=("Segoe UI", 13)).place(relx=0.5, rely=0.45, anchor="center")
             return
@@ -1754,31 +1786,27 @@ class FolderLensApp(ctk.CTk):
             self.sort_reverse = key != "name"
         if self.search_query:
             return
-        self._render_active_view()      # repaint headers so the arrow follows
         expanded = set()
+        pending = list(self.tree.get_children())
+        while pending:
+            iid = pending.pop()
+            node = self.iid_to_node.get(iid)
+            if node and self.tree.item(iid, "open"):
+                expanded.add(node.path)
+                pending.extend(self.tree.get_children(iid))
+        self._render_active_view()      # rebuild headers and rows in new order
 
-        def collect(iid):
-            for c in self.tree.get_children(iid):
-                node = self.iid_to_node.get(c)
-                if node and self.tree.item(c, "open"):
-                    expanded.add(node.path)
-                collect(c)
-        collect("")
-        self.tree.delete(*self.tree.get_children())
-        self.iid_to_node = {}
-        self._insert_tree_children("", self.root_node)
-
-        def reexpand(iid):
-            for c in self.tree.get_children(iid):
-                node = self.iid_to_node.get(c)
-                if node and node.path in expanded:
-                    dummies = self.tree.get_children(c)
-                    if len(dummies) == 1 and self._is_dummy(dummies[0]):
-                        self.tree.delete(dummies[0])
-                        self._insert_tree_children(c, node)
-                    self.tree.item(c, open=True)
-                    reexpand(c)
-        reexpand("")
+        pending = list(self.tree.get_children())
+        while pending:
+            iid = pending.pop()
+            node = self.iid_to_node.get(iid)
+            if node and node.path in expanded:
+                dummies = self.tree.get_children(iid)
+                if len(dummies) == 1 and self._is_dummy(dummies[0]):
+                    self.tree.delete(dummies[0])
+                    self._insert_tree_children(iid, node)
+                self.tree.item(iid, open=True)
+                pending.extend(self.tree.get_children(iid))
 
     def _on_tree_select(self, event):
         nodes = self._selected_nodes()
@@ -1836,9 +1864,7 @@ class FolderLensApp(ctk.CTk):
 
         files = analysis.largest_files(
             self.root_node, 100, filter_key=self.file_filter,
-            filter_index=self._filter_index)
-        if self.search_query:
-            files = [n for n in files if analysis.match_query(n.name, self.search_query)]
+            filter_index=self._filter_index, name_query=self.search_query)
         if not files:
             return
         for node in files:
@@ -2431,15 +2457,26 @@ class FolderLensApp(ctk.CTk):
         if not self.root_node:
             messagebox.showwarning("No data", "Scan a folder first.")
             return
+        index = None
+        if self.file_filter != "all":
+            if not self._filter_ready_for_view():
+                return
+            choice = messagebox.askyesnocancel(
+                "CSV scope", f"Export only {self._filter_label()} files and their folders?\n\n"
+                "Yes: visible file type only. No: all scanned files. Cancel: stop export.", parent=self)
+            if choice is None:
+                return
+            index = self._filter_index if choice else None
         save_path = filedialog.asksaveasfilename(defaultextension=".csv",
                                                  filetypes=[("CSV files", "*.csv")], title="Export report as")
         if not save_path:
             return
+        root = self.root_node
         self._set_status("Exporting CSV…")
 
         def worker():
             try:
-                rows = analysis.export_tree_csv(self.root_node, save_path)
+                rows = analysis.export_tree_csv(root, save_path, filter_index=index)
                 self.after(0, lambda: (self._set_status(f"Exported {rows:,} rows"),
                                        messagebox.showinfo("Export complete", f"Wrote {rows:,} rows to:\n{save_path}")))
             except Exception as exc:
@@ -2452,30 +2489,53 @@ class FolderLensApp(ctk.CTk):
         if not selection:
             messagebox.showwarning("No selection", self._no_selection_hint())
             return
+        if not messagebox.askyesno("Confirm ZIP scope", self._action_scope_prompt(selection, "ZIP"),
+                                   parent=self):
+            return
         save_path = filedialog.asksaveasfilename(defaultextension=".zip",
                                                  filetypes=[("ZIP files", "*.zip")], title="Save ZIP as")
         if not save_path:
             return
         paths = [node.path for _, node in selection]
+        zip_path = os.path.normcase(os.path.abspath(save_path))
+        for _, node in selection:
+            selected_path = os.path.normcase(os.path.abspath(node.path))
+            try:
+                inside = (selected_path == zip_path or node.is_dir and
+                          os.path.commonpath([selected_path, zip_path]) == selected_path)
+            except ValueError:  # different Windows drives
+                inside = False
+            if inside:
+                messagebox.showerror("ZIP location", "Save the ZIP outside the selected files and folders.", parent=self)
+                return
         self._set_status("Creating ZIP…")
 
         def worker():
             try:
+                errors = []
                 with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for path in paths:
                         if os.path.isfile(path):
                             zf.write(path, os.path.basename(path))
                         elif os.path.isdir(path):
                             base = os.path.dirname(path)
-                            for r, _, files in os.walk(path):
+                            for r, _, files in os.walk(path, onerror=lambda err: errors.append(str(err))):
                                 for file in files:
                                     fp = os.path.join(r, file)
                                     try:
                                         zf.write(fp, os.path.relpath(fp, base))
-                                    except OSError:
-                                        pass
-                self.after(0, lambda: (self._set_status("ZIP created"),
-                                       messagebox.showinfo("Success", f"Created: {save_path}")))
+                                    except OSError as exc:
+                                        errors.append(f"{fp}: {exc}")
+                        else:
+                            errors.append(f"Missing: {path}")
+                if errors:
+                    details = "\n".join(errors[:5])
+                    self.after(0, lambda: (self._set_status("ZIP incomplete"),
+                                           messagebox.showwarning("Incomplete ZIP",
+                                               f"Created: {save_path}\nSkipped {len(errors)} item(s):\n{details}")))
+                else:
+                    self.after(0, lambda: (self._set_status("ZIP created"),
+                                           messagebox.showinfo("Success", f"Created: {save_path}")))
             except Exception as exc:
                 msg = str(exc)
                 self.after(0, lambda: (self._set_status("ZIP failed"),
@@ -2487,19 +2547,32 @@ class FolderLensApp(ctk.CTk):
             return "Select files or folders first."
         return "Switch to the Tree, Largest Files or Duplicates view to select items."
 
+    def _action_scope_prompt(self, selection: List[tuple], action: str) -> str:
+        """A filtered folder row represents all files on disk for ZIP/delete."""
+        total = sum(node.size for _, node in selection)
+        items = sum(1 + node.item_count for _, node in selection)
+        folders = any(node.is_dir for _, node in selection)
+        scope = (f"{len(selection)} selected item(s); {items:,} scanned items; "
+                 f"{format_size(total)} total scanned size.")
+        if folders and self.file_filter != "all":
+            scope += (f"\n\nThe {self._filter_label()} filter only changes the view. "
+                      f"{action} will include ALL file types inside selected folders, "
+                      "including files hidden by this filter.")
+        if action == "ZIP":
+            return f"Create a ZIP from the entire selected files and folders?\n{scope}"
+        return scope
+
     def _delete_selected(self):
         selection = self._top_level_selection()
         if not selection:
             messagebox.showwarning("No selection", self._no_selection_hint())
             return
-        total = sum(self._node_size(node) for _, node in selection)
+        scope = self._action_scope_prompt(selection, "Delete")
         recycle = self.settings.use_recycle_bin and trash.is_supported()
         if recycle:
-            prompt = (f"Move {len(selection)} item(s) ({format_size(total)}) to the "
-                      f"Recycle Bin?\nYou can restore them from there.")
+            prompt = f"Move the selected files and folders to the Recycle Bin?\n{scope}\nYou can restore them from there."
         else:
-            prompt = (f"Delete {len(selection)} item(s) ({format_size(total)})?\n"
-                      f"This cannot be undone.")
+            prompt = f"Delete the selected files and folders?\n{scope}\nThis cannot be undone."
         if not messagebox.askyesno("Confirm delete", prompt):
             return
         self._set_status("Recycling…" if recycle else "Deleting…")
@@ -2507,6 +2580,7 @@ class FolderLensApp(ctk.CTk):
         # remember which view started this so the async result never touches a
         # widget the user has since navigated away from
         tree, mapping = self._selection_context()
+        action_root = self.root_node
 
         def worker():
             deleted, errors = [], []
@@ -2524,10 +2598,13 @@ class FolderLensApp(ctk.CTk):
                     deleted.append((iid, node))
                 except Exception as e:
                     errors.append(f"{node.name}: {e}")
-            self.after(0, lambda: self._apply_deletions(deleted, errors, tree, mapping))
+            self.after(0, lambda: self._apply_deletions(
+                deleted, errors, tree, mapping, action_root))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_deletions(self, deleted, errors, tree=None, mapping=None):
+    def _apply_deletions(self, deleted, errors, tree=None, mapping=None, action_root=None):
+        if action_root is not None and action_root is not self.root_node:
+            return
         rows_alive = False
         if tree is not None:
             try:
