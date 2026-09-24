@@ -5,6 +5,7 @@ import tkinter.font as tkfont
 from typing import Optional, List, Dict
 import json
 import os
+import queue
 import sys
 import shutil
 import subprocess
@@ -952,6 +953,7 @@ class FolderLensApp(ctk.CTk):
         self._places = None
         self._places_loading = False
         self._places_grid = None
+        self._io_results = queue.SimpleQueue()
 
         # tree-view state
         self.tree: Optional[ttk.Treeview] = None
@@ -992,6 +994,7 @@ class FolderLensApp(ctk.CTk):
         self._build_toolbar()
         self._build_body()
         self._build_status_bar()
+        self.after(100, self._poll_io_results)
 
         self.bind("<F5>", lambda e: self._refresh())
         self.bind("<F1>", lambda e: self._show_shortcuts())
@@ -1008,10 +1011,7 @@ class FolderLensApp(ctk.CTk):
 
             def check_last_folder():
                 exists = os.path.isdir(last_folder)
-                try:
-                    self.after(0, lambda: self._restore_last_folder(last_folder, exists))
-                except RuntimeError:  # window closed while a network path was checked
-                    pass
+                self._io_results.put(("restore", (last_folder, exists)))
 
             threading.Thread(target=check_last_folder, daemon=True).start()
             self._set_status("Checking last folder…")
@@ -1026,6 +1026,21 @@ class FolderLensApp(ctk.CTk):
             self.scan_folder(os.path.abspath(path))
         else:
             self._set_status("Last folder unavailable; choose a place to scan")
+
+    def _poll_io_results(self):
+        """Deliver filesystem results on Tk's thread, even before mainloop starts."""
+        while True:
+            try:
+                kind, payload = self._io_results.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "restore":
+                self._restore_last_folder(*payload)
+            elif kind == "disk":
+                self._disk_usage_ready(*payload)
+            elif kind == "places":
+                self._places_ready(payload)
+        self.after(100, self._poll_io_results)
 
     # -------------------------------------------------------------- chrome
 
@@ -1523,10 +1538,7 @@ class FolderLensApp(ctk.CTk):
                 label = f"Disk: {format_size(usage.free)} free of {format_size(usage.total)}"
             except OSError:
                 label = ""
-            try:
-                self.after(0, lambda: self._disk_usage_ready(generation, path, label))
-            except RuntimeError:  # window closed while filesystem I/O was blocked
-                pass
+            self._io_results.put(("disk", (generation, path, label)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1723,10 +1735,7 @@ class FolderLensApp(ctk.CTk):
                         places = locations.start_places()[:12]
                     except OSError:
                         places = []
-                    try:
-                        self.after(0, lambda: self._places_ready(places))
-                    except RuntimeError:  # app closed while a drive was checked
-                        pass
+                    self._io_results.put(("places", places))
 
                 threading.Thread(target=load_places, daemon=True).start()
         else:
