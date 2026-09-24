@@ -88,7 +88,7 @@ jobs:
           $installer = $installerItem.FullName
           $installDir = Join-Path $env:RUNNER_TEMP 'FolderLensInstall'
           $setupLog = Join-Path $env:RUNNER_TEMP 'FolderLens-setup.log'
-          $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$installDir", "/LOG=$setupLog")
+          $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/TASKS=contextmenu', "/DIR=$installDir", "/LOG=$setupLog")
           $installProcess = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
           if ($installProcess.ExitCode -ne 0) { throw "Installer exited with $($installProcess.ExitCode)" }
           $installedExe = Join-Path $installDir 'FolderLens.exe'
@@ -100,13 +100,29 @@ jobs:
             if ($actualInstall) { Write-Host "Registered install path: $($actualInstall.InstallPath)" }
             throw 'Installed executable is missing'
           }
-          $reportedVersion = & $installedExe --version
-          if ($reportedVersion -ne "FolderLens $version") {
-            throw "Installed version '$reportedVersion' does not match '$version'"
+          $expectedResource = python -c "from make_version_info import _version_tuple; from version import VERSION; print('.'.join(map(str, _version_tuple(VERSION))))"
+          $installedResourceVersion = (Get-Item $installedExe).VersionInfo.ProductVersion
+          if ($installedResourceVersion -ne $expectedResource) {
+            throw "Installed executable version '$installedResourceVersion' does not match '$expectedResource'"
+          }
+          $versionSmoke = Start-Process -FilePath $installedExe -ArgumentList '--version' -Wait -PassThru
+          if ($versionSmoke.ExitCode -ne 0) {
+            throw "Installed executable --version smoke test failed: $($versionSmoke.ExitCode)"
           }
           $registry = Get-ItemProperty 'HKLM:\SOFTWARE\FolderLens'
           if ($registry.Version -ne $version -or $registry.InstallPath -ne $installDir) {
             throw 'Installer registry metadata does not match the installed package'
+          }
+          $backgroundCommandPath = 'Registry::HKEY_CLASSES_ROOT\Directory\Background\shell\FolderLens\command'
+          $folderCommandPath = 'Registry::HKEY_CLASSES_ROOT\Directory\shell\FolderLens\command'
+          if (-not (Test-Path $backgroundCommandPath) -or -not (Test-Path $folderCommandPath)) {
+            throw 'Explorer context-menu commands were not installed'
+          }
+          $backgroundCommand = (Get-Item -LiteralPath $backgroundCommandPath).GetValue('')
+          $folderCommand = (Get-Item -LiteralPath $folderCommandPath).GetValue('')
+          if ($backgroundCommand -notlike "*$installedExe*" -or $backgroundCommand -notlike '*%V*' -or
+              $folderCommand -notlike "*$installedExe*" -or $folderCommand -notlike '*%1*') {
+            throw 'Explorer context-menu commands do not target FolderLens'
           }
           $uninstaller = Get-ChildItem $installDir -Filter 'unins*.exe' | Select-Object -First 1
           if (-not $uninstaller) { throw 'Uninstaller executable is missing' }
@@ -114,6 +130,10 @@ jobs:
           & $uninstallerPath /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
           if ($LASTEXITCODE -ne 0) { throw "Uninstaller exited with $LASTEXITCODE" }
           if (Test-Path $installedExe) { throw 'Uninstall left FolderLens.exe behind' }
+          if ((Test-Path $backgroundCommandPath) -or (Test-Path $folderCommandPath)) {
+            throw 'Uninstall left Explorer context-menu entries behind'
+          }
+          if (Test-Path 'HKLM:\SOFTWARE\FolderLens') { throw 'Uninstall left FolderLens registry metadata behind' }
 
       - name: Build one-directory variant (antivirus-friendly)
         shell: pwsh
