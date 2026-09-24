@@ -437,6 +437,14 @@ def test_advanced_filter_projection_and_action_scope(gui):
     assert [node.name for node in gui.largest_map.values()] == ["pic.png"]
 
 
+def test_slow_disk_usage_cannot_overwrite_new_scan_status(gui):
+    gui.status_disk.configure(text="current")
+    gui._disk_usage_ready(gui._scan_generation - 1, gui.root_node.path, "stale")
+    assert gui.status_disk.cget("text") == "current"
+    gui._disk_usage_ready(gui._scan_generation, gui.root_node.path, "fresh")
+    assert gui.status_disk.cget("text") == "fresh"
+
+
 def test_treemap_hit_testing_uses_geometry(gui):
     show(gui, "Treemap")
     gui.treemap_canvas.configure(width=640, height=440)
@@ -651,23 +659,31 @@ def test_start_screen_offers_places_before_any_scan(gui):
     gui.root_node = None
     show(gui, "Tree")
 
-    texts = []
-
     def collect(widget):
-        for child in widget.winfo_children():
-            try:
-                text = child.cget("text")
-            except tk.TclError:
-                text = ""
-            if text:
-                texts.append(str(text))
-            collect(child)
+        texts = []
+        def visit(widget):
+            for child in widget.winfo_children():
+                try:
+                    text = child.cget("text")
+                except tk.TclError:
+                    text = ""
+                if text:
+                    texts.append(str(text))
+                visit(child)
+        visit(widget)
+        return " ".join(texts)
 
-    collect(gui.body)
-    joined = " ".join(texts)
+    joined = collect(gui.body)
     assert "Where should we look" in joined
     assert "Browse" in joined
-    assert any(place.label in joined for place in locations.start_places())
+    # Cards arrive after filesystem checks on a worker; Browse stays usable.
+    expected = {place.label for place in locations.start_places()}
+    deadline = time.monotonic() + 15
+    while not any(label in joined for label in expected) and time.monotonic() < deadline:
+        gui.update()
+        time.sleep(0.02)
+        joined = collect(gui.body)
+    assert any(label in joined for label in expected)
 
 
 def test_breadcrumbs_are_clickable_prefixes(gui, tmp_path):
