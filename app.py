@@ -1226,6 +1226,14 @@ class FolderLensApp(ctk.CTk):
         self._hover_tile = None
         self._treemap_focus_tile = None
         self._treemap_focus_info = None
+        self._treemap_workspace = None
+        self._treemap_detail_panel = None
+        self._treemap_detail_name = None
+        self._treemap_detail_summary = None
+        self._treemap_detail_location = None
+        self._treemap_detail_action = None
+        self._treemap_details_toggle = None
+        self._treemap_details_expanded = None
         self._highlight_id = None
         self._treemap_photo = None
         self._treemap_image = None
@@ -2028,6 +2036,14 @@ class FolderLensApp(ctk.CTk):
         self.tree = None
         self.largest_tree = None
         self.dup_tree = None
+        self._treemap_focus_info = None
+        self._treemap_workspace = None
+        self._treemap_detail_panel = None
+        self._treemap_detail_name = None
+        self._treemap_detail_summary = None
+        self._treemap_detail_location = None
+        self._treemap_detail_action = None
+        self._treemap_details_toggle = None
         # every row that was pointing at a thumbnail is gone with them; the
         # map would otherwise grow for the lifetime of the session
         self._row_by_path.clear()
@@ -3022,14 +3038,68 @@ class FolderLensApp(ctk.CTk):
                             cursor="hand2", font=("Segoe UI", 10, "bold"))
             back.pack(side="right", padx=14, pady=11)
             back.bind("<Button-1>", lambda e: self._treemap_back())
+        details_toggle = tk.Button(
+            summary, text="Show details", command=self._toggle_treemap_details,
+            bd=0, relief="flat", cursor="hand2", bg=colors['head_bg'], fg=ACCENT,
+            activebackground=colors['head_bg'], activeforeground=ACCENT,
+            font=("Segoe UI", 9, "bold"), padx=4)
+        details_toggle.pack(side="right", padx=(6, 12), pady=11)
+        self._treemap_details_toggle = details_toggle
         self._treemap_focus_info = tk.Label(
             summary, text="Map: arrows select · Enter opens · Backspace goes up",
             bg=colors['head_bg'], fg=colors['muted_fg'], font=("Segoe UI", 9), anchor="e")
         self._treemap_focus_info.pack(side="right", padx=(4, 12), pady=11)
 
-        self.treemap_canvas = tk.Canvas(wrap, bg=colors['canvas_bg'], highlightthickness=0,
+        workspace = tk.Frame(wrap, bg=colors['canvas_bg'])
+        workspace.pack(fill="both", expand=True)
+        self._treemap_workspace = workspace
+        self._treemap_detail_panel = tk.Frame(workspace, bg=colors['head_bg'], width=260)
+        self._treemap_detail_panel.pack_propagate(False)
+        tk.Label(self._treemap_detail_panel, text="Selection details",
+                 bg=colors['head_bg'], fg=colors['tree_fg'],
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=14, pady=(16, 10))
+        self._treemap_detail_name = tk.Label(
+            self._treemap_detail_panel, text="Move over a tile or use arrow keys",
+            bg=colors['head_bg'], fg=colors['tree_fg'],
+            font=("Segoe UI", 10, "bold"), justify="left", anchor="w",
+            wraplength=228)
+        self._treemap_detail_name.pack(fill="x", padx=14, pady=(0, 8))
+        self._treemap_detail_summary = tk.Label(
+            self._treemap_detail_panel, text="",
+            bg=colors['head_bg'], fg=colors['muted_fg'],
+            font=("Segoe UI", 9), justify="left", anchor="w", wraplength=228)
+        self._treemap_detail_summary.pack(fill="x", padx=14, pady=(0, 12))
+        tk.Label(self._treemap_detail_panel, text="Location",
+                 bg=colors['head_bg'], fg=colors['muted_fg'],
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=14, pady=(4, 3))
+        self._treemap_detail_location = tk.Label(
+            self._treemap_detail_panel, text="",
+            bg=colors['head_bg'], fg=colors['tree_fg'],
+            font=("Segoe UI", 9), justify="left", anchor="nw", wraplength=228)
+        self._treemap_detail_location.pack(fill="x", padx=14, pady=(0, 14))
+        self._treemap_detail_action = tk.Button(
+            self._treemap_detail_panel, text="Open selected", command=self._treemap_activate_focus,
+            bd=0, relief="flat", cursor="hand2", bg=ACCENT, fg="white",
+            activebackground=ACCENT_HOVER, activeforeground="white",
+            font=("Segoe UI", 9, "bold"), padx=10, pady=7)
+        self._treemap_detail_action.pack(fill="x", padx=14, pady=(4, 6))
+        tk.Button(
+            self._treemap_detail_panel, text="Show in Explorer",
+            command=self._treemap_reveal_focus, bd=0, relief="flat", cursor="hand2",
+            bg=colors['tree_bg'], fg=colors['tree_fg'], font=("Segoe UI", 9),
+            padx=10, pady=6).pack(fill="x", padx=14, pady=4)
+        tk.Button(
+            self._treemap_detail_panel, text="Copy path", command=self._treemap_copy_focus_path,
+            bd=0, relief="flat", cursor="hand2", bg=colors['tree_bg'],
+            fg=colors['tree_fg'], font=("Segoe UI", 9), padx=10, pady=6
+        ).pack(fill="x", padx=14, pady=4)
+
+        self.treemap_canvas = tk.Canvas(workspace, bg=colors['canvas_bg'], highlightthickness=0,
                                        takefocus=True)
-        self.treemap_canvas.pack(fill="both", expand=True)
+        self.treemap_canvas.pack(side="left", fill="both", expand=True)
+        workspace.bind("<Configure>", lambda event: self._update_treemap_details_layout(
+            event.width), add="+")
+        self.after_idle(lambda: self._update_treemap_details_layout(workspace.winfo_width()))
         self._build_treemap_legend(wrap, colors)
         if self.tooltip is None:
             self.tooltip = Tooltip(self)
@@ -3263,11 +3333,78 @@ class FolderLensApp(ctk.CTk):
         node = tile.node
         if getattr(node, "is_aggregate", False):
             kind = "Grouped items"
+            location = node.parent.path
+            item_count = node.item_count
+            action = "Browse grouped items"
         else:
             kind = "Folder" if node.is_dir else get_file_category(node.name, is_dir=False)['label']
+            location = node.path
+            item_count = self._node_count(node) if node.is_dir else 1
+            action = ("Zoom into folder" if node.is_dir else
+                      "Open image" if is_image_file(node.name) else "Open file")
         name = node.name if len(node.name) <= 40 else node.name[:37] + "…"
-        self._treemap_focus_info.configure(
-            text=f"{kind}: {name} · {format_size(self._node_size(node))}")
+        size = self._node_size(node)
+        share = calculate_percentage(size, self._node_size(self.treemap_node))
+        self._treemap_focus_info.configure(text=f"{kind}: {name} · {format_size(size)}")
+        if self._treemap_detail_name is not None:
+            metric = (self._filter_index.spec.metric
+                      if self._has_active_filter() and self._filter_index is not None
+                      else "logical")
+            size_label = "Allocated size" if metric == "allocated" else "Logical size"
+            count_label = "items" if getattr(node, "is_aggregate", False) else self._count_label()
+            count_text = (f"{item_count:,} {count_label} · " if node.is_dir or
+                          getattr(node, "is_aggregate", False) else "")
+            self._treemap_detail_name.configure(text=node.name)
+            self._treemap_detail_summary.configure(
+                text=f"{kind}\n{size_label}: {format_size(size)}\n"
+                     f"{count_text}Share of this map: {share:.1f}%")
+            self._treemap_detail_location.configure(text=location)
+            self._treemap_detail_action.configure(text=action, state="normal")
+
+    def _update_treemap_details_layout(self, width: int):
+        panel = self._treemap_detail_panel
+        canvas = getattr(self, "treemap_canvas", None)
+        if panel is None or canvas is None:
+            return
+        visible = (width >= 1120 if self._treemap_details_expanded is None
+                   else self._treemap_details_expanded)
+        is_visible = panel.winfo_manager() == "pack"
+        if visible and not is_visible:
+            panel.pack(side="right", fill="y", before=canvas)
+        elif not visible and is_visible:
+            panel.pack_forget()
+        if self._treemap_details_toggle is not None:
+            self._treemap_details_toggle.configure(
+                text="Hide details" if visible else "Show details")
+
+    def _toggle_treemap_details(self):
+        panel = self._treemap_detail_panel
+        workspace = self._treemap_workspace
+        if panel is None or workspace is None:
+            return
+        visible = panel.winfo_manager() != "pack"
+        self._treemap_details_expanded = visible
+        self._update_treemap_details_layout(workspace.winfo_width())
+
+    def _focused_treemap_path(self):
+        tile = self._treemap_focus_tile
+        if tile is None:
+            return None
+        node = tile.node
+        return node.parent.path if getattr(node, "is_aggregate", False) else node.path
+
+    def _treemap_reveal_focus(self):
+        path = self._focused_treemap_path()
+        if path:
+            self._reveal(path)
+
+    def _treemap_copy_focus_path(self):
+        path = self._focused_treemap_path()
+        if not path:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self._set_status("Copied path to the clipboard")
 
     def _treemap_focus_in(self, _event=None):
         if self._tiles and self._treemap_focus_tile is None:
@@ -3326,6 +3463,8 @@ class FolderLensApp(ctk.CTk):
             self._render_active_view()
         elif is_image_file(tile.node.name):
             self._open_image(tile.node.path)
+        else:
+            self._reveal(tile.node.path)
         return "break"
 
     def _treemap_thumb(self, path: str, size, mtime=None):

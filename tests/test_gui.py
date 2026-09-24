@@ -494,6 +494,36 @@ def test_treemap_resize_is_debounced(gui):
         gui._draw_treemap = original
 
 
+def test_treemap_details_follow_focus_and_offer_file_actions(gui, monkeypatch):
+    show(gui, "Treemap")
+    wait_treemap(gui)
+    gui.update()
+    tile = next(tile for tile in gui._tiles if tile.node.name == "notes.txt")
+
+    gui._treemap_set_focus(tile)
+    assert gui._treemap_detail_name.cget("text") == "notes.txt"
+    assert "Logical size" in gui._treemap_detail_summary.cget("text")
+    assert gui._treemap_detail_location.cget("text") == tile.node.path
+    assert gui._treemap_detail_action.cget("text") == "Open file"
+
+    gui._treemap_details_expanded = False
+    gui._update_treemap_details_layout(1000)
+    assert not gui._treemap_detail_panel.winfo_manager()
+    gui._treemap_details_toggle.invoke()
+    assert gui._treemap_detail_panel.winfo_manager() == "pack"
+
+    revealed = []
+    monkeypatch.setattr(gui, "_reveal", revealed.append)
+    gui._treemap_activate_focus()
+    assert revealed == [tile.node.path]
+
+    copied = []
+    monkeypatch.setattr(gui, "clipboard_clear", lambda: None)
+    monkeypatch.setattr(gui, "clipboard_append", copied.append)
+    gui._treemap_copy_focus_path()
+    assert copied == [tile.node.path]
+
+
 def test_deletion_updates_model_without_the_original_widget(gui, sample_tree):
     """Deleting is async; the user may switch views before it lands. The model
     must still update and nothing may touch the destroyed widget."""
